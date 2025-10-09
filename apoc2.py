@@ -5,6 +5,7 @@ INDENTATION FIXED VERSION
 """
 
 import streamlit as st
+from streamlit_image_coordinates import streamlit_image_coordinates
 import cv2
 import numpy as np
 import pytesseract
@@ -2847,6 +2848,149 @@ class OpenAIVisionCameraManager:
         except Exception as e:
             logger.error(f"[ENHANCE] Error enhancing garment: {e}")
             return garment_image
+
+# ==========================
+# CAMERA DISPLAY HELPER FUNCTIONS
+# ==========================
+
+def draw_roi_overlay_on_full_frame(frame, roi_coords, original_resolution, roi_type='tag', color=(0, 255, 0), thickness=4):
+    """
+    Draw ROI rectangle on FULL frame (shows complete camera view with overlay).
+    
+    Args:
+        frame: Full camera frame (not cropped)
+        roi_coords: Dictionary with ROI coordinates {'tag': (x,y,w,h), 'work': (x,y,w,h)}
+        original_resolution: Tuple (width, height) that ROI coords were calibrated for
+        roi_type: Which ROI to draw ('tag' or 'work')
+        color: RGB color tuple (default: green)
+        thickness: Line thickness in pixels
+    
+    Returns:
+        Frame with ROI overlay drawn, or original frame if error
+    """
+    if frame is None or roi_type not in roi_coords:
+        return frame
+    
+    # Get ROI coordinates
+    x, y, w, h = roi_coords[roi_type]
+    
+    # Scale ROI if frame resolution differs from calibration resolution
+    h_frame, w_frame = frame.shape[:2]
+    original_width, original_height = original_resolution
+    
+    if w_frame != original_width or h_frame != original_height:
+        scale_x = w_frame / original_width
+        scale_y = h_frame / original_height
+        x = int(x * scale_x)
+        y = int(y * scale_y)
+        w = int(w * scale_x)
+        h = int(h * scale_y)
+    
+    # Ensure coordinates are within frame bounds
+    x = max(0, min(x, w_frame - 1))
+    y = max(0, min(y, h_frame - 1))
+    w = min(w, w_frame - x)
+    h = min(h, h_frame - y)
+    
+    if w <= 0 or h <= 0:
+        return frame
+    
+    # Create a copy to draw on
+    display_frame = frame.copy()
+    
+    # Draw main rectangle
+    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, thickness)
+    
+    # Draw corner markers (for visibility)
+    corner_size = 25
+    corner_thick = 6
+    
+    # Top-left corner
+    cv2.line(display_frame, (x, y), (x + corner_size, y), color, corner_thick)
+    cv2.line(display_frame, (x, y), (x, y + corner_size), color, corner_thick)
+    
+    # Top-right corner
+    cv2.line(display_frame, (x + w, y), (x + w - corner_size, y), color, corner_thick)
+    cv2.line(display_frame, (x + w, y), (x + w, y + corner_size), color, corner_thick)
+    
+    # Bottom-left corner
+    cv2.line(display_frame, (x, y + h), (x + corner_size, y + h), color, corner_thick)
+    cv2.line(display_frame, (x, y + h), (x, y + h - corner_size), color, corner_thick)
+    
+    # Bottom-right corner
+    cv2.line(display_frame, (x + w, y + h), (x + w - corner_size, y + h), color, corner_thick)
+    cv2.line(display_frame, (x + w, y + h), (x + w, y + h - corner_size), color, corner_thick)
+    
+    # Draw center crosshair
+    center_x, center_y = x + w // 2, y + h // 2
+    cross_size = 20
+    cv2.line(display_frame, (center_x - cross_size, center_y), 
+             (center_x + cross_size, center_y), color, 3)
+    cv2.line(display_frame, (center_x, center_y - cross_size), 
+             (center_x, center_y + cross_size), color, 3)
+    
+    # Add label with background
+    label = f"TAG ROI: {w}x{h}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    font_thickness = 2
+    
+    # Get text size for background rectangle
+    (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
+    
+    # Draw background rectangle for text
+    bg_y1 = y - text_height - 15
+    
+    # Ensure background is within frame
+    if bg_y1 >= 0:
+        cv2.rectangle(display_frame, (x, bg_y1), (x + text_width + 10, y - 5), (0, 0, 0), -1)
+        cv2.putText(display_frame, label, (x + 5, y - 10), font, font_scale, color, font_thickness)
+    else:
+        # If label would be cut off at top, put it at bottom
+        cv2.rectangle(display_frame, (x, y + h + 5), 
+                     (x + text_width + 10, y + h + text_height + 20), (0, 0, 0), -1)
+        cv2.putText(display_frame, label, (x + 5, y + h + text_height + 10), 
+                    font, font_scale, color, font_thickness)
+    
+    return display_frame
+
+
+def display_camera_with_roi_overlay(camera_manager, camera_type='arducam', roi_type='tag'):
+    """
+    Display FULL camera frame with ROI overlay (not cropped).
+    
+    Args:
+        camera_manager: OpenAIVisionCameraManager instance
+        camera_type: 'arducam' or 'realsense'
+        roi_type: 'tag' or 'work'
+    
+    Returns:
+        tuple: (full_frame_with_overlay, cropped_roi) or (None, None)
+    """
+    # Get FULL camera frame (not cropped)
+    if camera_type == 'arducam':
+        full_frame = camera_manager.get_arducam_frame()
+    else:
+        full_frame = camera_manager.get_realsense_frame()
+    
+    if full_frame is None:
+        return None, None
+    
+    # Draw ROI overlay on full frame
+    frame_with_overlay = draw_roi_overlay_on_full_frame(
+        full_frame, 
+        camera_manager.roi_coords,
+        camera_manager.original_resolution,
+        roi_type=roi_type,
+        color=(0, 255, 0),  # Green
+        thickness=4
+    )
+    
+    # Also get the cropped ROI for processing
+    cropped_roi = camera_manager.apply_roi(full_frame, roi_type)
+    
+    return frame_with_overlay, cropped_roi
+
 
 # ==========================
 # IMPROVED OPENAI TEXT EXTRACTOR WITH BRAND CORRECTION
@@ -6348,52 +6492,75 @@ class EnhancedPipelineManager:
             
             # Show appropriate camera based on current step
             if self.current_step == 0:
-                # Tag camera with ROI - GUARANTEED TO WORK VERSION
+                # Tag camera with INTERACTIVE ROI (click to move)
                 try:
                     frame = self.camera_manager.get_arducam_frame()
                     
                     if frame is not None:
-                        # Debug info
-                        st.caption(f"🔍 Frame: {frame.shape}, ROI: {self.camera_manager.roi_coords.get('tag', 'NOT FOUND')}")
+                        # Initialize tag_roi in session state if not exists
+                        if 'tag_roi' not in st.session_state:
+                            st.session_state.tag_roi = self.camera_manager.roi_coords['tag']
+                        if 'last_click' not in st.session_state:
+                            st.session_state.last_click = None
                         
-                        # Force a copy to prevent any weird reference issues
-                        frame_copy = frame.copy()
+                        # Get current ROI from session state
+                        current_roi = st.session_state.tag_roi
                         
-                        # Draw ROI directly here to ensure it happens
-                        x, y, w, h = self.camera_manager.roi_coords['tag']
-                        h_frame, w_frame = frame_copy.shape[:2]
+                        # Draw ROI with interactive handles
+                        display_frame = self.draw_roi_on_image(frame, current_roi)
                         
-                        # Scale if needed
-                        orig_w, orig_h = self.camera_manager.original_resolution
-                        if w_frame != orig_w or h_frame != orig_h:
-                            scale_x = w_frame / orig_w
-                            scale_y = h_frame / orig_h
-                            x = int(x * scale_x)
-                            y = int(y * scale_y)
-                            w = int(w * scale_x)
-                            h = int(h * scale_y)
+                        # Convert to PIL for interactive display
+                        display_pil = Image.fromarray(display_frame)
                         
-                        # Clamp to bounds
-                        x = max(0, min(x, w_frame - 1))
-                        y = max(0, min(y, h_frame - 1))
-                        w = max(1, min(w, w_frame - x))
-                        h = max(1, min(h, h_frame - y))
+                        # Display with click detection
+                        st.caption("🖱️ Click anywhere to move the ROI")
+                        clicked = streamlit_image_coordinates(
+                            display_pil,
+                            key="tag_roi_interactive"
+                        )
                         
-                        # Draw the ROI box directly
-                        cv2.rectangle(frame_copy, (x, y), (x+w, y+h), (0, 255, 0), 4)
-                        cv2.putText(frame_copy, "TAG ROI", (x, y-10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        # Handle click to move ROI
+                        if clicked is not None and clicked != st.session_state.last_click:
+                            st.session_state.last_click = clicked
+                            
+                            # Update ROI position
+                            new_roi = self.handle_roi_click(clicked, current_roi)
+                            st.session_state.tag_roi = new_roi
+                            
+                            # Save to config
+                            self.save_roi_to_config(new_roi)
+                            
+                            # Update camera manager's ROI
+                            self.camera_manager.roi_coords['tag'] = new_roi
+                            
+                            st.success(f"✅ ROI moved to ({new_roi[0]}, {new_roi[1]})")
+                            
+                            # Force refresh to show new position
+                            time.sleep(0.1)
+                            st.rerun()
                         
-                        st.caption(f"✅ Drew ROI at ({x}, {y}) size {w}x{h}")
+                        # Show ROI info
+                        col_info1, col_info2, col_info3 = st.columns(3)
+                        with col_info1:
+                            st.metric("Position", f"({current_roi[0]}, {current_roi[1]})")
+                        with col_info2:
+                            st.metric("Size", f"{current_roi[2]}×{current_roi[3]}")
+                        with col_info3:
+                            if st.button("🔄 Reset", key="reset_roi_btn"):
+                                st.session_state.tag_roi = (450, 300, 200, 120)
+                                self.save_roi_to_config(st.session_state.tag_roi)
+                                self.camera_manager.roi_coords['tag'] = st.session_state.tag_roi
+                                st.rerun()
                         
-                        # Display
-                        st.image(frame_copy, caption="🎯 Tag Camera - GREEN BOX shows tag area", 
-                                use_container_width=True)
-                        
-                        # Show zoom level
-                        zoom = st.session_state.get('zoom_level', 1.0)
-                        if zoom > 1.0:
-                            st.caption(f"🔍 Zoom: {zoom}x")
+                        # Show cropped ROI preview
+                        x, y, w, h = current_roi
+                        if 0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]:
+                            y_end = min(y + h, frame.shape[0])
+                            x_end = min(x + w, frame.shape[1])
+                            roi_preview = frame[y:y_end, x:x_end]
+                            
+                            with st.expander("🔍 ROI Preview"):
+                                st.image(roi_preview, caption="Cropped Tag Region", use_container_width=True)
                         
                         # Show brightness info
                         if self.auto_optimizer.enabled:
@@ -6458,7 +6625,9 @@ class EnhancedPipelineManager:
             
             with next_col:
                 if st.button("➡️", type="primary", key="next_compact", help="Next step"):
-                    self._execute_current_step()
+                    result = self._execute_current_step()
+                    # CRITICAL: Force refresh to show new step
+                    st.rerun()
             
             st.markdown("---")
             
@@ -6652,6 +6821,83 @@ class EnhancedPipelineManager:
             self.pipeline_data = PipelineData()
             st.rerun()
     
+    def draw_roi_on_image(self, image, roi_coords, color=(0, 255, 0), thickness=4):
+        """Draw ROI rectangle on image with interactive handles"""
+        if image is None:
+            return None
+        
+        img_with_roi = image.copy()
+        x, y, w, h = roi_coords
+        
+        # Draw rectangle
+        cv2.rectangle(img_with_roi, (x, y), (x + w, y + h), color, thickness)
+        
+        # Draw corner handles (for visual feedback)
+        handle_size = 15
+        handle_color = (0, 0, 255)  # Blue handles
+        cv2.rectangle(img_with_roi, (x - handle_size, y - handle_size), 
+                      (x + handle_size, y + handle_size), handle_color, -1)
+        cv2.rectangle(img_with_roi, (x + w - handle_size, y - handle_size), 
+                      (x + w + handle_size, y + handle_size), handle_color, -1)
+        cv2.rectangle(img_with_roi, (x - handle_size, y + h - handle_size), 
+                      (x + handle_size, y + h + handle_size), handle_color, -1)
+        cv2.rectangle(img_with_roi, (x + w - handle_size, y + h - handle_size), 
+                      (x + w + handle_size, y + h + handle_size), handle_color, -1)
+        
+        # Add label
+        cv2.putText(img_with_roi, "Click to Move ROI", (x, y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        return img_with_roi
+    
+    def handle_roi_click(self, click_coords, current_roi):
+        """Handle click to move ROI center to clicked position"""
+        if click_coords is None:
+            return current_roi
+        
+        x_click = click_coords['x']
+        y_click = click_coords['y']
+        
+        # Get current ROI dimensions (keep size the same)
+        _, _, w, h = current_roi
+        
+        # Center the ROI on the clicked point
+        new_x = max(0, x_click - w // 2)
+        new_y = max(0, y_click - h // 2)
+        
+        logger.info(f"[ROI-CLICK] Moved ROI from {current_roi[:2]} to ({new_x}, {new_y})")
+        
+        return (new_x, new_y, w, h)
+    
+    def save_roi_to_config(self, roi_coords):
+        """Save updated ROI to config file"""
+        import json
+        
+        config_file = 'roi_config.json'
+        
+        try:
+            # Load existing config
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+            else:
+                config = {'original_resolution': [1280, 720]}
+            
+            # Update tag ROI
+            config['roi_coords'] = config.get('roi_coords', {})
+            config['roi_coords']['tag'] = list(roi_coords)
+            
+            # Save
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            logger.info(f"[ROI-SAVE] Saved ROI to config: {roi_coords}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"[ROI-SAVE] Failed to save ROI: {e}")
+            return False
+
     def render_cool_step_pipeline(self):
         """Render an animated step pipeline with checkboxes on the right side"""
         
@@ -6803,10 +7049,50 @@ class EnhancedPipelineManager:
             st.session_state.focus_start_time = time.time()
             st.rerun()
         
+        if st.sidebar.button("🎯 Position Tag ROI"):
+            st.session_state.roi_positioning_mode = True
+            st.rerun()
+        
         if st.sidebar.button("🔄 Reset Pipeline"):
             self.current_step = 0
             self.pipeline_data = PipelineData()
             st.rerun()
+        
+        # Display Settings
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔄 Display Settings")
+        
+        auto_refresh = st.sidebar.checkbox(
+            "Auto-refresh display",
+            value=st.session_state.get('auto_refresh', True),
+            help="Automatically update the camera feed",
+            key="auto_refresh_checkbox"
+        )
+        st.session_state.auto_refresh = auto_refresh
+        
+        if auto_refresh:
+            refresh_rate = st.sidebar.slider(
+                "Refresh rate (seconds)",
+                min_value=0.5,
+                max_value=5.0,
+                value=1.0,
+                step=0.5,
+                key="refresh_rate_slider"
+            )
+            st.session_state.refresh_rate = refresh_rate
+            
+            # Auto-refresh using time-based trigger
+            if 'last_refresh' not in st.session_state:
+                st.session_state.last_refresh = time.time()
+            
+            current_time = time.time()
+            if current_time - st.session_state.last_refresh >= refresh_rate:
+                st.session_state.last_refresh = current_time
+                st.rerun()
+            
+            # Show countdown
+            time_until_refresh = refresh_rate - (current_time - st.session_state.last_refresh)
+            st.sidebar.caption(f"⏱️ Next refresh: {time_until_refresh:.1f}s")
         
         # System Tests
         st.sidebar.markdown("---")
@@ -10184,6 +10470,287 @@ class EnhancedPipelineManager:
                 st.write("Print functionality would be implemented here")
 
 # ==========================
+# ROI POSITIONING MODE
+# ==========================
+def render_roi_positioning_mode():
+    """Special mode to position tag ROI using FULL RealSense camera view"""
+    st.title("🎯 Tag ROI Positioning Tool - FULL CAMERA VIEW")
+    st.warning("⚠️ This shows your COMPLETE camera view so you can see your entire garment and locate the tag!")
+    
+    # Get pipeline manager
+    pm = st.session_state.pipeline_manager
+    
+    # Initialize ROI in session state if not exists
+    if 'tag_roi_temp' not in st.session_state:
+        st.session_state.tag_roi_temp = {
+            'x': pm.camera_manager.roi_coords['tag'][0],
+            'y': pm.camera_manager.roi_coords['tag'][1],
+            'w': pm.camera_manager.roi_coords['tag'][2],
+            'h': pm.camera_manager.roi_coords['tag'][3]
+        }
+    
+    if 'roi_move_step' not in st.session_state:
+        st.session_state.roi_move_step = 20
+    
+    # Resolution selector at top
+    res_col1, res_col2 = st.columns([3, 1])
+    with res_col1:
+        st.info("💡 If you can't see your full garment, the camera view might be too zoomed. This tool shows the COMPLETE camera frame.")
+    with res_col2:
+        move_step = st.select_slider(
+            "Move Step",
+            options=[5, 10, 20, 50],
+            value=st.session_state.roi_move_step,
+            help="Pixels per arrow click",
+            key="move_step_selector"
+        )
+        st.session_state.roi_move_step = move_step
+    
+    # Create layout: Camera (left) + Controls (right)
+    col_camera, col_controls = st.columns([3, 1])
+    
+    with col_camera:
+        st.subheader("📹 FULL RealSense Camera View")
+        st.caption("You should see your ENTIRE garment in this view - not cropped")
+        
+        # Get RealSense frame (FULL FRAME - no ROI applied)
+        frame = pm.camera_manager.get_realsense_frame()
+        
+        if frame is not None:
+            # Store actual frame size
+            st.session_state.frame_size = {
+                'width': frame.shape[1],
+                'height': frame.shape[0]
+            }
+            
+            # Draw ROI overlay on FULL RealSense feed
+            roi = st.session_state.tag_roi_temp
+            display_frame = frame.copy()
+            
+            x, y, w, h = roi['x'], roi['y'], roi['w'], roi['h']
+            
+            # Ensure ROI is within frame bounds
+            x = max(0, min(x, frame.shape[1] - w))
+            y = max(0, min(y, frame.shape[0] - h))
+            
+            # Draw main ROI rectangle with VERY THICK border
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 6)
+            
+            # Draw corner markers (larger for visibility)
+            corner_size = 25
+            corner_thickness = 6
+            
+            # Top-left corner
+            cv2.line(display_frame, (x, y), (x + corner_size, y), (0, 255, 0), corner_thickness)
+            cv2.line(display_frame, (x, y), (x, y + corner_size), (0, 255, 0), corner_thickness)
+            
+            # Top-right corner
+            cv2.line(display_frame, (x + w, y), (x + w - corner_size, y), (0, 255, 0), corner_thickness)
+            cv2.line(display_frame, (x + w, y), (x + w, y + corner_size), (0, 255, 0), corner_thickness)
+            
+            # Bottom-left corner
+            cv2.line(display_frame, (x, y + h), (x + corner_size, y + h), (0, 255, 0), corner_thickness)
+            cv2.line(display_frame, (x, y + h), (x, y + h - corner_size), (0, 255, 0), corner_thickness)
+            
+            # Bottom-right corner
+            cv2.line(display_frame, (x + w, y + h), (x + w - corner_size, y + h), (0, 255, 0), corner_thickness)
+            cv2.line(display_frame, (x + w, y + h), (x + w, y + h - corner_size), (0, 255, 0), corner_thickness)
+            
+            # Center crosshair (RED for visibility)
+            center_x, center_y = x + w // 2, y + h // 2
+            crosshair_size = 30
+            cv2.line(display_frame, (center_x - crosshair_size, center_y), 
+                     (center_x + crosshair_size, center_y), (0, 0, 255), 4)
+            cv2.line(display_frame, (center_x, center_y - crosshair_size), 
+                     (center_x, center_y + crosshair_size), (0, 0, 255), 4)
+            
+            # Add label with background
+            label = f"TAG ROI: {w}x{h} @ ({x}, {y})"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            font_thickness = 2
+            
+            # Get text size for background
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
+            
+            # Draw background rectangle for label
+            cv2.rectangle(display_frame, 
+                          (x, y - text_height - 20), 
+                          (x + text_width + 10, y - 5),
+                          (0, 0, 0), -1)
+            
+            # Draw label text
+            cv2.putText(display_frame, label, (x + 5, y - 10), 
+                        font, font_scale, (0, 255, 0), font_thickness)
+            
+            # Add instruction at top of frame
+            instruction = "Position GREEN BOX over your garment tag"
+            inst_x = frame.shape[1] // 2 - 350
+            cv2.rectangle(display_frame, (inst_x - 10, 10), (inst_x + 700, 55), (0, 0, 0), -1)
+            cv2.putText(display_frame, instruction, (inst_x, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+            
+            # Display FULL FRAME (use_container_width ensures full view)
+            st.image(display_frame, caption=f"🎯 Full RealSense View ({frame.shape[1]}x{frame.shape[0]})", 
+                     use_container_width=True)
+            
+            st.info(f"📐 Camera Resolution: {frame.shape[1]}x{frame.shape[0]} - You should see your ENTIRE garment!")
+            
+            # Show cropped ROI preview
+            if 0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]:
+                y_end = min(y + h, frame.shape[0])
+                x_end = min(x + w, frame.shape[1])
+                roi_preview = frame[y:y_end, x:x_end]
+                
+                st.markdown("---")
+                st.markdown("### 🔍 ROI Preview (What AI Will See)")
+                st.image(roi_preview, caption="Cropped Tag Region", use_container_width=True)
+        else:
+            st.error("❌ No RealSense frame available")
+            st.info("💡 Make sure RealSense camera is connected and Step 1 has been run at least once")
+    
+    with col_controls:
+        st.subheader("🎮 Controls")
+        
+        # Current position
+        st.metric("X Position", f"{roi['x']} px")
+        st.metric("Y Position", f"{roi['y']} px")
+        st.metric("Width", f"{roi['w']} px")
+        st.metric("Height", f"{roi['h']} px")
+        
+        st.markdown("---")
+        
+        # Arrow controls (configurable step size)
+        move_step = st.session_state.roi_move_step
+        st.markdown(f"### ⬆️⬇️⬅️➡️ Move ROI ({move_step}px)")
+        
+        frame_w = st.session_state.frame_size.get('width', 640)
+        frame_h = st.session_state.frame_size.get('height', 480)
+        
+        arrow_col1, arrow_col2, arrow_col3 = st.columns(3)
+        with arrow_col1:
+            if st.button("⬅️", key="roi_left", use_container_width=True):
+                st.session_state.tag_roi_temp['x'] = max(0, roi['x'] - move_step)
+                st.rerun()
+        with arrow_col2:
+            if st.button("⬆️", key="roi_up", use_container_width=True):
+                st.session_state.tag_roi_temp['y'] = max(0, roi['y'] - move_step)
+                st.rerun()
+        with arrow_col3:
+            if st.button("➡️", key="roi_right", use_container_width=True):
+                st.session_state.tag_roi_temp['x'] = min(frame_w - roi['w'], roi['x'] + move_step)
+                st.rerun()
+        
+        if st.button("⬇️", key="roi_down", use_container_width=True):
+            st.session_state.tag_roi_temp['y'] = min(frame_h - roi['h'], roi['y'] + move_step)
+            st.rerun()
+        
+        if st.button("🎯 Center", key="roi_center", use_container_width=True):
+            st.session_state.tag_roi_temp['x'] = (frame_w - roi['w']) // 2
+            st.session_state.tag_roi_temp['y'] = (frame_h - roi['h']) // 2
+            st.rerun()
+        
+        st.markdown("---")
+        
+        # Quick presets (frame-aware)
+        st.markdown("### 📍 Quick Presets")
+        
+        frame_w = st.session_state.frame_size.get('width', 640)
+        frame_h = st.session_state.frame_size.get('height', 480)
+        
+        preset_col1, preset_col2 = st.columns(2)
+        
+        with preset_col1:
+            if st.button("Top Left", key="preset_tl", use_container_width=True):
+                st.session_state.tag_roi_temp = {'x': 50, 'y': 50, 'w': 200, 'h': 120}
+                st.rerun()
+            
+            if st.button("Center Left", key="preset_cl", use_container_width=True):
+                st.session_state.tag_roi_temp = {'x': 50, 'y': (frame_h - 120) // 2, 'w': 200, 'h': 120}
+                st.rerun()
+            
+            if st.button("Bottom Left", key="preset_bl", use_container_width=True):
+                st.session_state.tag_roi_temp = {'x': 50, 'y': frame_h - 170, 'w': 200, 'h': 120}
+                st.rerun()
+        
+        with preset_col2:
+            if st.button("Top Right", key="preset_tr", use_container_width=True):
+                st.session_state.tag_roi_temp = {'x': frame_w - 250, 'y': 50, 'w': 200, 'h': 120}
+                st.rerun()
+            
+            if st.button("Center Right", key="preset_cr", use_container_width=True):
+                st.session_state.tag_roi_temp = {'x': frame_w - 250, 'y': (frame_h - 120) // 2, 'w': 200, 'h': 120}
+                st.rerun()
+            
+            if st.button("Bottom Right", key="preset_br", use_container_width=True):
+                st.session_state.tag_roi_temp = {'x': frame_w - 250, 'y': frame_h - 170, 'w': 200, 'h': 120}
+                st.rerun()
+        
+        if st.button("🎯 Absolute Center", key="preset_center", type="secondary", use_container_width=True):
+            st.session_state.tag_roi_temp = {
+                'x': (frame_w - 200) // 2,
+                'y': (frame_h - 120) // 2,
+                'w': 200,
+                'h': 120
+            }
+            st.rerun()
+        
+        st.markdown("---")
+        
+        # Sliders for fine control (frame-aware)
+        st.markdown("### 🎚️ Fine Tune")
+        
+        max_x = max(0, frame_w - roi['w'])
+        max_y = max(0, frame_h - roi['h'])
+        
+        new_x = st.slider("X Position", 0, max_x, roi['x'], key="fine_x", step=5)
+        if new_x != roi['x']:
+            st.session_state.tag_roi_temp['x'] = new_x
+            st.rerun()
+        
+        new_y = st.slider("Y Position", 0, max_y, roi['y'], key="fine_y", step=5)
+        if new_y != roi['y']:
+            st.session_state.tag_roi_temp['y'] = new_y
+            st.rerun()
+        
+        # Size adjustments
+        new_w = st.slider("Width", 100, 400, roi['w'], key="w_slider", step=10)
+        if new_w != roi['w']:
+            st.session_state.tag_roi_temp['w'] = new_w
+            st.rerun()
+        
+        new_h = st.slider("Height", 80, 300, roi['h'], key="h_slider", step=10)
+        if new_h != roi['h']:
+            st.session_state.tag_roi_temp['h'] = new_h
+            st.rerun()
+        
+        st.markdown("---")
+        
+        # Action buttons
+        if st.button("✅ Save & Exit", key="save_roi", type="primary", use_container_width=True):
+            # Update camera manager ROI
+            new_roi = (
+                st.session_state.tag_roi_temp['x'],
+                st.session_state.tag_roi_temp['y'],
+                st.session_state.tag_roi_temp['w'],
+                st.session_state.tag_roi_temp['h']
+            )
+            pm.camera_manager.roi_coords['tag'] = new_roi
+            
+            # Save to config file
+            pm.save_roi_to_config(new_roi)
+            
+            st.success(f"✅ ROI saved: {new_roi}")
+            
+            # Exit positioning mode
+            st.session_state.roi_positioning_mode = False
+            st.rerun()
+        
+        if st.button("❌ Cancel", key="cancel_roi", use_container_width=True):
+            st.session_state.roi_positioning_mode = False
+            st.rerun()
+
+# ==========================
 # MAIN FUNCTION
 # ==========================
 def render_focus_mode(pm):
@@ -10725,9 +11292,19 @@ def main():
         st.session_state.focus_mode_started = False  # Reset to trigger cache clearing
         st.rerun()
     
+    # Check for ROI positioning mode
+    if st.session_state.get("roi_positioning_mode", False):
+        render_roi_positioning_mode()
+        return
+    
     # Check for focus mode
     if st.session_state.get("focus_mode", False):
         render_focus_mode(st.session_state.pipeline_manager)
+        return
+    
+    # Check for defect collection mode
+    if st.session_state.get('defect_collection_mode', False):
+        render_defect_collection_mode()
         return
     
     # Main content - COMPACT LAYOUT
