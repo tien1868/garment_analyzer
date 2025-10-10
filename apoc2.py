@@ -30,11 +30,9 @@ import hashlib
 from vertexai.generative_models import GenerativeModel, Part
 import vertexai
 from functools import wraps
-from collections import Counter
 from threading import Thread
 import traceback
 import streamlit.components.v1 as components
-from streamlit_image_coordinates import streamlit_image_coordinates
 import re
 import requests
 import socket
@@ -2802,13 +2800,70 @@ class OpenAIVisionCameraManager:
                 click_x, click_y = clicked['x'], clicked['y']
                 
                 if not st.session_state.dragging:
-                    # Start drag
-                    dist = np.sqrt((click_x - cx)**2 + (click_y - cy)**2)
-                    if dist < 20:
-                        st.session_state.drag_handle = "center"
+                    # Detect what was clicked
+                    handle_clicked = None
+                    
+                    # Check if corner was clicked
+                    for corner_x, corner_y, corner_name in corners:
+                        if abs(click_x - corner_x) < handle_size and abs(click_y - corner_y) < handle_size:
+                            handle_clicked = corner_name
+                            break
+                    
+                    # Check if center was clicked
+                    if handle_clicked is None:
+                        dist = np.sqrt((click_x - cx)**2 + (click_y - cy)**2)
+                        if dist < 20:
+                            handle_clicked = "center"
+                    
+                    if handle_clicked:
+                        st.session_state.drag_handle = handle_clicked
                         st.session_state.dragging = True
                         st.session_state.drag_start_coords = (click_x, click_y, x, y, w, h)
                         st.rerun()
+                
+                else:
+                    # Update ROI based on drag
+                    start_x, start_y, orig_x, orig_y, orig_w, orig_h = st.session_state.drag_start_coords
+                    dx = click_x - start_x
+                    dy = click_y - start_y
+                    
+                    new_x, new_y, new_w, new_h = orig_x, orig_y, orig_w, orig_h
+                    
+                    handle = st.session_state.drag_handle
+                    
+                    if handle == "center":
+                        # Move entire ROI
+                        new_x = max(0, min(frame.shape[1] - orig_w, orig_x + dx))
+                        new_y = max(0, min(frame.shape[0] - orig_h, orig_y + dy))
+                    
+                    elif handle == "TL":  # top-left
+                        new_x = max(0, orig_x + dx)
+                        new_y = max(0, orig_y + dy)
+                        new_w = max(50, orig_w - dx)
+                        new_h = max(50, orig_h - dy)
+                    
+                    elif handle == "TR":  # top-right
+                        new_y = max(0, orig_y + dy)
+                        new_w = max(50, orig_w + dx)
+                        new_h = max(50, orig_h - dy)
+                    
+                    elif handle == "BL":  # bottom-left
+                        new_x = max(0, orig_x + dx)
+                        new_w = max(50, orig_w - dx)
+                        new_h = max(50, orig_h + dy)
+                    
+                    elif handle == "BR":  # bottom-right
+                        new_w = max(50, orig_w + dx)
+                        new_h = max(50, orig_h + dy)
+                    
+                    # Enforce bounds
+                    new_x = max(0, min(frame.shape[1] - 50, new_x))
+                    new_y = max(0, min(frame.shape[0] - 50, new_y))
+                    new_w = min(frame.shape[1] - new_x, new_w)
+                    new_h = min(frame.shape[0] - new_y, new_h)
+                    
+                    st.session_state.temp_roi = (new_x, new_y, new_w, new_h)
+                    st.rerun()
         
         # Manual controls
         st.markdown("---")
