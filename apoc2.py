@@ -6492,75 +6492,29 @@ class EnhancedPipelineManager:
             
             # Show appropriate camera based on current step
             if self.current_step == 0:
-                # Tag camera with INTERACTIVE ROI (click to move)
+                # Tag camera with SIMPLE ROI overlay (full frame view)
                 try:
-                    frame = self.camera_manager.get_arducam_frame()
+                    # Use the new helper function to show FULL frame with ROI overlay
+                    full_frame, tag_crop = display_camera_with_roi_overlay(
+                        self.camera_manager,
+                        camera_type='arducam',
+                        roi_type='tag'
+                    )
                     
-                    if frame is not None:
-                        # Initialize tag_roi in session state if not exists
-                        if 'tag_roi' not in st.session_state:
-                            st.session_state.tag_roi = self.camera_manager.roi_coords['tag']
-                        if 'last_click' not in st.session_state:
-                            st.session_state.last_click = None
+                    if full_frame is not None:
+                        # Display FULL camera frame with green ROI box overlay
+                        st.image(full_frame, caption="📸 Full Camera View - Green box shows Tag ROI", 
+                                use_container_width=True)
                         
-                        # Get current ROI from session state
-                        current_roi = st.session_state.tag_roi
+                        # Show current ROI coordinates
+                        roi_coords = self.camera_manager.roi_coords.get('tag', (0, 0, 0, 0))
+                        st.info(f"Tag ROI: Position ({roi_coords[0]}, {roi_coords[1]}) | Size {roi_coords[2]}×{roi_coords[3]}")
                         
-                        # Draw ROI with interactive handles
-                        display_frame = self.draw_roi_on_image(frame, current_roi)
-                        
-                        # Convert to PIL for interactive display
-                        display_pil = Image.fromarray(display_frame)
-                        
-                        # Display with click detection
-                        st.caption("🖱️ Click anywhere to move the ROI")
-                        clicked = streamlit_image_coordinates(
-                            display_pil,
-                            key="tag_roi_interactive"
-                        )
-                        
-                        # Handle click to move ROI
-                        if clicked is not None and clicked != st.session_state.last_click:
-                            st.session_state.last_click = clicked
-                            
-                            # Update ROI position
-                            new_roi = self.handle_roi_click(clicked, current_roi)
-                            st.session_state.tag_roi = new_roi
-                            
-                            # Save to config
-                            self.save_roi_to_config(new_roi)
-                            
-                            # Update camera manager's ROI
-                            self.camera_manager.roi_coords['tag'] = new_roi
-                            
-                            st.success(f"✅ ROI moved to ({new_roi[0]}, {new_roi[1]})")
-                            
-                            # Force refresh to show new position
-                            time.sleep(0.1)
-                            st.rerun()
-                        
-                        # Show ROI info
-                        col_info1, col_info2, col_info3 = st.columns(3)
-                        with col_info1:
-                            st.metric("Position", f"({current_roi[0]}, {current_roi[1]})")
-                        with col_info2:
-                            st.metric("Size", f"{current_roi[2]}×{current_roi[3]}")
-                        with col_info3:
-                            if st.button("🔄 Reset", key="reset_roi_btn"):
-                                st.session_state.tag_roi = (450, 300, 200, 120)
-                                self.save_roi_to_config(st.session_state.tag_roi)
-                                self.camera_manager.roi_coords['tag'] = st.session_state.tag_roi
-                                st.rerun()
-                        
-                        # Show cropped ROI preview
-                        x, y, w, h = current_roi
-                        if 0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]:
-                            y_end = min(y + h, frame.shape[0])
-                            x_end = min(x + w, frame.shape[1])
-                            roi_preview = frame[y:y_end, x:x_end]
-                            
-                            with st.expander("🔍 ROI Preview"):
-                                st.image(roi_preview, caption="Cropped Tag Region", use_container_width=True)
+                        # Show cropped ROI preview in expander
+                        if tag_crop is not None:
+                            with st.expander("🔍 Tag ROI Preview (What AI Will See)"):
+                                st.image(tag_crop, caption="Cropped Tag Region", use_container_width=True)
+                                st.caption(f"Size: {tag_crop.shape[1]}×{tag_crop.shape[0]} pixels")
                         
                         # Show brightness info
                         if self.auto_optimizer.enabled:
