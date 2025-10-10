@@ -6517,19 +6517,16 @@ class EnhancedPipelineManager:
                                 st.caption(f"Size: {tag_crop.shape[1]}×{tag_crop.shape[0]} pixels")
                         
                         # Show brightness info
-                        if self.auto_optimizer.enabled:
-                            zoom = st.session_state.get('zoom_level', 1.0)
-                            roi_preview = self.camera_manager.apply_roi(frame, 'tag', zoom_factor=zoom)
-                            if roi_preview is not None:
-                                brightness_info = self.auto_optimizer.analyze_image_brightness(roi_preview)
-                                if brightness_info:
-                                    mean = brightness_info['mean']
-                                    if mean > 180:
-                                        st.caption("💡 Very bright - will reduce on capture")
-                                    elif mean < 60:
-                                        st.caption("💡 Dark - will boost on capture")
-                                    else:
-                                        st.caption("✅ Good lighting")
+                        if self.auto_optimizer.enabled and tag_crop is not None:
+                            brightness_info = self.auto_optimizer.analyze_image_brightness(tag_crop)
+                            if brightness_info:
+                                mean = brightness_info['mean']
+                                if mean > 180:
+                                    st.caption("💡 Very bright - will reduce on capture")
+                                elif mean < 60:
+                                    st.caption("💡 Dark - will boost on capture")
+                                else:
+                                    st.caption("✅ Good lighting")
                     else:
                         st.error("❌ No camera frame available")
                         
