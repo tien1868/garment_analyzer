@@ -2729,6 +2729,28 @@ class OpenAIVisionCameraManager:
         # Motion detected if difference exceeds threshold (lowered from 30 to 20 for better sensitivity)
         return mean_diff > threshold
     
+    def save_roi_config_method(self):
+        """Save ROI configuration to roi_config.json"""
+        try:
+            config = {
+                'roi_coords': {
+                    'tag': list(self.roi_coords.get('tag', (183, 171, 211, 159))),
+                    'work': list(self.roi_coords.get('work', (38, 33, 592, 435)))
+                },
+                'original_resolution': list(self.original_resolution),
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            with open('roi_config.json', 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            logger.info("✅ ROI configuration saved to roi_config.json")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to save ROI config: {e}")
+            return False
+    
     def cleanup(self):
         """Release camera resources"""
         if self.arducam_cap:
