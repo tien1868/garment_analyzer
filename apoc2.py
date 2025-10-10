@@ -2728,7 +2728,10 @@ class OpenAIVisionCameraManager:
         return mean_diff > threshold
     
     def render_interactive_roi_editor(self):
-        """Interactive ROI editor with full click-and-drag functionality"""
+        """
+        Interactive ROI editor with full click-and-drag functionality
+        Call this from a dedicated page in your Streamlit app
+        """
         st.title("🎯 ROI Configuration Editor")
         st.markdown("**Click and drag** to adjust Region of Interest boxes")
         
@@ -2746,28 +2749,29 @@ class OpenAIVisionCameraManager:
         col1, col2 = st.columns([1, 3])
         
         with col1:
-            roi_type = st.radio("Select ROI:", ["tag", "work"], key="roi_type_selector")
+            roi_type = st.radio("Select ROI to edit:", ["tag", "work"], key="roi_type_selector")
             
             st.markdown("---")
             st.markdown("**Controls:**")
             st.info("""
-🟡 **Corners**: Drag to resize
-🔵 **Center**: Drag to move
-⌨️ **Manual**: Use inputs
+            🟡 **Yellow Corners**: Drag to resize
+            🔵 **Blue Center**: Drag to move
+            ⌨️ **Manual**: Use inputs below
             """)
             
             if st.session_state.dragging:
                 st.warning(f"🖱️ Dragging {st.session_state.drag_handle}...")
-                if st.button("⏹️ Stop"):
+                if st.button("⏹️ Stop Dragging"):
                     st.session_state.dragging = False
+                    st.session_state.drag_handle = None
                     st.rerun()
         
         with col2:
-            # Get frame
-            frame = self.get_arducam_frame() if roi_type == 'tag' else self.get_realsense_frame()
+            # Get current frame from camera
+            frame = self.get_arducam_frame()
             
             if frame is None:
-                st.error("❌ No camera frame")
+                st.error("❌ Cannot get camera frame. Check camera connection.")
                 return
             
             # Get current ROI
@@ -2778,46 +2782,65 @@ class OpenAIVisionCameraManager:
             
             x, y, w, h = current_roi
             
-            # Draw ROI
-            display = frame.copy()
-            cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            # Draw ROI on frame
+            display_frame = frame.copy()
             
-            # Corners
+            # Draw rectangle
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+            # Draw corner handles (yellow squares)
             handle_size = 15
-            corners = [(x, y, "TL"), (x+w, y, "TR"), (x, y+h, "BL"), (x+w, y+h, "BR")]
-            for cx, cy, _ in corners:
-                cv2.rectangle(display, (cx-handle_size//2, cy-handle_size//2),
-                            (cx+handle_size//2, cy+handle_size//2), (255, 255, 0), -1)
+            corners = [
+                (x, y, "top-left"),
+                (x + w, y, "top-right"),
+                (x, y + h, "bottom-left"),
+                (x + w, y + h, "bottom-right")
+            ]
             
-            # Center
-            cx, cy = x + w//2, y + h//2
-            cv2.circle(display, (cx, cy), 20, (0, 0, 255), -1)
+            for cx, cy, name in corners:
+                cv2.rectangle(display_frame, 
+                             (cx - handle_size//2, cy - handle_size//2),
+                             (cx + handle_size//2, cy + handle_size//2),
+                             (255, 255, 0), -1)
             
-            # Display
-            clicked = streamlit_image_coordinates(display, key=f"roi_ed_{roi_type}")
+            # Draw center handle (blue circle)
+            center_x = x + w // 2
+            center_y = y + h // 2
+            cv2.circle(display_frame, (center_x, center_y), 20, (0, 0, 255), -1)
             
-            if clicked:
-                click_x, click_y = clicked['x'], clicked['y']
+            # Add label
+            label = f"{roi_type.upper()}: {w}x{h}"
+            cv2.putText(display_frame, label, (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Display with click tracking
+            coords = streamlit_image_coordinates(
+                display_frame,
+                key=f"roi_editor_{roi_type}_{st.session_state.get('roi_refresh', 0)}"
+            )
+            
+            # Handle clicks/drags
+            if coords is not None:
+                click_x, click_y = coords['x'], coords['y']
                 
+                # Detect what was clicked
                 if not st.session_state.dragging:
-                    # Detect what was clicked
-                    handle_clicked = None
-                    
                     # Check if corner was clicked
-                    for corner_x, corner_y, corner_name in corners:
-                        if abs(click_x - corner_x) < handle_size and abs(click_y - corner_y) < handle_size:
-                            handle_clicked = corner_name
+                    handle_clicked = None
+                    for cx, cy, name in corners:
+                        if abs(click_x - cx) < handle_size and abs(click_y - cy) < handle_size:
+                            handle_clicked = name
                             break
                     
                     # Check if center was clicked
                     if handle_clicked is None:
-                        dist = np.sqrt((click_x - cx)**2 + (click_y - cy)**2)
+                        dist = np.sqrt((click_x - center_x)**2 + (click_y - center_y)**2)
                         if dist < 20:
                             handle_clicked = "center"
                     
                     if handle_clicked:
-                        st.session_state.drag_handle = handle_clicked
                         st.session_state.dragging = True
+                        st.session_state.drag_handle = handle_clicked
                         st.session_state.drag_start_coords = (click_x, click_y, x, y, w, h)
                         st.rerun()
                 
@@ -2836,23 +2859,23 @@ class OpenAIVisionCameraManager:
                         new_x = max(0, min(frame.shape[1] - orig_w, orig_x + dx))
                         new_y = max(0, min(frame.shape[0] - orig_h, orig_y + dy))
                     
-                    elif handle == "TL":  # top-left
+                    elif handle == "top-left":
                         new_x = max(0, orig_x + dx)
                         new_y = max(0, orig_y + dy)
                         new_w = max(50, orig_w - dx)
                         new_h = max(50, orig_h - dy)
                     
-                    elif handle == "TR":  # top-right
+                    elif handle == "top-right":
                         new_y = max(0, orig_y + dy)
                         new_w = max(50, orig_w + dx)
                         new_h = max(50, orig_h - dy)
                     
-                    elif handle == "BL":  # bottom-left
+                    elif handle == "bottom-left":
                         new_x = max(0, orig_x + dx)
                         new_w = max(50, orig_w - dx)
                         new_h = max(50, orig_h + dy)
                     
-                    elif handle == "BR":  # bottom-right
+                    elif handle == "bottom-right":
                         new_w = max(50, orig_w + dx)
                         new_h = max(50, orig_h + dy)
                     
@@ -2865,44 +2888,70 @@ class OpenAIVisionCameraManager:
                     st.session_state.temp_roi = (new_x, new_y, new_w, new_h)
                     st.rerun()
         
-        # Manual controls
+        # Manual adjustment controls
         st.markdown("---")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            nx = st.number_input("X", 0, 2000, x, key=f"mx_{roi_type}")
-        with col2:
-            ny = st.number_input("Y", 0, 2000, y, key=f"my_{roi_type}")
-        with col3:
-            nw = st.number_input("W", 50, 1000, w, key=f"mw_{roi_type}")
-        with col4:
-            nh = st.number_input("H", 50, 1000, h, key=f"mh_{roi_type}")
+        st.subheader("Manual Adjustment")
         
-        if (nx, ny, nw, nh) != current_roi:
-            st.session_state.temp_roi = (nx, ny, nw, nh)
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            new_x = st.number_input("X Position", 0, frame.shape[1], x, key=f"manual_x_{roi_type}")
+        with col2:
+            new_y = st.number_input("Y Position", 0, frame.shape[0], y, key=f"manual_y_{roi_type}")
+        with col3:
+            new_w = st.number_input("Width", 50, frame.shape[1], w, key=f"manual_w_{roi_type}")
+        with col4:
+            new_h = st.number_input("Height", 50, frame.shape[0], h, key=f"manual_h_{roi_type}")
+        
+        if (new_x, new_y, new_w, new_h) != current_roi:
+            st.session_state.temp_roi = (new_x, new_y, new_w, new_h)
             st.rerun()
         
-        # Save/Reset
-        col1, col2 = st.columns(2)
+        # Action buttons
+        col1, col2, col3 = st.columns(3)
+        
         with col1:
-            if st.button("💾 Save", type="primary"):
+            if st.button("💾 Save ROI", type="primary"):
                 if st.session_state.temp_roi:
                     self.roi_coords[roi_type] = st.session_state.temp_roi
-                self.save_roi_config_method()
+                self.save_roi_config()
                 st.session_state.temp_roi = None
-                st.success("✅ Saved!")
+                st.success(f"✅ {roi_type.upper()} ROI saved!")
                 st.rerun()
+        
         with col2:
-            if st.button("🔄 Reset"):
+            if st.button("🔄 Reset to Default"):
+                default_rois = {
+                    'tag': (183, 171, 211, 159),
+                    'work': (38, 33, 592, 435)
+                }
+                st.session_state.temp_roi = default_rois[roi_type]
+                st.rerun()
+        
+        with col3:
+            if st.button("❌ Cancel Changes"):
                 st.session_state.temp_roi = None
                 st.rerun()
+        
+        # ROI Statistics
+        st.markdown("---")
+        st.subheader("ROI Statistics")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Position", f"({x}, {y})")
+        with col2:
+            st.metric("Size", f"{w} × {h}")
+        with col3:
+            aspect = w / h if h > 0 else 0
+            st.metric("Aspect Ratio", f"{aspect:.2f}:1")
     
-    def save_roi_config_method(self):
-        """Save ROI configuration to roi_config.json"""
+    def save_roi_config(self):
+        """Save ROI configuration to file"""
         try:
             config = {
                 'roi_coords': {
-                    'tag': list(self.roi_coords.get('tag', (183, 171, 211, 159))),
-                    'work': list(self.roi_coords.get('work', (38, 33, 592, 435)))
+                    'tag': list(self.roi_coords['tag']),
+                    'work': list(self.roi_coords['work'])
                 },
                 'original_resolution': list(self.original_resolution),
                 'timestamp': datetime.now().isoformat()
@@ -2911,9 +2960,9 @@ class OpenAIVisionCameraManager:
             with open('roi_config.json', 'w') as f:
                 json.dump(config, f, indent=2)
             
-            logger.info("✅ ROI configuration saved to roi_config.json")
+            logger.info(f"✅ ROI config saved: tag={config['roi_coords']['tag']}, work={config['roi_coords']['work']}")
             return True
-        
+            
         except Exception as e:
             logger.error(f"Failed to save ROI config: {e}")
             return False
