@@ -2729,6 +2729,118 @@ class OpenAIVisionCameraManager:
         # Motion detected if difference exceeds threshold (lowered from 30 to 20 for better sensitivity)
         return mean_diff > threshold
     
+    def render_interactive_roi_editor(self):
+        """Interactive ROI editor with full click-and-drag functionality"""
+        st.title("🎯 ROI Configuration Editor")
+        st.markdown("**Click and drag** to adjust Region of Interest boxes")
+        
+        # Initialize session state for dragging
+        if 'dragging' not in st.session_state:
+            st.session_state.dragging = False
+        if 'drag_handle' not in st.session_state:
+            st.session_state.drag_handle = None
+        if 'drag_start_coords' not in st.session_state:
+            st.session_state.drag_start_coords = None
+        if 'temp_roi' not in st.session_state:
+            st.session_state.temp_roi = None
+        
+        # ROI Selection
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            roi_type = st.radio("Select ROI:", ["tag", "work"], key="roi_type_selector")
+            
+            st.markdown("---")
+            st.markdown("**Controls:**")
+            st.info("""
+🟡 **Corners**: Drag to resize
+🔵 **Center**: Drag to move
+⌨️ **Manual**: Use inputs
+            """)
+            
+            if st.session_state.dragging:
+                st.warning(f"🖱️ Dragging {st.session_state.drag_handle}...")
+                if st.button("⏹️ Stop"):
+                    st.session_state.dragging = False
+                    st.rerun()
+        
+        with col2:
+            # Get frame
+            frame = self.get_arducam_frame() if roi_type == 'tag' else self.get_realsense_frame()
+            
+            if frame is None:
+                st.error("❌ No camera frame")
+                return
+            
+            # Get current ROI
+            if st.session_state.temp_roi is not None:
+                current_roi = st.session_state.temp_roi
+            else:
+                current_roi = self.roi_coords.get(roi_type, (100, 100, 200, 150))
+            
+            x, y, w, h = current_roi
+            
+            # Draw ROI
+            display = frame.copy()
+            cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # Corners
+            handle_size = 15
+            corners = [(x, y, "TL"), (x+w, y, "TR"), (x, y+h, "BL"), (x+w, y+h, "BR")]
+            for cx, cy, _ in corners:
+                cv2.rectangle(display, (cx-handle_size//2, cy-handle_size//2),
+                            (cx+handle_size//2, cy+handle_size//2), (255, 255, 0), -1)
+            
+            # Center
+            cx, cy = x + w//2, y + h//2
+            cv2.circle(display, (cx, cy), 20, (0, 0, 255), -1)
+            
+            # Display
+            clicked = streamlit_image_coordinates(display, key=f"roi_ed_{roi_type}")
+            
+            if clicked:
+                click_x, click_y = clicked['x'], clicked['y']
+                
+                if not st.session_state.dragging:
+                    # Start drag
+                    dist = np.sqrt((click_x - cx)**2 + (click_y - cy)**2)
+                    if dist < 20:
+                        st.session_state.drag_handle = "center"
+                        st.session_state.dragging = True
+                        st.session_state.drag_start_coords = (click_x, click_y, x, y, w, h)
+                        st.rerun()
+        
+        # Manual controls
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            nx = st.number_input("X", 0, 2000, x, key=f"mx_{roi_type}")
+        with col2:
+            ny = st.number_input("Y", 0, 2000, y, key=f"my_{roi_type}")
+        with col3:
+            nw = st.number_input("W", 50, 1000, w, key=f"mw_{roi_type}")
+        with col4:
+            nh = st.number_input("H", 50, 1000, h, key=f"mh_{roi_type}")
+        
+        if (nx, ny, nw, nh) != current_roi:
+            st.session_state.temp_roi = (nx, ny, nw, nh)
+            st.rerun()
+        
+        # Save/Reset
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save", type="primary"):
+                if st.session_state.temp_roi:
+                    self.roi_coords[roi_type] = st.session_state.temp_roi
+                self.save_roi_config_method()
+                st.session_state.temp_roi = None
+                st.success("✅ Saved!")
+                st.rerun()
+        with col2:
+            if st.button("🔄 Reset"):
+                st.session_state.temp_roi = None
+                st.rerun()
+    
     def save_roi_config_method(self):
         """Save ROI configuration to roi_config.json"""
         try:
@@ -7026,6 +7138,10 @@ class EnhancedPipelineManager:
             st.session_state.roi_positioning_mode = True
             st.rerun()
         
+        if st.sidebar.button("🎨 Interactive ROI Editor"):
+            st.session_state.interactive_roi_mode = True
+            st.rerun()
+        
         if st.sidebar.button("🔄 Reset Pipeline"):
             self.current_step = 0
             self.pipeline_data = PipelineData()
@@ -11264,6 +11380,14 @@ def main():
         st.session_state.focus_start_time = time.time()
         st.session_state.focus_mode_started = False  # Reset to trigger cache clearing
         st.rerun()
+    
+    # Check for interactive ROI editor mode
+    if st.session_state.get("interactive_roi_mode", False):
+        st.session_state.pipeline_manager.camera_manager.render_interactive_roi_editor()
+        if st.button("❌ Close ROI Editor"):
+            st.session_state.interactive_roi_mode = False
+            st.rerun()
+        return
     
     # Check for ROI positioning mode
     if st.session_state.get("roi_positioning_mode", False):
