@@ -7236,8 +7236,8 @@ class EnhancedPipelineManager:
                     )
                     
                     if full_frame is not None:
-                        # Display FULL camera frame with green ROI box overlay
-                        st.image(full_frame, caption="📸 Full Camera View - Green box shows Tag ROI", 
+                        # Display FULL camera frame with green ROI box overlay (no button overlay needed)
+                        st.image(full_frame, caption="📸 Full Camera View - Green box shows Tag ROI",
                                 width='stretch')
                         
                         # Show current ROI coordinates
@@ -9335,357 +9335,64 @@ class EnhancedPipelineManager:
             else: return "XXXL"
     
     def render_action_panel(self):
-        """Simplified action panel with consistent Next Step button"""
-        
-        # ===== EMERGENCY DEBUG SECTION - ADD THIS AT THE TOP =====
+        """Simplified, robust action panel that prevents infinite loops."""
         st.markdown("---")
-        st.markdown("### 🔧 DEBUG CONTROLS")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.write(f"**Current Step:** {st.session_state.pipeline_manager.current_step}")
-        
-        with col2:
-            if st.button("⚡ FORCE NEXT (Debug)", key="force_next_debug"):
-                old_step = st.session_state.pipeline_manager.current_step
-                st.session_state.pipeline_manager.current_step += 1
-                st.success(f"Forced {old_step} → {st.session_state.pipeline_manager.current_step}")
-                time.sleep(0.5)  # Brief pause to see the message
-                st.rerun()
-        
-        with col3:
-            if st.button("🔄 Reset to Step 0", key="reset_debug"):
-                st.session_state.pipeline_manager.current_step = 0
-                st.rerun()
-        
-        st.markdown("---")
-        # ===== END DEBUG SECTION =====
-        
-        # Log every time this renders
-        logger.info(f"[PANEL] Rendering action panel - Step: {st.session_state.pipeline_manager.current_step}")
-        
-        # Check for infinite loops
-        if 'panel_render_count' not in st.session_state:
-            st.session_state.panel_render_count = 0
-        
-        st.session_state.panel_render_count += 1
-        
-        if st.session_state.panel_render_count > 100:
-            st.error("🛑 Too many reruns detected - using debug controls instead")
-            # Don't stop, just warn
-        
-        logger.info(f"[PANEL] Render count: {st.session_state.panel_render_count}")
-        
-        # LOOP PREVENTION: Throttle this function (but always show Next Step button)
-        if 'action_panel_last_call' not in st.session_state:
-            st.session_state.action_panel_last_call = 0
-        
-        current_time = time.time()
-        should_throttle = current_time - st.session_state.action_panel_last_call < 0.3  # Reduced from 0.5s to 0.3s
-        
-        st.session_state.action_panel_last_call = current_time
-        
-        # LOOP PREVENTION: Track action panel executions
-        if 'action_panel_count' not in st.session_state:
-            st.session_state.action_panel_count = 0
-        st.session_state.action_panel_count += 1
-        
-        if st.session_state.action_panel_count > 50:  # More than 50 executions
-            st.error("🛑 **INFINITE LOOP DETECTED** - Please refresh the page to reset.")
-            st.stop()
-        
-        st.markdown("---")
-        
-        # ALWAYS show the Next Step button - even if throttling
-        # Show step progress bar, reset button, and Next Step button at the top
-        progress_col1, progress_col2, reset_col, next_col = st.columns([2, 1, 1, 1])
-        with progress_col1:
-            steps_len = len(self.steps)
-            if steps_len > 0:
-                progress_val = (st.session_state.pipeline_manager.current_step + 1) / steps_len
-                progress_val = min(max(progress_val, 0.0), 1.0)  # Clamp to valid range
-                st.progress(progress_val)
-            else:
-                st.progress(0.0)
-        with progress_col2:
-            st.write(f"Step {st.session_state.pipeline_manager.current_step + 1} of {len(self.steps)}")
+
+        # Header with progress bar, reset, and the main Next Step button
+        progress_col, reset_col, next_col = st.columns([3, 1, 1])
+
+        with progress_col:
+            progress = (self.current_step + 1) / len(self.steps)
+            st.progress(progress, text=f"Step {self.current_step + 1}: {self.steps[self.current_step]}")
+
         with reset_col:
-            if st.button("🔄 Reset", help="Start over with new garment", key="reset_pipeline"):
-                # Clear all pipeline data including images
-                st.session_state.pipeline_manager.pipeline_data = PipelineData()
-                st.session_state.pipeline_manager.current_step = 0
-                
-                # Clear retry flags and loop prevention
-                # Reset session state for fresh start
-                
-                # Clear any cached camera frames or images
-                if 'cached_tag_frame' in st.session_state:
-                    del st.session_state.cached_tag_frame
-                if 'cached_garment_frame' in st.session_state:
-                    del st.session_state.cached_garment_frame
-                if 'last_camera_frame' in st.session_state:
-                    del st.session_state.last_camera_frame
-                
-                # Clear any UI state flags
-                if 'show_tag_preview' in st.session_state:
-                    st.session_state.show_tag_preview = False
-                if 'show_garment_preview' in st.session_state:
-                    st.session_state.show_garment_preview = False
-                # Reset Next Step button flag
-                st.session_state.next_step_button_rendered = False
-                
-                st.success("✅ Pipeline reset! Camera feed refreshed.")
+            if st.button("🔄 Reset", key="reset_button"):
+                self.current_step = 0
+                self.pipeline_data = PipelineData()
                 st.rerun()
+
         with next_col:
-            # Debug mode checkbox
-            if st.checkbox("🔧 Debug Mode", help="Show debug information and force advance button"):
-                st.caption(f"Debug: Panel renders: {st.session_state.get('action_panel_count', 0)}")
-                st.caption(f"Current step: {st.session_state.pipeline_manager.current_step}")
-                st.caption(f"Tag image exists: {st.session_state.pipeline_manager.pipeline_data.tag_image is not None}")
-                st.caption(f"Brand: {st.session_state.pipeline_manager.pipeline_data.brand}")
-                
-                if st.button("⚡ Force Next Step", help="Emergency bypass - may skip validation"):
-                    st.session_state.pipeline_manager.current_step += 1
-                    st.warning("⚠️ Forced advance - may skip validation")
-                    st.rerun()
-            
-            # Simplified Next Step button with comprehensive logging
-            # Add logging BEFORE the button
-            logger.info(f"[BUTTON] Rendering Next button for step {st.session_state.pipeline_manager.current_step}")
-            
-            # Simplified button with unique key
-            button_key = f"next_btn_step_{st.session_state.pipeline_manager.current_step}_{int(time.time())}"
-            
-            if st.button("➡️ Next Step", type="primary", key=button_key, use_container_width=True):
-                logger.info(f"[BUTTON] ✅ NEXT BUTTON CLICKED - Step: {st.session_state.pipeline_manager.current_step}")
-                
-                try:
-                    # Get current step
-                    current = st.session_state.pipeline_manager.current_step
-                    logger.info(f"[BUTTON] Current step: {current}")
-                    
-                    # Simple validation - just check if we should advance
-                    can_advance = True
-                    
-                    # Step-specific processing
-                    if current == 0:  # Tag Analysis
-                        logger.info("[BUTTON] Step 0: Starting tag analysis...")
-                        
-                        # Run the actual tag analysis
-                        with st.spinner("🔍 Analyzing tag..."):
-                            result = st.session_state.pipeline_manager.handle_step_0_tag_analysis()
-                            logger.info(f"[BUTTON] Tag analysis result: {result}")
-                        
-                        if result and result.get('success', False):
-                            logger.info("[BUTTON] ✅ Tag analysis successful!")
-                            st.success(f"✅ Tag analyzed: {result.get('message', 'Success')}")
-                            can_advance = True
-                        else:
-                            error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
-                            logger.error(f"[BUTTON] ❌ Tag analysis failed: {error_msg}")
-                            st.error(f"❌ Tag analysis failed: {error_msg}")
-                            can_advance = False
-                    
-                    elif current == 1:  # Garment Analysis
-                        logger.info("[BUTTON] Step 1: Starting garment analysis...")
-                        with st.spinner("👕 Analyzing garment..."):
-                            result = st.session_state.pipeline_manager.handle_step_1_garment_analysis()
-                            logger.info(f"[BUTTON] Garment analysis result: {result}")
-                        
-                        if result and result.get('success', False):
-                            logger.info("[BUTTON] ✅ Garment analysis successful!")
-                            st.success(f"✅ Garment analyzed: {result.get('message', 'Success')}")
-                            can_advance = True
-                        else:
-                            error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
-                            logger.error(f"[BUTTON] ❌ Garment analysis failed: {error_msg}")
-                            st.error(f"❌ Garment analysis failed: {error_msg}")
-                            can_advance = False
-                    
+            # This is the main action button for the entire application
+            if st.button("➡️ Next Step", type="primary", key="main_next_step_button"):
+
+                # Get the current step before doing anything
+                step_to_execute = self.current_step
+                logger.info(f"[ACTION] 'Next Step' clicked for step {step_to_execute}")
+
+                # --- Execute the logic for the CURRENT step ---
+                analysis_success = False
+
+                if step_to_execute == 0:  # Tag Analysis
+                    with st.spinner("🔍 Analyzing tag... This may take a moment."):
+                        result = self.handle_step_0_tag_analysis()
+                    if result and result.get('success'):
+                        st.success(f"✅ Tag analyzed: {result.get('message', 'OK')}")
+                        analysis_success = True
                     else:
-                        # For other steps, just advance
-                        logger.info(f"[BUTTON] Step {current}: Simple advance")
-                        can_advance = True
-                    
-                    # Advance if allowed
-                    if can_advance:
-                        st.session_state.pipeline_manager.current_step += 1
-                        new_step = st.session_state.pipeline_manager.current_step
-                        logger.info(f"[BUTTON] ✅ ADVANCED: {current} → {new_step}")
-                        st.success(f"✅ Moving to step {new_step}")
-                        time.sleep(0.3)  # Brief pause
-                        st.rerun()
+                        st.error(f"❌ Tag analysis failed: {result.get('error', 'Unknown error')}")
+
+                elif step_to_execute == 1:  # Garment Analysis
+                    with st.spinner("👕 Analyzing garment..."):
+                        result = self.handle_step_1_garment_analysis()
+                    if result and result.get('success'):
+                        st.success(f"✅ Garment analyzed: {result.get('message', 'OK')}")
+                        analysis_success = True
                     else:
-                        logger.info(f"[BUTTON] ⏸️ Not advancing - step {current} failed")
-                    
-                except Exception as e:
-                    logger.error(f"[BUTTON] ❌ Error in Next button: {e}", exc_info=True)
-                    st.error(f"Error: {e}")
-                
-                # OLD COMPLEX LOGIC - REPLACED BY SIMPLIFIED VERSION ABOVE
-                if False:  # Disabled to prevent execution
-                    if st.session_state.pipeline_manager.current_step == 0:  # Tag Analysis
-                        logger.info("[NEXT-STEP] Starting tag analysis...")
-                    # Auto-capture and analyze tag
-                    if st.session_state.pipeline_manager.camera_manager:
-                        logger.info("[NEXT-STEP] Camera manager available")
-                        # STEP 1: INTELLIGENT PROBE - Test tag reflectivity first
-                        with st.spinner("🔍 Probing tag reflectivity..."):
-                            if st.session_state.pipeline_manager.auto_optimizer.enabled and st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                # Start with VERY low light to test reflectivity
-                                # Show static lighting info instead of running probe in UI loop
-                                st.info("💡 **Smart Lighting**: Click 'Next Step' to run intelligent lighting probe and analyze tag")
-                                
-                                # Clear retry flag for new analysis
-                                st.session_state.tag_retry_attempted = False
-                            
-                            # Get camera frame first
-                            frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-                            if frame is not None:
-                                # Check if auto-zoom is enabled
-                                auto_zoom = st.session_state.get('auto_zoom_enabled', True)
-                                
-                                if auto_zoom:
-                                    # 🤖 AUTOMATIC TAG DETECTION & ZOOM
-                                    st.info("🤖 Auto-detecting tag...")
-                                    zoomed_tag = st.session_state.pipeline_manager.camera_manager.detect_tag_for_auto_zoom(frame)
-                                    st.session_state.pipeline_manager.pipeline_data.tag_image = zoomed_tag
-                                    st.success("✅ Tag auto-detected and zoomed")
-                                else:
-                                    # Manual zoom from slider
-                                    zoom_factor = st.session_state.get('zoom_level', 1.0)
-                                    st.session_state.pipeline_manager.pipeline_data.tag_image = st.session_state.pipeline_manager.camera_manager.apply_roi(frame, 'tag', zoom_factor=zoom_factor)
-                            else:
-                                st.error("❌ No camera frame available")
-                            
-                            # Analyze immediately
-                            if st.session_state.pipeline_manager.pipeline_data.tag_image is not None and st.session_state.pipeline_manager.text_extractor:
-                                with st.spinner("🔍 Reading tag (this may take 2-3 seconds)..."):
-                                    # Check network availability first
-                                    if st.session_state.pipeline_manager.is_network_available():
-                                        # For Step 0, only analyze tag (garment not captured yet)
-                                        import asyncio
-                                        from openai import AsyncOpenAI
-                                        api_key = os.getenv('OPENAI_API_KEY')
-                                        client = AsyncOpenAI(api_key=api_key)
-                                        
-                                        # USE GEMINI-ONLY APPROACH (OpenAI removed)
-                                        tag_result = st.session_state.pipeline_manager.text_extractor.analyze_tag(
-                                            st.session_state.pipeline_manager.pipeline_data.tag_image
-                                        )
-                                        result = {'tag': tag_result, 'success': tag_result.get('success', False)}
-                                    else:
-                                        # Use offline fallback
-                                        st.warning("🌐 No network connection - using offline mode")
-                                        result = {'tag': st.session_state.pipeline_manager.get_offline_fallback_data('tag'), 'success': True}
-                                    
-                                # Parse parallel results correctly
-                                if result and result.get('success'):
-                                    tag_data = result.get('tag', {})
-                                    st.session_state.pipeline_manager.pipeline_data.brand = tag_data.get('brand', None)  # Primary suggestion
-                                    st.session_state.pipeline_manager.pipeline_data.brand_suggestions = tag_data.get('brand_suggestions', [])  # All AI suggestions
-                                    st.session_state.pipeline_manager.pipeline_data.size = tag_data.get('size', 'Unknown')
-                                    
-                                    # --- CHECK CONFIDENCE SCORE FOR MANUAL REVIEW ---
-                                    confidence = tag_data.get('confidence', 1.0)
-                                    brand = tag_data.get('brand', None)
-                                    raw_text = tag_data.get('raw_text', '')
-                                    
-                                    if confidence < 0.4 and brand:
-                                        # LOW CONFIDENCE - Flag for manual review
-                                        st.warning(f"⚠️ **LOW CONFIDENCE BRAND DETECTION**")
-                                        st.error(f"🤖 AI guessed: **{brand}** (Confidence: {confidence:.0%})")
-                                        st.info(f"📝 Raw OCR text: `{raw_text}`")
-                                        st.info("🔍 Google Lens fallback will be triggered in next step for visual confirmation")
-                                        st.session_state.pipeline_manager.pipeline_data.needs_serp_fallback = True
-                                        st.session_state.pipeline_manager.pipeline_data.low_confidence_brand = True
-                                    elif confidence < 0.7 and brand:
-                                        # MEDIUM CONFIDENCE - Show warning but proceed
-                                        st.warning(f"⚠️ **MEDIUM CONFIDENCE** ({confidence:.0%}) - Brand: {brand}")
-                                        st.caption("Consider verifying this brand manually")
-                                    else:
-                                        # HIGH CONFIDENCE - All good!
-                                        if brand:
-                                            st.success(f"✅ **HIGH CONFIDENCE** (>{confidence:.0%}) - Brand: {brand}")
-                                    st.session_state.pipeline_manager.pipeline_data.raw_tag_text = tag_data.get('raw_text', 'No text extracted')  # Raw OCR text
-                                    
-                                    # 🔍 STORE DUAL-MODEL COMPARISON DATA in session state
-                                    st.session_state.pipeline_manager.pipeline_data.model_comparison = {
-                                        'consensus': tag_data.get('consensus', False),
-                                        'openai_brand': tag_data.get('openai_brand'),
-                                        'gemini_brand': tag_data.get('gemini_brand'),
-                                        'final_brand': tag_data.get('brand')
-                                    }
-                                    
-                                    # ============================================
-                                    # FLAG FOR SERP FALLBACK (if brand not detected)
-                                    # ============================================
-                                    if not st.session_state.pipeline_manager.pipeline_data.brand:
-                                        # Tag unreadable - flag for SERP in Step 1
-                                        st.session_state.pipeline_manager.pipeline_data.needs_serp_fallback = True
-                                        st.warning("⚠️ Tag unreadable - will try Google Lens after garment capture")
-                                        logger.info("[TAG] Brand not detected - SERP fallback flagged for Step 1")
-                                    else:
-                                        st.session_state.pipeline_manager.pipeline_data.needs_serp_fallback = False
-                                    
-                                    # ============================================
-                                    # LEARNING SYSTEM: Save to dataset
-                                    # ============================================
-                                    try:
-                                        # Get brightness info safely
-                                        try:
-                                            frame_for_brightness = st.session_state.pipeline_manager.pipeline_data.tag_image
-                                            brightness_info = st.session_state.pipeline_manager.auto_optimizer.analyze_image_brightness(frame_for_brightness)
-                                            mean_brightness = brightness_info.get('mean', 0) if brightness_info else 0
-                                        except:
-                                            mean_brightness = 0
-                                        
-                                        # Prepare metadata for learning system
-                                        metadata = {
-                                            'brightness': st.session_state.pipeline_manager.auto_optimizer.light_controller.current_state.get('brightness', 0),
-                                            'mean_brightness': mean_brightness,
-                                            'preprocessing': 'auto_optimized',
-                                            'garment_type': st.session_state.pipeline_manager.pipeline_data.garment_type or 'unknown',
-                                            'gender': st.session_state.pipeline_manager.pipeline_data.gender or 'unknown',
-                                            'condition': st.session_state.pipeline_manager.pipeline_data.condition or 'unknown',
-                                            'zoom_level': st.session_state.get('zoom_level', 1.0),
-                                            'camera_model': 'arducam'
-                                        }
-                                        
-                                        # Save AI result to dataset
-                                        if st.session_state.pipeline_manager.dataset_manager:
-                                            logger.info(f"[LEARNING] Attempting to save: Brand='{tag_data.get('brand')}', Size='{tag_data.get('size')}'")
-                                            saved = st.session_state.pipeline_manager.dataset_manager.save_sample(
-                                                tag_image=st.session_state.pipeline_manager.pipeline_data.tag_image,
-                                                ai_result=tag_data,
-                                                metadata=metadata
-                                            )
-                                            
-                                            if saved:
-                                                st.toast("📚 Training data saved!", icon="✅")
-                                                logger.info("[LEARNING] ✅ Training data saved successfully")
-                                            else:
-                                                logger.warning("[LEARNING] ⚠️ Training data NOT saved")
-                                        else:
-                                            logger.error("[LEARNING] ❌ dataset_manager is None!")
-                                            
-                                    except Exception as e:
-                                        logger.error(f"[LEARNING] Failed to save training data: {e}")
-                                        import traceback
-                                        logger.error(traceback.format_exc())
-                                    
-                                    # ============================================
-                                    # FEEDBACK UI: Help improve the system
-                                    # ============================================
-                                    if brand:  # Show feedback for ALL predictions (removed confidence filter)
-                                        st.markdown("---")
-                                        st.markdown("### 🧠 Help Improve Recognition")
-                                        st.info("Was this brand recognition correct? Your feedback helps train the system!")
-                                        
-                                        col_feedback1, col_feedback2 = st.columns(2)
-                                        with col_feedback1:
-                                            if st.button("✅ Correct", key="feedback_correct", type="primary"):
+                        st.error(f"❌ Garment analysis failed: {result.get('error', 'Unknown error')}")
+
+                else:
+                    # For all other steps, just assume success and advance
+                    analysis_success = True
+
+                # --- Advance to the NEXT step ONLY if the current one succeeded ---
+                if analysis_success:
+                    if self.current_step < len(self.steps) - 1:
+                        self.current_step += 1
+                        logger.info(f"[ACTION] Advancing to step {self.current_step}")
+                        st.rerun() # Rerun to display the UI for the new step
+                    else:
+                        st.balloons()
+                        st.success("🎉 Pipeline complete!")
                                                 # Save positive validation to database
                                                 try:
                                                     if st.session_state.pipeline_manager.dataset_manager:
