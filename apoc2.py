@@ -6022,7 +6022,7 @@ def show_confirmation_dialog(title, message, options, key_prefix):
                 label_visibility="collapsed"
             )
             
-            if st.button("✅ Confirm", type="primary", key=f"{key_prefix}_confirm", use_container_width=True):
+            if st.button("✅ Confirm", type="primary", key=f"{key_prefix}_confirm", width='stretch'):
                 st.markdown('</div>', unsafe_allow_html=True)
                 return selection
         
@@ -6742,7 +6742,7 @@ class EnhancedPipelineManager:
                     if full_frame is not None:
                         # Display FULL camera frame with green ROI box overlay
                         st.image(full_frame, caption="📸 Full Camera View - Green box shows Tag ROI", 
-                                use_container_width=True)
+                                width='stretch')
                         
                         # Show current ROI coordinates
                         roi_coords = self.camera_manager.roi_coords.get('tag', (0, 0, 0, 0))
@@ -6751,7 +6751,7 @@ class EnhancedPipelineManager:
                         # Show cropped ROI preview in expander
                         if tag_crop is not None:
                             with st.expander("🔍 Tag ROI Preview (What AI Will See)"):
-                                st.image(tag_crop, caption="Cropped Tag Region", use_container_width=True)
+                                st.image(tag_crop, caption="Cropped Tag Region", width='stretch')
                                 st.caption(f"Size: {tag_crop.shape[1]}×{tag_crop.shape[0]} pixels")
                         
                         # Show brightness info
@@ -6779,22 +6779,22 @@ class EnhancedPipelineManager:
                 if frame is not None:
                     frame_with_roi = self.camera_manager.draw_roi_overlay(frame.copy(), 'work')
                     if frame_with_roi is not None:
-                        st.image(frame_with_roi, caption="🎯 Garment Camera", use_container_width=True)
+                        st.image(frame_with_roi, caption="🎯 Garment Camera", width='stretch')
                 else:
                     st.warning("⚠️ Camera not available")
             
             else:
                 # Show last captured image for other steps
                 if self.pipeline_data.garment_image is not None:
-                    st.image(self.pipeline_data.garment_image, caption="📸 Captured Garment", use_container_width=True)
+                    st.image(self.pipeline_data.garment_image, caption="📸 Captured Garment", width='stretch')
                 elif self.pipeline_data.tag_image is not None:
-                    st.image(self.pipeline_data.tag_image, caption="📸 Captured Tag", use_container_width=True)
+                    st.image(self.pipeline_data.tag_image, caption="📸 Captured Tag", width='stretch')
                 else:
                     st.info("No images captured yet")
             
             # Camera controls (compact)
             st.markdown("---")
-            if st.button("🔄 Refresh", key="refresh_camera_compact", use_container_width=True):
+            if st.button("🔄 Refresh", key="refresh_camera_compact", width='stretch'):
                 st.rerun()
         
         with col_content:
@@ -6877,16 +6877,16 @@ class EnhancedPipelineManager:
                 
                 if motion:
                     st.session_state.tag_motion_detected = True
-                    logger.info("[MOTION] Tag movement detected - refreshing preview")
-                    time.sleep(0.2)  # Brief pause for tag to settle
-                    st.rerun()
+                    logger.info("[MOTION] Tag movement detected")
+                    # NOTE: Removed st.rerun() - let natural Streamlit refresh handle it
+                    # This prevents blocking button clicks
             
             # Control buttons at the top
             col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 1])
             
             with col_ctrl1:
                 # Manual refresh
-                if st.button("🔄 Refresh", key="refresh_tag_compact", use_container_width=True):
+                if st.button("🔄 Refresh", key="refresh_tag_compact", width='stretch'):
                     st.session_state.last_tag_motion_check = 0  # Force immediate check
                     st.rerun()
             
@@ -7005,7 +7005,7 @@ class EnhancedPipelineManager:
             if self.pipeline_data.price_estimate:
                 st.write(f"**Price:** ${self.pipeline_data.price_estimate.get('mid', 0)}")
         
-        if st.button("🔄 Start New", type="primary", use_container_width=True):
+        if st.button("🔄 Start New", type="primary", width='stretch'):
             self.current_step = 0
             self.pipeline_data = PipelineData()
             st.rerun()
@@ -7573,7 +7573,7 @@ class EnhancedPipelineManager:
                 # Thumbnail image
                 if match.get('thumbnail'):
                     try:
-                        st.image(match.get('thumbnail'), use_container_width=True)
+                        st.image(match.get('thumbnail'), width='stretch')
                     except Exception as e:
                         logger.warning(f"Could not display SERP thumbnail: {e}")
                         st.caption("🖼️ Thumbnail unavailable")
@@ -8003,7 +8003,7 @@ class EnhancedPipelineManager:
                             pass
                         
                         frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(ardu_frame.copy(), 'tag')
-                        st.image(frame_with_roi, caption="Tag Camera", use_container_width=True)
+                        st.image(frame_with_roi, caption="Tag Camera", width='stretch')
                     else:
                         st.warning("ArduCam not accessible")
                 except Exception as e:
@@ -8020,7 +8020,7 @@ class EnhancedPipelineManager:
                             pass
                         
                         frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(real_frame.copy(), 'work')
-                        st.image(frame_with_roi, caption="Garment Camera", use_container_width=True)
+                        st.image(frame_with_roi, caption="Garment Camera", width='stretch')
                     else:
                         st.warning("RealSense not accessible")
                 except Exception as e:
@@ -8188,7 +8188,7 @@ class EnhancedPipelineManager:
                             st.image(
                                 frame_with_roi,
                                 caption="🎯 Position tag in GREEN BOX",
-                                use_container_width=True
+                                width='stretch'
                             )
                             
                             # Show brightness info
@@ -8353,7 +8353,7 @@ class EnhancedPipelineManager:
                 st.image(
                     st.session_state.pipeline_manager.pipeline_data.garment_image,
                     caption="Captured Garment",
-                    use_container_width=True
+                    width='stretch'
                 )
             
             with col2:
@@ -8507,7 +8507,7 @@ class EnhancedPipelineManager:
                         st.image(
                             frame_with_roi,
                             caption="🎯 Position ENTIRE garment in GREEN BOX",
-                            use_container_width=True
+                            width='stretch'
                         )
                         
                         # Show motion status
@@ -8782,7 +8782,7 @@ class EnhancedPipelineManager:
         if self.pipeline_data.garment_image is not None:
             st.image(self.pipeline_data.garment_image, 
                     caption="Current garment image", 
-                    use_container_width=True)
+                    width='stretch')
             
             # Show any detected defects
             if hasattr(self.pipeline_data, 'defects') and self.pipeline_data.defects:
@@ -8902,9 +8902,12 @@ class EnhancedPipelineManager:
             st.session_state.next_step_button_rendered = True
             if st.button("➡️ Next Step", type="primary", key=f"next_step_{st.session_state.pipeline_manager.current_step}"):
                 # Handle step-specific actions before advancing
+                logger.info(f"[NEXT-STEP] Button clicked! Current step: {st.session_state.pipeline_manager.current_step}")
                 if st.session_state.pipeline_manager.current_step == 0:  # Tag Analysis
+                    logger.info("[NEXT-STEP] Starting tag analysis...")
                     # Auto-capture and analyze tag
                     if st.session_state.pipeline_manager.camera_manager:
+                        logger.info("[NEXT-STEP] Camera manager available")
                         # STEP 1: INTELLIGENT PROBE - Test tag reflectivity first
                         with st.spinner("🔍 Probing tag reflectivity..."):
                             if st.session_state.pipeline_manager.auto_optimizer.enabled and st.session_state.pipeline_manager.auto_optimizer.light_controller:
@@ -9309,7 +9312,11 @@ class EnhancedPipelineManager:
                                             # Brand unreadable but size detected - this is OK, continue
                                             st.warning(f"⚠️ Brand unreadable, but got Size: **{st.session_state.pipeline_manager.pipeline_data.size}**")
                                             st.info("💡 Will try Google Lens visual search in next step")
-                                    # Don't return - allow progression to Step 1
+                                    
+                                    # Advance to Step 1 after tag analysis
+                                    st.session_state.pipeline_manager.current_step = 1
+                                    st.success("✅ Moving to garment analysis...")
+                                    st.rerun()
                                 else:
                                     st.error("❌ Couldn't read tag clearly. Please adjust and try again.")
                                     return  # Only return on error
@@ -9593,7 +9600,7 @@ class EnhancedPipelineManager:
                             # Show preview prominently centered
                             col1, col2, col3 = st.columns([1, 2, 1])
                             with col2:
-                                st.image(frame_with_roi, caption="🎯 Position tag inside the GREEN BOX", use_container_width=True)
+                                st.image(frame_with_roi, caption="🎯 Position tag inside the GREEN BOX", width='stretch')
                             
                             # Show brightness feedback (with zoom if set)
                             if st.session_state.pipeline_manager.auto_optimizer.enabled:
@@ -9646,7 +9653,7 @@ class EnhancedPipelineManager:
                                             label = debug_file
                                         # Convert BGR to RGB for proper display
                                         debug_img_rgb = cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB)
-                                        st.image(debug_img_rgb, caption=label, use_container_width=True)
+                                        st.image(debug_img_rgb, caption=label, width='stretch')
                             except Exception as e:
                                 logger.warning(f"Could not display debug image {debug_file}: {e}")
                                 with cols[idx]:
@@ -9976,7 +9983,7 @@ class EnhancedPipelineManager:
                             # Show preview prominently centered
                             col1, col2, col3 = st.columns([1, 2, 1])
                             with col2:
-                                st.image(frame_with_roi, caption="🎯 Position garment inside the GREEN BOX", use_container_width=True)
+                                st.image(frame_with_roi, caption="🎯 Position garment inside the GREEN BOX", width='stretch')
                             
                             # Show brightness feedback
                             if st.session_state.pipeline_manager.auto_optimizer.enabled:
@@ -10149,7 +10156,7 @@ class EnhancedPipelineManager:
                     st.markdown("**📸 Captured Garment Image:**")
                     
                     # Show the captured image first
-                    st.image(st.session_state.pipeline_manager.pipeline_data.garment_image, caption="Captured Garment - Click armpit seams", use_container_width=True)
+                    st.image(st.session_state.pipeline_manager.pipeline_data.garment_image, caption="Captured Garment - Click armpit seams", width='stretch')
                     
                     # Convert numpy array to PIL Image for coordinate detection
                     pil_image = Image.fromarray(st.session_state.pipeline_manager.pipeline_data.garment_image)
@@ -10184,7 +10191,7 @@ class EnhancedPipelineManager:
                             p2 = st.session_state.measurement_points[-1]
                             cv2.line(img_with_points, (p1['x'], p1['y']), (p2['x'], p2['y']), (0, 255, 0), 2)
                         
-                        st.image(img_with_points, use_container_width=True)
+                        st.image(img_with_points, width='stretch')
             
             with col2:
                     st.markdown("#### Measurement:")
@@ -10401,6 +10408,20 @@ class EnhancedPipelineManager:
         """Handle Step 0: Tag analysis - Clean version"""
         with st.spinner("🔍 Analyzing tag..."):
             result = st.session_state.pipeline_manager.handle_step_0_tag_analysis()
+            
+            # Check if analysis was successful
+            if result and result.get('success'):
+                # Advance to next step
+                st.session_state.pipeline_manager.current_step = 1
+                st.success("✅ Tag analyzed! Moving to garment analysis...")
+                st.rerun()
+            elif result and (result.get('brand') or result.get('size')):
+                # Partial success - advance anyway
+                st.session_state.pipeline_manager.current_step = 1
+                st.warning("⚠️ Partial tag data extracted. Moving to garment analysis...")
+                st.rerun()
+            else:
+                st.error("❌ Tag analysis failed. Please try again.")
 
     def render_action_panel_simple(self):
         """Simplified action panel - focus on making it work"""
@@ -10524,7 +10545,7 @@ class EnhancedPipelineManager:
         frame = self.camera_manager.get_arducam_frame()
         if frame is not None:
             frame_with_roi = self.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
-            st.image(frame_with_roi, use_container_width=True)
+            st.image(frame_with_roi, width='stretch')
         else:
             st.warning("Camera feed not available")
     
@@ -10785,7 +10806,7 @@ def render_roi_positioning_mode():
             
             # Display FULL FRAME (use_container_width ensures full view)
             st.image(display_frame, caption=f"🎯 Full RealSense View ({frame.shape[1]}x{frame.shape[0]})", 
-                     use_container_width=True)
+                     width='stretch')
             
             st.info(f"📐 Camera Resolution: {frame.shape[1]}x{frame.shape[0]} - You should see your ENTIRE garment!")
             
@@ -10797,7 +10818,7 @@ def render_roi_positioning_mode():
                 
                 st.markdown("---")
                 st.markdown("### 🔍 ROI Preview (What AI Will See)")
-                st.image(roi_preview, caption="Cropped Tag Region", use_container_width=True)
+                st.image(roi_preview, caption="Cropped Tag Region", width='stretch')
         else:
             st.error("❌ No RealSense frame available")
             st.info("💡 Make sure RealSense camera is connected and Step 1 has been run at least once")
@@ -10822,23 +10843,23 @@ def render_roi_positioning_mode():
         
         arrow_col1, arrow_col2, arrow_col3 = st.columns(3)
         with arrow_col1:
-            if st.button("⬅️", key="roi_left", use_container_width=True):
+            if st.button("⬅️", key="roi_left", width='stretch'):
                 st.session_state.tag_roi_temp['x'] = max(0, roi['x'] - move_step)
                 st.rerun()
         with arrow_col2:
-            if st.button("⬆️", key="roi_up", use_container_width=True):
+            if st.button("⬆️", key="roi_up", width='stretch'):
                 st.session_state.tag_roi_temp['y'] = max(0, roi['y'] - move_step)
                 st.rerun()
         with arrow_col3:
-            if st.button("➡️", key="roi_right", use_container_width=True):
+            if st.button("➡️", key="roi_right", width='stretch'):
                 st.session_state.tag_roi_temp['x'] = min(frame_w - roi['w'], roi['x'] + move_step)
                 st.rerun()
         
-        if st.button("⬇️", key="roi_down", use_container_width=True):
+        if st.button("⬇️", key="roi_down", width='stretch'):
             st.session_state.tag_roi_temp['y'] = min(frame_h - roi['h'], roi['y'] + move_step)
             st.rerun()
         
-        if st.button("🎯 Center", key="roi_center", use_container_width=True):
+        if st.button("🎯 Center", key="roi_center", width='stretch'):
             st.session_state.tag_roi_temp['x'] = (frame_w - roi['w']) // 2
             st.session_state.tag_roi_temp['y'] = (frame_h - roi['h']) // 2
             st.rerun()
@@ -10854,32 +10875,32 @@ def render_roi_positioning_mode():
         preset_col1, preset_col2 = st.columns(2)
         
         with preset_col1:
-            if st.button("Top Left", key="preset_tl", use_container_width=True):
+            if st.button("Top Left", key="preset_tl", width='stretch'):
                 st.session_state.tag_roi_temp = {'x': 50, 'y': 50, 'w': 200, 'h': 120}
                 st.rerun()
             
-            if st.button("Center Left", key="preset_cl", use_container_width=True):
+            if st.button("Center Left", key="preset_cl", width='stretch'):
                 st.session_state.tag_roi_temp = {'x': 50, 'y': (frame_h - 120) // 2, 'w': 200, 'h': 120}
                 st.rerun()
             
-            if st.button("Bottom Left", key="preset_bl", use_container_width=True):
+            if st.button("Bottom Left", key="preset_bl", width='stretch'):
                 st.session_state.tag_roi_temp = {'x': 50, 'y': frame_h - 170, 'w': 200, 'h': 120}
                 st.rerun()
         
         with preset_col2:
-            if st.button("Top Right", key="preset_tr", use_container_width=True):
+            if st.button("Top Right", key="preset_tr", width='stretch'):
                 st.session_state.tag_roi_temp = {'x': frame_w - 250, 'y': 50, 'w': 200, 'h': 120}
                 st.rerun()
             
-            if st.button("Center Right", key="preset_cr", use_container_width=True):
+            if st.button("Center Right", key="preset_cr", width='stretch'):
                 st.session_state.tag_roi_temp = {'x': frame_w - 250, 'y': (frame_h - 120) // 2, 'w': 200, 'h': 120}
                 st.rerun()
             
-            if st.button("Bottom Right", key="preset_br", use_container_width=True):
+            if st.button("Bottom Right", key="preset_br", width='stretch'):
                 st.session_state.tag_roi_temp = {'x': frame_w - 250, 'y': frame_h - 170, 'w': 200, 'h': 120}
                 st.rerun()
         
-        if st.button("🎯 Absolute Center", key="preset_center", type="secondary", use_container_width=True):
+        if st.button("🎯 Absolute Center", key="preset_center", type="secondary", width='stretch'):
             st.session_state.tag_roi_temp = {
                 'x': (frame_w - 200) // 2,
                 'y': (frame_h - 120) // 2,
@@ -10920,7 +10941,7 @@ def render_roi_positioning_mode():
         st.markdown("---")
         
         # Action buttons
-        if st.button("✅ Save & Exit", key="save_roi", type="primary", use_container_width=True):
+        if st.button("✅ Save & Exit", key="save_roi", type="primary", width='stretch'):
             # Update camera manager ROI
             new_roi = (
                 st.session_state.tag_roi_temp['x'],
@@ -10939,7 +10960,7 @@ def render_roi_positioning_mode():
             st.session_state.roi_positioning_mode = False
             st.rerun()
         
-        if st.button("❌ Cancel", key="cancel_roi", use_container_width=True):
+        if st.button("❌ Cancel", key="cancel_roi", width='stretch'):
             st.session_state.roi_positioning_mode = False
             st.rerun()
 
@@ -11006,7 +11027,7 @@ def render_focus_mode(pm):
             
             # Show the 12MP capture
             try:
-                st.image(best_frame, caption=f"12MP Capture - Focus Score: {best_score:.0f}", use_container_width=True)
+                st.image(best_frame, caption=f"12MP Capture - Focus Score: {best_score:.0f}", width='stretch')
                 st.success(f"✅ 12MP capture successful! Resolution: {best_frame.shape[1]}x{best_frame.shape[0]}")
             except Exception as e:
                 logger.warning(f"12MP capture image display error: {e}")
@@ -11044,7 +11065,7 @@ def render_focus_mode(pm):
     try:
         # Convert frame to ensure it's in the right format for Streamlit
         if frame_roi is not None and frame_roi.size > 0:
-            preview_ph.image(frame_roi, caption="Live Camera Feed", use_container_width=True)
+            preview_ph.image(frame_roi, caption="Live Camera Feed", width='stretch')
         else:
             preview_ph.warning("No valid camera frame available")
     except Exception as e:
@@ -11127,7 +11148,7 @@ def render_defect_collection_mode():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             
             # Display image (click detection would need streamlit-image-coordinates library)
-            st.image(annotated_frame, use_container_width=True)
+            st.image(annotated_frame, width='stretch')
             
             # Manual coordinate entry for now (can be enhanced with click detection)
             st.caption("Enter defect coordinates manually (click detection requires additional library)")
@@ -11342,7 +11363,7 @@ def main():
                     
                     # Validate image before displaying
                     if frame_with_roi.size > 0 and frame_with_roi.shape[0] > 0 and frame_with_roi.shape[1] > 0:
-                        st.image(frame_with_roi, use_container_width=True)
+                        st.image(frame_with_roi, width='stretch')
                     else:
                         st.warning("⚠️ Invalid camera frame - empty or corrupted")
                 except Exception as e:
@@ -11359,7 +11380,7 @@ def main():
                     
                     # Validate image before displaying
                     if frame_with_roi.size > 0 and frame_with_roi.shape[0] > 0 and frame_with_roi.shape[1] > 0:
-                        st.image(frame_with_roi, use_container_width=True)
+                        st.image(frame_with_roi, width='stretch')
                     else:
                         st.warning("⚠️ Invalid camera frame - empty or corrupted")
                 except Exception as e:
