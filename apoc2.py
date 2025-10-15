@@ -22,31 +22,34 @@ import google.generativeai as genai
 import sounddevice as sd
 from scipy.io.wavfile import write
 import sqlite3
-from datetime import datetime
 from collections import Counter
-import difflib
-import pandas as pd
-import hashlib
-from vertexai.generative_models import GenerativeModel, Part
-import vertexai
+from datetime import datetime
+from dataclasses import dataclass, field
+from enum import Enum
 from functools import wraps
 from threading import Thread
-import traceback
-import streamlit.components.v1 as components
+from typing import Optional, Dict, List, Tuple
+from urllib.parse import urlencode
+import base64
+import concurrent.futures
+import difflib
+import hashlib
+import io
+import json
+import logging
+import numpy as np
+import os
+import pandas as pd
 import re
 import requests
 import socket
-from enum import Enum
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+import streamlit.components.v1 as components
+from streamlit_image_coordinates import streamlit_image_coordinates
 import threading
-from collections import Counter
-from datetime import datetime
-from urllib.parse import urlencode
-import pandas as pd
-import logging
-import concurrent.futures
-import difflib
+import time
+import traceback
+from vertexai.generative_models import GenerativeModel, Part
+import vertexai
 
 # ============================================
 # CONFIGURE LOGGING FIRST - BEFORE ANYTHING ELSE
@@ -314,6 +317,49 @@ def validate_garment_classification(garment_type: str, visible_features: list) -
             return False, "Turtleneck requires high folded collar"
     
     return True, "Classification valid"
+
+
+def validate_classification_strict(garment_type, features_dict):
+    """
+    Strict validation rules for garment classification
+    Returns: (is_valid, corrected_type, issues)
+    """
+    issues = []
+    corrected_type = garment_type
+    
+    garment_lower = garment_type.lower()
+    has_opening = features_dict.get('has_front_opening', False)
+    neckline = features_dict.get('neckline', '').lower()
+    
+    # RULE 1: Cardigan MUST have opening
+    if 'cardigan' in garment_lower:
+        if not has_opening:
+            issues.append("Cardigan requires front opening")
+            corrected_type = 'pullover'
+            logger.warning("[VALIDATION] Auto-corrected: cardigan → pullover (no opening)")
+    
+    # RULE 2: Pullover/Sweater CANNOT have opening
+    if any(term in garment_lower for term in ['pullover', 'sweater']) and 'cardigan' not in garment_lower:
+        if has_opening:
+            issues.append("Pullover cannot have front opening")
+            corrected_type = 'cardigan'
+            logger.warning("[VALIDATION] Auto-corrected: pullover → cardigan (has opening)")
+    
+    # RULE 3: Turtleneck requires turtleneck collar
+    if 'turtleneck' in garment_lower:
+        if 'turtle' not in neckline and 'high' not in neckline:
+            issues.append("Turtleneck classification requires turtleneck collar")
+            logger.warning("[VALIDATION] Turtleneck without appropriate collar")
+    
+    # RULE 4: Button-down requires buttons
+    if 'button' in garment_lower:
+        if not has_opening:
+            issues.append("Button-down requires buttons/opening")
+            corrected_type = garment_type.replace('button-down', 'shirt').replace('button down', 'shirt')
+    
+    is_valid = len(issues) == 0
+    
+    return is_valid, corrected_type, issues
 
 
 def build_ebay_item_specifics(pipeline_data) -> dict:
@@ -1318,6 +1364,424 @@ class ImprovedSmartLightOptimizer:
         """Toggle automatic adjustment on/off"""
         self.enabled = not self.enabled
         return self.enabled
+
+# ==========================
+# ENHANCED OCR WITH MULTI-STRATEGY PREPROCESSING
+# ==========================
+class EnhancedOCRProcessor:
+    """Advanced OCR with multiple preprocessing strategies for robust text extraction"""
+    
+    def __init__(self):
+        self.tesseract_configs = {
+            'general': '--oem 3 --psm 6',      # Uniform block of text
+            'sparse': '--oem 3 --psm 11',      # Sparse text
+            'single_line': '--oem 3 --psm 7',  # Single line
+            'single_word': '--oem 3 --psm 8',  # Single word (brands)
+        }
+        logger.info("Enhanced OCR Processor initialized")
+    
+    def preprocess_tag_image(self, image):
+        """
+        Apply multiple preprocessing strategies and return all variants
+        """
+        if image is None or image.size == 0:
+            return {}
+        
+        # Convert to grayscale
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image.copy()
+        
+        preprocessed = {}
+        
+        # Strategy 1: Adaptive Thresholding (best for uneven lighting)
+        try:
+            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+            adaptive = cv2.adaptiveThreshold(
+                denoised, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                11, 2
+            )
+            preprocessed['adaptive'] = adaptive
+        except Exception as e:
+            logger.warning(f"Adaptive threshold failed: {e}")
+        
+        # Strategy 2: Otsu's Binarization (best for high contrast)
+        try:
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, otsu = cv2.threshold(
+                blurred, 0, 255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            preprocessed['otsu'] = otsu
+        except Exception as e:
+            logger.warning(f"Otsu threshold failed: {e}")
+        
+        # Strategy 3: CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        try:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            _, contrast = cv2.threshold(
+                enhanced, 0, 255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            preprocessed['clahe'] = contrast
+        except Exception as e:
+            logger.warning(f"CLAHE failed: {e}")
+        
+        # Strategy 4: Morphological Operations (remove noise)
+        try:
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+            kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+            morph = cv2.morphologyEx(opening, cv2.MORPH_CLOSE, kernel2, iterations=1)
+            preprocessed['morph'] = morph
+        except Exception as e:
+            logger.warning(f"Morphological operations failed: {e}")
+        
+        return preprocessed
+    
+    def extract_text_multipass(self, image):
+        """
+        Run OCR with multiple strategies and return best result
+        """
+        if image is None:
+            return {'text': '', 'confidence': 0.0, 'strategy': 'none'}
+        
+        # Preprocess with all strategies
+        preprocessed_images = self.preprocess_tag_image(image)
+        
+        if not preprocessed_images:
+            logger.error("All preprocessing strategies failed")
+            return {'text': '', 'confidence': 0.0, 'strategy': 'failed'}
+        
+        results = []
+        
+        # Try each preprocessed image with each config
+        for strategy_name, processed_img in preprocessed_images.items():
+            for config_name, config in self.tesseract_configs.items():
+                try:
+                    # Get OCR data with confidence scores
+                    data = pytesseract.image_to_data(
+                        processed_img,
+                        config=config,
+                        output_type=pytesseract.Output.DICT
+                    )
+                    
+                    # Extract high-confidence words only
+                    text_parts = []
+                    confidences = []
+                    
+                    for i, word in enumerate(data['text']):
+                        conf = int(data['conf'][i])
+                        if conf > 30 and word.strip():  # Confidence > 30%
+                            text_parts.append(word)
+                            confidences.append(conf)
+                    
+                    if text_parts:
+                        full_text = ' '.join(text_parts)
+                        avg_conf = sum(confidences) / len(confidences)
+                        
+                        results.append({
+                            'text': full_text,
+                            'confidence': avg_conf,
+                            'strategy': f"{strategy_name}/{config_name}",
+                            'word_count': len(text_parts)
+                        })
+                        
+                        logger.debug(f"[OCR] {strategy_name}/{config_name}: conf={avg_conf:.1f}%, words={len(text_parts)}")
+                
+                except Exception as e:
+                    logger.debug(f"OCR failed for {strategy_name}/{config_name}: {e}")
+        
+        if not results:
+            return {'text': '', 'confidence': 0.0, 'strategy': 'all_failed'}
+        
+        # Pick best result by confidence
+        best = max(results, key=lambda x: x['confidence'])
+        
+        # Fallback: if low confidence, try longest result
+        if best['confidence'] < 50:
+            longest = max(results, key=lambda x: len(x['text']))
+            if len(longest['text']) > len(best['text']) * 1.5:
+                logger.info("[OCR] Low confidence - using longest result instead")
+                return longest
+        
+        logger.info(f"[OCR] Best: '{best['text'][:60]}...' (conf: {best['confidence']:.1f}%, strategy: {best['strategy']})")
+        return best
+    
+    def extract_brand_from_tag(self, image):
+        """
+        Specialized extraction for brand name (usually top 30% of tag)
+        """
+        if image is None:
+            return None
+        
+        # Focus on top section where brands typically are
+        h, w = image.shape[:2]
+        top_section = image[0:int(h*0.3), :]
+        
+        # High-contrast preprocessing for bold text
+        if len(top_section.shape) == 3:
+            gray = cv2.cvtColor(top_section, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = top_section
+        
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Try single word mode first (brands are often one word)
+        try:
+            brand_text = pytesseract.image_to_string(
+                binary,
+                config='--oem 3 --psm 8'
+            ).strip()
+            
+            if brand_text and len(brand_text) > 2:
+                # Clean the brand name
+                brand_text = ''.join(c for c in brand_text if c.isalnum() or c.isspace())
+                if brand_text:
+                    logger.info(f"[BRAND] Extracted: '{brand_text}'")
+                    return brand_text
+        except Exception as e:
+            logger.warning(f"Brand extraction failed: {e}")
+        
+        return None
+
+# ==========================
+# EBAY ITEM SPECIFICS WITH FUZZY MATCHING
+# ==========================
+class ImprovedEbayMapper:
+    """Map garment attributes to eBay-compliant values with fuzzy matching"""
+    
+    def __init__(self):
+        # eBay accepted values (subset - add more as needed)
+        self.accepted_values = {
+            'Neckline': [
+                'Boat Neck', 'Collared', 'Cowl Neck', 'Crew Neck', 'Halter',
+                'High Neck', 'Hooded', 'Mock Neck', 'Off Shoulder',
+                'Scoop Neck', 'Square Neck', 'Turtleneck', 'V-Neck', 'Other'
+            ],
+            'Sleeve Length': [
+                'Long Sleeve', 'Short Sleeve', '3/4 Sleeve', 'Sleeveless',
+                'Cap Sleeve', 'Tank Top'
+            ],
+            'Style': [
+                'Casual', 'Formal', 'Business', 'Bohemian', 'Preppy',
+                'Athletic', 'Vintage', 'Classic', 'Streetwear'
+            ],
+            'Fit': [
+                'Regular', 'Slim', 'Relaxed', 'Oversized', 'Fitted',
+                'Athletic', 'Tailored', 'Loose'
+            ],
+            'Pattern': [
+                'Solid', 'Striped', 'Floral', 'Animal Print', 'Plaid',
+                'Polka Dot', 'Chevron', 'Geometric', 'Abstract',
+                'Color Block', 'Paisley'
+            ],
+            'Condition': [
+                'New with tags', 'New without tags', 'New with defects',
+                'Pre-owned', 'Excellent', 'Very Good', 'Good', 'Acceptable'
+            ]
+        }
+        
+        logger.info("Improved eBay Mapper initialized")
+    
+    def normalize_to_ebay(self, field_name, raw_value):
+        """
+        Normalize a value to eBay's accepted format using fuzzy matching
+        """
+        if not raw_value or raw_value.lower() in ['unknown', 'none', 'n/a']:
+            return None
+        
+        accepted = self.accepted_values.get(field_name, [])
+        if not accepted:
+            # Field doesn't have predefined values
+            return raw_value.strip().title()
+        
+        raw_clean = raw_value.strip().title()
+        
+        # Exact match (case-insensitive)
+        for accepted_val in accepted:
+            if raw_clean.lower() == accepted_val.lower():
+                return accepted_val
+        
+        # Fuzzy match
+        matches = difflib.get_close_matches(
+            raw_clean,
+            accepted,
+            n=1,
+            cutoff=0.6  # 60% similarity
+        )
+        
+        if matches:
+            logger.info(f"[EBAY] Fuzzy matched '{raw_value}' → '{matches[0]}' for {field_name}")
+            return matches[0]
+        
+        # No match - use Other if available
+        logger.warning(f"[EBAY] No match for '{raw_value}' in {field_name}")
+        return 'Other' if 'Other' in accepted else None
+    
+    def build_item_specifics(self, pipeline_data):
+        """
+        Build eBay Item Specifics with proper normalization
+        """
+        item_specifics = {}
+        
+        # Brand (CRITICAL)
+        if pipeline_data.brand and pipeline_data.brand != 'Unknown':
+            item_specifics['Brand'] = pipeline_data.brand
+        else:
+            item_specifics['Brand'] = 'Unbranded'
+        
+        # Size (CRITICAL)
+        if pipeline_data.size and pipeline_data.size != 'Unknown':
+            item_specifics['Size'] = pipeline_data.size
+        
+        # Neckline
+        if pipeline_data.neckline and pipeline_data.neckline != 'Unknown':
+            neckline = self.normalize_to_ebay('Neckline', pipeline_data.neckline)
+            if neckline:
+                item_specifics['Neckline'] = neckline
+        
+        # Sleeve Length
+        if pipeline_data.sleeve_length and pipeline_data.sleeve_length != 'Unknown':
+            sleeve = self.normalize_to_ebay('Sleeve Length', pipeline_data.sleeve_length)
+            if sleeve:
+                item_specifics['Sleeve Length'] = sleeve
+        
+        # Style
+        if pipeline_data.style and pipeline_data.style != 'Unknown':
+            style = self.normalize_to_ebay('Style', pipeline_data.style)
+            if style:
+                item_specifics['Style'] = style
+        
+        # Fit
+        if pipeline_data.fit and pipeline_data.fit != 'Unknown':
+            fit = self.normalize_to_ebay('Fit', pipeline_data.fit)
+            if fit:
+                item_specifics['Fit'] = fit
+        
+        # Pattern
+        if pipeline_data.pattern and pipeline_data.pattern not in ['None', 'Unknown']:
+            pattern = self.normalize_to_ebay('Pattern', pipeline_data.pattern)
+            if pattern:
+                item_specifics['Pattern'] = pattern
+        
+        # Condition
+        condition = self.normalize_to_ebay('Condition', pipeline_data.condition)
+        if condition:
+            item_specifics['Condition'] = condition
+        
+        return item_specifics
+    
+    def validate_listing(self, item_specifics):
+        """
+        Validate that all values are eBay-compliant
+        """
+        errors = []
+        
+        # Check required fields
+        required = ['Brand', 'Size', 'Condition']
+        for field in required:
+            if field not in item_specifics:
+                errors.append(f"Missing required field: {field}")
+        
+        # Validate values against accepted list
+        for field, value in item_specifics.items():
+            if field in self.accepted_values:
+                if value not in self.accepted_values[field]:
+                    errors.append(f"Invalid value for {field}: '{value}'")
+        
+        return errors
+
+# ==========================
+# INTEGRATION HELPER FUNCTIONS
+# ==========================
+
+def analyze_tag_with_enhanced_ocr(tag_image, light_controller):
+    """
+    Enhanced tag analysis with multi-strategy OCR
+    """
+    # Initialize OCR processor
+    ocr_processor = EnhancedOCRProcessor()
+    
+    # Optimize lighting
+    logger.info("[TAG] Optimizing lighting for OCR...")
+    light_optimizer = ImprovedSmartLightOptimizer(light_controller)
+    light_optimizer.optimize_for_current_image(tag_image, purpose='tag')
+    time.sleep(0.3)  # Let light settle
+    
+    # Extract text with multiple strategies
+    logger.info("[TAG] Running multi-pass OCR...")
+    ocr_result = ocr_processor.extract_text_multipass(tag_image)
+    
+    # Extract brand specifically
+    brand = ocr_processor.extract_brand_from_tag(tag_image)
+    
+    return {
+        'full_text': ocr_result['text'],
+        'confidence': ocr_result['confidence'],
+        'brand': brand,
+        'strategy': ocr_result['strategy']
+    }
+
+def classify_and_validate(garment_image, classification_result):
+    """
+    Classify garment and validate with strict rules
+    """
+    # Extract features from AI response
+    features = {
+        'has_front_opening': classification_result.get('has_front_opening', False),
+        'neckline': classification_result.get('neckline', 'Unknown'),
+    }
+    
+    garment_type = classification_result.get('type', 'Unknown')
+    
+    # Validate
+    is_valid, corrected_type, issues = validate_classification_strict(
+        garment_type,
+        features
+    )
+    
+    if not is_valid:
+        logger.warning(f"[VALIDATION] Classification issues: {issues}")
+        classification_result['type'] = corrected_type
+        classification_result['validation_issues'] = issues
+        classification_result['auto_corrected'] = True
+    
+    return classification_result
+
+def build_ebay_listing_improved(pipeline_data):
+    """
+    Build eBay listing with proper validation
+    """
+    ebay_mapper = ImprovedEbayMapper()
+    
+    # Build item specifics
+    item_specifics = ebay_mapper.build_item_specifics(pipeline_data)
+    
+    # Validate
+    errors = ebay_mapper.validate_listing(item_specifics)
+    
+    if errors:
+        logger.error(f"[EBAY] Validation errors: {errors}")
+        return {
+            'item_specifics': item_specifics,
+            'is_valid': False,
+            'errors': errors
+        }
+    
+    logger.info("[EBAY] Listing validation PASSED")
+    return {
+        'item_specifics': item_specifics,
+        'is_valid': True,
+        'errors': []
+    }
 
 # ==========================
 # CAMERA MANAGER 
