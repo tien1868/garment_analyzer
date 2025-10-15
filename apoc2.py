@@ -9332,6 +9332,47 @@ class EnhancedPipelineManager:
     
     def render_action_panel(self):
         """Simplified action panel with consistent Next Step button"""
+        
+        # ===== EMERGENCY DEBUG SECTION - ADD THIS AT THE TOP =====
+        st.markdown("---")
+        st.markdown("### 🔧 DEBUG CONTROLS")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.write(f"**Current Step:** {st.session_state.pipeline_manager.current_step}")
+        
+        with col2:
+            if st.button("⚡ FORCE NEXT (Debug)", key="force_next_debug"):
+                old_step = st.session_state.pipeline_manager.current_step
+                st.session_state.pipeline_manager.current_step += 1
+                st.success(f"Forced {old_step} → {st.session_state.pipeline_manager.current_step}")
+                time.sleep(0.5)  # Brief pause to see the message
+                st.rerun()
+        
+        with col3:
+            if st.button("🔄 Reset to Step 0", key="reset_debug"):
+                st.session_state.pipeline_manager.current_step = 0
+                st.rerun()
+        
+        st.markdown("---")
+        # ===== END DEBUG SECTION =====
+        
+        # Log every time this renders
+        logger.info(f"[PANEL] Rendering action panel - Step: {st.session_state.pipeline_manager.current_step}")
+        
+        # Check for infinite loops
+        if 'panel_render_count' not in st.session_state:
+            st.session_state.panel_render_count = 0
+        
+        st.session_state.panel_render_count += 1
+        
+        if st.session_state.panel_render_count > 100:
+            st.error("🛑 Too many reruns detected - using debug controls instead")
+            # Don't stop, just warn
+        
+        logger.info(f"[PANEL] Render count: {st.session_state.panel_render_count}")
+        
         # LOOP PREVENTION: Throttle this function (but always show Next Step button)
         if 'action_panel_last_call' not in st.session_state:
             st.session_state.action_panel_last_call = 0
@@ -9405,43 +9446,43 @@ class EnhancedPipelineManager:
                     st.warning("⚠️ Forced advance - may skip validation")
                     st.rerun()
             
-            # Consistent Next Step button for all steps
-            # Mark that the main Next Step button is being rendered
-            st.session_state.next_step_button_rendered = True
-            if st.button("➡️ Next Step", type="primary", key=f"next_step_{st.session_state.pipeline_manager.current_step}"):
-                # Handle step-specific actions before advancing
-                logger.info(f"[NEXT-STEP] Button clicked! Current step: {st.session_state.pipeline_manager.current_step}")
+            # Simplified Next Step button with comprehensive logging
+            # Add logging BEFORE the button
+            logger.info(f"[BUTTON] Rendering Next button for step {st.session_state.pipeline_manager.current_step}")
+            
+            # Simplified button with unique key
+            button_key = f"next_btn_step_{st.session_state.pipeline_manager.current_step}_{int(time.time())}"
+            
+            if st.button("➡️ Next Step", type="primary", key=button_key, use_container_width=True):
+                logger.info(f"[BUTTON] ✅ NEXT BUTTON CLICKED - Step: {st.session_state.pipeline_manager.current_step}")
                 
-                # Execute current step logic
                 try:
-                    logger.info(f"[NEXT-STEP] Executing step {st.session_state.pipeline_manager.current_step}")
-                    result = st.session_state.pipeline_manager._execute_current_step()
+                    # Get current step
+                    current = st.session_state.pipeline_manager.current_step
+                    logger.info(f"[BUTTON] Current step: {current}")
                     
-                    logger.info(f"[NEXT-STEP] Step result: {result}")
+                    # Simple validation - just check if we should advance
+                    can_advance = True
                     
-                    if result.get('success', False):
-                        # Only advance if step succeeded
-                        old_step = st.session_state.pipeline_manager.current_step
+                    # Basic step-specific checks (keep simple!)
+                    if current == 0:  # Tag Analysis
+                        if not hasattr(st.session_state.pipeline_manager.pipeline_data, 'tag_image') or st.session_state.pipeline_manager.pipeline_data.tag_image is None:
+                            st.warning("⚠️ Please capture a tag image first")
+                            can_advance = False
+                            logger.warning("[BUTTON] Cannot advance - no tag image")
+                    
+                    # Advance if allowed
+                    if can_advance:
                         st.session_state.pipeline_manager.current_step += 1
                         new_step = st.session_state.pipeline_manager.current_step
-                        
-                        logger.info(f"[NEXT-STEP] Advanced from step {old_step} to step {new_step}")
-                        st.success(f"✅ Step {old_step + 1} complete! Moving to step {new_step + 1}")
-                        
-                        # Add a small delay to ensure success message is visible
-                        time.sleep(0.5)
+                        logger.info(f"[BUTTON] ✅ ADVANCED: {current} → {new_step}")
+                        st.success(f"✅ Moving to step {new_step}")
+                        time.sleep(0.3)  # Brief pause
                         st.rerun()
-                    else:
-                        # Show error but don't advance
-                        error_msg = result.get('error', 'Unknown error')
-                        logger.error(f"[NEXT-STEP] Step {st.session_state.pipeline_manager.current_step} failed: {error_msg}")
-                        st.error(f"❌ Step failed: {error_msg}")
-                
+                    
                 except Exception as e:
-                    logger.error(f"[NEXT-STEP] Step execution failed: {e}")
-                    import traceback
-                    logger.error(f"[NEXT-STEP] Traceback: {traceback.format_exc()}")
-                    st.error(f"❌ Error: {e}")
+                    logger.error(f"[BUTTON] ❌ Error in Next button: {e}", exc_info=True)
+                    st.error(f"Error: {e}")
                 
                 # OLD COMPLEX LOGIC - REPLACED BY SIMPLIFIED VERSION ABOVE
                 if False:  # Disabled to prevent execution
