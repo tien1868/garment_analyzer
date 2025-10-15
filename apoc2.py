@@ -7331,6 +7331,10 @@ class EnhancedPipelineManager:
                 self._render_step_5_compact()
             else:
                 self._render_final_review_compact()
+        
+        # CRITICAL: Add the action panel with Next Step button
+        st.markdown("---")
+        self.render_action_panel()
 
     def _render_step_0_compact(self):
         """Compact Step 0: Tag Analysis with AUTO-REFRESH motion detection"""
@@ -9464,12 +9468,45 @@ class EnhancedPipelineManager:
                     # Simple validation - just check if we should advance
                     can_advance = True
                     
-                    # Basic step-specific checks (keep simple!)
+                    # Step-specific processing
                     if current == 0:  # Tag Analysis
-                        if not hasattr(st.session_state.pipeline_manager.pipeline_data, 'tag_image') or st.session_state.pipeline_manager.pipeline_data.tag_image is None:
-                            st.warning("⚠️ Please capture a tag image first")
+                        logger.info("[BUTTON] Step 0: Starting tag analysis...")
+                        
+                        # Run the actual tag analysis
+                        with st.spinner("🔍 Analyzing tag..."):
+                            result = st.session_state.pipeline_manager.handle_step_0_tag_analysis()
+                            logger.info(f"[BUTTON] Tag analysis result: {result}")
+                        
+                        if result and result.get('success', False):
+                            logger.info("[BUTTON] ✅ Tag analysis successful!")
+                            st.success(f"✅ Tag analyzed: {result.get('message', 'Success')}")
+                            can_advance = True
+                        else:
+                            error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
+                            logger.error(f"[BUTTON] ❌ Tag analysis failed: {error_msg}")
+                            st.error(f"❌ Tag analysis failed: {error_msg}")
                             can_advance = False
-                            logger.warning("[BUTTON] Cannot advance - no tag image")
+                    
+                    elif current == 1:  # Garment Analysis
+                        logger.info("[BUTTON] Step 1: Starting garment analysis...")
+                        with st.spinner("👕 Analyzing garment..."):
+                            result = st.session_state.pipeline_manager.handle_step_1_garment_analysis()
+                            logger.info(f"[BUTTON] Garment analysis result: {result}")
+                        
+                        if result and result.get('success', False):
+                            logger.info("[BUTTON] ✅ Garment analysis successful!")
+                            st.success(f"✅ Garment analyzed: {result.get('message', 'Success')}")
+                            can_advance = True
+                        else:
+                            error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
+                            logger.error(f"[BUTTON] ❌ Garment analysis failed: {error_msg}")
+                            st.error(f"❌ Garment analysis failed: {error_msg}")
+                            can_advance = False
+                    
+                    else:
+                        # For other steps, just advance
+                        logger.info(f"[BUTTON] Step {current}: Simple advance")
+                        can_advance = True
                     
                     # Advance if allowed
                     if can_advance:
@@ -9479,6 +9516,8 @@ class EnhancedPipelineManager:
                         st.success(f"✅ Moving to step {new_step}")
                         time.sleep(0.3)  # Brief pause
                         st.rerun()
+                    else:
+                        logger.info(f"[BUTTON] ⏸️ Not advancing - step {current} failed")
                     
                 except Exception as e:
                     logger.error(f"[BUTTON] ❌ Error in Next button: {e}", exc_info=True)
