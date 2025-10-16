@@ -29,6 +29,330 @@ from data_collection_and_correction_system import (
     render_confidence_scores
 )
 
+# eBay API imports for sold comps research
+import requests
+from datetime import datetime, timedelta
+import statistics
+from functools import wraps
+
+# Rate limiting decorator for eBay API
+def rate_limited(max_per_minute=5000):
+    """Rate limiting decorator for API calls"""
+    min_interval = 60.0 / max_per_minute
+    last_called = [0.0]
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_called[0]
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_called[0] = time.time()
+            return ret
+        return wrapper
+    return decorator
+
+# eBay cache helper functions
+def _cache_key_with_specifics(brand: str, garment_type: str, size: str = None, 
+                             gender: str = None, item_specifics: dict = None) -> str:
+    """Generate cache key for eBay search"""
+    key_parts = [brand, garment_type]
+    if size and size != 'Unknown':
+        key_parts.append(size)
+    if gender and gender != 'Unisex':
+        key_parts.append(gender)
+    if item_specifics:
+        for name, value in sorted(item_specifics.items()):
+            key_parts.append(f"{name}:{value}")
+    return "ebay_" + "_".join(key_parts).replace(" ", "_").lower()
+
+def _get_cached_result(cache_key: str) -> dict:
+    """Get cached eBay result"""
+    try:
+        cache_file = f"cache/{cache_key}.json"
+        if os.path.exists(cache_file):
+            # Check if cache is still valid (24 hours)
+            cache_time = os.path.getmtime(cache_file)
+            if time.time() - cache_time < 86400:  # 24 hours
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+    except Exception:
+        pass
+    return None
+
+def _cache_result(cache_key: str, result: dict):
+    """Cache eBay result"""
+    try:
+        os.makedirs("cache", exist_ok=True)
+        cache_file = f"cache/{cache_key}.json"
+        with open(cache_file, 'w') as f:
+            json.dump(result, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to cache eBay result: {e}")
+
+class eBayCompsFinder:
+    """Research eBay sold comps for accurate pricing and sell-through rates"""
+    
+    def __init__(self, app_id=None):
+        """
+        Initialize with eBay Finding API credentials.
+        Get your App ID from: https://developer.ebay.com/my/keys
+        """
+        self.app_id = app_id or os.getenv('EBAY_APP_ID')
+        self.base_url = "https://svcs.ebay.com/services/search/FindingService/v1"
+        
+        if not self.app_id:
+            logger.warning("⚠️ eBay App ID not found. Set EBAY_APP_ID environment variable")
+            logger.warning("   Get one free at: https://developer.ebay.com/my/keys")
+    
+    @rate_limited(max_per_minute=5000)  # eBay allows 5000 calls/day for free tier
+    def search_sold_comps(self, brand: str, garment_type: str, size: str = None, 
+                          gender: str = None, item_specifics: dict = None,
+                          days_back: int = 90) -> dict:
+        """
+        Search eBay for sold/completed listings to get real market data.
+        
+        Returns:
+            {
+                'sold_items': [...],
+                'active_items': [...],
+                'avg_sold_price': float,
+                'median_sold_price': float,
+                'sell_through_rate': float,  # % of items that sold vs listed
+                'total_sold': int,
+                'total_active': int,
+                'price_range': {'low': float, 'high': float},
+                'days_to_sell_avg': float,
+                'success': bool
+            }
+        """
+        if not self.app_id:
+            return {'success': False, 'error': 'eBay App ID not configured'}
+        
+        # Check cache first
+        cache_key = _cache_key_with_specifics(brand, garment_type, size, gender, item_specifics)
+        cached = _get_cached_result(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            # Build search query
+            keywords = self._build_search_keywords(brand, garment_type, size, gender)
+            
+            # Search SOLD items (completed + sold)
+            sold_data = self._search_ebay(
+                keywords=keywords,
+                item_filter=[
+                    {'name': 'SoldItemsOnly', 'value': 'true'},
+                    {'name': 'EndTimeFrom', 'value': (datetime.now() - timedelta(days=days_back)).isoformat()}
+                ],
+                item_specifics=item_specifics
+            )
+            
+            # Search ACTIVE items (current listings)
+            active_data = self._search_ebay(
+                keywords=keywords,
+                item_filter=[
+                    {'name': 'ListingType', 'value': 'FixedPrice'}
+                ],
+                item_specifics=item_specifics
+            )
+            
+            # Parse results
+            sold_items = self._parse_items(sold_data)
+            active_items = self._parse_items(active_data)
+            
+            # Calculate metrics
+            result = self._calculate_metrics(sold_items, active_items, days_back)
+            result['success'] = True
+            result['brand'] = brand
+            result['garment_type'] = garment_type
+            result['search_keywords'] = keywords
+            
+            # Cache the result
+            _cache_result(cache_key, result)
+            
+            logger.info(f"[EBAY] {brand} {garment_type}: "
+                       f"${result['avg_sold_price']:.2f} avg, "
+                       f"{result['sell_through_rate']:.1f}% sell-through, "
+                       f"{result['total_sold']} sold in {days_back} days")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"[EBAY] Search failed: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def _build_search_keywords(self, brand: str, garment_type: str, 
+                               size: str = None, gender: str = None) -> str:
+        """Build optimized eBay search keywords"""
+        keywords = [brand, garment_type]
+        
+        # Add size if specific
+        if size and size != 'Unknown':
+            # Clean size string
+            size_clean = size.replace('US', '').replace('IT', '').replace('EU', '').strip()
+            if size_clean and not size_clean.lower() in ['one size', 'os', 'onesize']:
+                keywords.append(f"size {size_clean}")
+        
+        # Add gender if specific
+        if gender and gender.lower() in ['men', 'women', 'womens', 'mens']:
+            if gender.lower() in ['women', 'womens']:
+                keywords.append("women's")
+            elif gender.lower() in ['men', 'mens']:
+                keywords.append("men's")
+        
+        return ' '.join(keywords)
+    
+    def _search_ebay(self, keywords: str, item_filter: list = None,
+                     item_specifics: dict = None, max_results: int = 100) -> dict:
+        """Execute eBay Finding API search"""
+        
+        params = {
+            'OPERATION-NAME': 'findCompletedItems' if any(f.get('name') == 'SoldItemsOnly' for f in (item_filter or [])) else 'findItemsAdvanced',
+            'SERVICE-VERSION': '1.0.0',
+            'SECURITY-APPNAME': self.app_id,
+            'RESPONSE-DATA-FORMAT': 'JSON',
+            'REST-PAYLOAD': '',
+            'keywords': keywords,
+            'paginationInput.entriesPerPage': str(min(max_results, 100)),
+            'sortOrder': 'EndTimeSoonest'
+        }
+        
+        # Add item filters
+        if item_filter:
+            for idx, filt in enumerate(item_filter):
+                params[f'itemFilter({idx}).name'] = filt['name']
+                params[f'itemFilter({idx}).value'] = filt['value']
+        
+        # Add item specifics (neckline, sleeve length, etc.)
+        if item_specifics:
+            for idx, (name, value) in enumerate(item_specifics.items()):
+                params[f'aspectFilter({idx}).aspectName'] = name
+                params[f'aspectFilter({idx}).aspectValueName'] = value
+        
+        response = requests.get(self.base_url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        return response.json()
+    
+    def _parse_items(self, api_response: dict) -> list:
+        """Parse eBay API response into simplified item list"""
+        items = []
+        
+        try:
+            search_result = api_response.get('findCompletedItemsResponse', 
+                                           api_response.get('findItemsAdvancedResponse', [{}]))[0]
+            
+            if 'searchResult' not in search_result:
+                return items
+            
+            result_items = search_result['searchResult'][0].get('item', [])
+            
+            for item in result_items:
+                try:
+                    # Extract price
+                    price_info = item.get('sellingStatus', [{}])[0]
+                    price = float(price_info.get('currentPrice', [{}])[0].get('__value__', 0))
+                    
+                    # Extract listing dates
+                    start_time = item.get('listingInfo', [{}])[0].get('startTime', [''])[0]
+                    end_time = item.get('listingInfo', [{}])[0].get('endTime', [''])[0]
+                    
+                    # Calculate days to sell
+                    days_to_sell = None
+                    if start_time and end_time:
+                        try:
+                            start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                            end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                            days_to_sell = (end - start).days
+                        except:
+                            pass
+                    
+                    items.append({
+                        'title': item.get('title', [''])[0],
+                        'price': price,
+                        'condition': item.get('condition', [{}])[0].get('conditionDisplayName', [''])[0],
+                        'url': item.get('viewItemURL', [''])[0],
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'days_to_sell': days_to_sell,
+                        'item_id': item.get('itemId', [''])[0]
+                    })
+                except Exception as e:
+                    logger.debug(f"Failed to parse item: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Failed to parse eBay response: {e}")
+        
+        return items
+    
+    def _calculate_metrics(self, sold_items: list, active_items: list, 
+                          days_back: int) -> dict:
+        """Calculate pricing and sell-through metrics"""
+        
+        # Filter out extreme outliers (likely errors or bundle deals)
+        def is_reasonable_price(price):
+            return 5.0 <= price <= 5000.0
+        
+        sold_prices = [item['price'] for item in sold_items if is_reasonable_price(item['price'])]
+        active_prices = [item['price'] for item in active_items if is_reasonable_price(item['price'])]
+        
+        # Calculate sold item metrics
+        avg_sold = statistics.mean(sold_prices) if sold_prices else 0
+        median_sold = statistics.median(sold_prices) if sold_prices else 0
+        
+        # Calculate sell-through rate
+        # Formula: (sold items / (sold + active items)) * 100
+        total_sold = len(sold_items)
+        total_active = len(active_items)
+        total_listings = total_sold + total_active
+        
+        sell_through_rate = (total_sold / total_listings * 100) if total_listings > 0 else 0
+        
+        # Calculate average days to sell
+        days_to_sell_list = [item['days_to_sell'] for item in sold_items 
+                            if item['days_to_sell'] is not None and item['days_to_sell'] > 0]
+        avg_days_to_sell = statistics.mean(days_to_sell_list) if days_to_sell_list else None
+        
+        # Price range
+        all_prices = sold_prices + active_prices
+        price_low = min(all_prices) if all_prices else 0
+        price_high = max(all_prices) if all_prices else 0
+        
+        return {
+            'sold_items': sold_items[:20],  # Keep top 20 for reference
+            'active_items': active_items[:20],
+            'avg_sold_price': round(avg_sold, 2),
+            'median_sold_price': round(median_sold, 2),
+            'sell_through_rate': round(sell_through_rate, 1),
+            'total_sold': total_sold,
+            'total_active': total_active,
+            'total_listings': total_listings,
+            'price_range': {
+                'low': round(price_low, 2),
+                'high': round(price_high, 2)
+            },
+            'days_to_sell_avg': round(avg_days_to_sell, 1) if avg_days_to_sell else None,
+            'confidence': self._calculate_confidence(total_sold, total_active)
+        }
+    
+    def _calculate_confidence(self, sold_count: int, active_count: int) -> str:
+        """Calculate confidence level based on sample size"""
+        total = sold_count + active_count
+        
+        if total >= 50:
+            return "High"
+        elif total >= 20:
+            return "Medium"
+        elif total >= 10:
+            return "Low"
+        else:
+            return "Very Low"
+
 # Store tag detection removed - was overdetecting
 import google.generativeai as genai
 import sounddevice as sd
@@ -698,8 +1022,197 @@ class PipelineData:
     price_low: float = 10
     price_high: float = 30
     model_comparison: Dict = field(default_factory=dict)  # Stores dual-model AI comparison results
+    
+    # eBay sold comps research fields
+    sell_through_rate: float = 0.0
+    avg_days_to_sell: Optional[float] = None
+    ebay_sold_count: int = 0
+    ebay_active_count: int = 0
+    pricing_confidence: str = "Unknown"
+    ebay_comps: Dict = field(default_factory=dict)
 
 # BackgroundAnalysisManager removed - was unused dead code
+
+# ==========================
+# EBAY RESEARCH INTEGRATION
+# ==========================
+
+def build_ebay_item_specifics(pipeline_data) -> dict:
+    """Build eBay item specifics from pipeline data"""
+    item_specifics = {}
+    
+    # Neckline mapping
+    neckline = pipeline_data.neckline.lower() if pipeline_data.neckline != 'Unknown' else ''
+    neckline_map = {
+        'v-neck': 'V-Neck',
+        'crewneck': 'Crew Neck',
+        'turtleneck': 'Turtle Neck',
+        'cowl-neck': 'Cowl Neck',
+        'scoop': 'Scoop Neck',
+        'boat-neck': 'Boat Neck'
+    }
+    for key, value in neckline_map.items():
+        if key in neckline:
+            item_specifics['Neckline'] = value
+            break
+    
+    # Sleeve length mapping
+    sleeve_length = pipeline_data.sleeve_length.lower() if pipeline_data.sleeve_length != 'Unknown' else ''
+    sleeve_map = {
+        'long': 'Long Sleeve',
+        'short': 'Short Sleeve',
+        '3-4': '3/4 Sleeve',
+        'sleeveless': 'Sleeveless'
+    }
+    for key, value in sleeve_map.items():
+        if key in sleeve_length:
+            item_specifics['Sleeve Length'] = value
+            break
+    
+    # Style mapping
+    style = pipeline_data.style.lower() if pipeline_data.style != 'Unknown' else ''
+    style_map = {
+        'casual': 'Casual',
+        'formal': 'Formal',
+        'business': 'Business'
+    }
+    for key, value in style_map.items():
+        if key in style:
+            item_specifics['Style'] = value
+            break
+    
+    # Fit mapping
+    fit = pipeline_data.fit.lower() if pipeline_data.fit != 'Unknown' else ''
+    fit_map = {
+        'slim': 'Slim Fit',
+        'regular': 'Regular Fit',
+        'relaxed': 'Relaxed Fit',
+        'oversized': 'Oversized'
+    }
+    for key, value in fit_map.items():
+        if key in fit:
+            item_specifics['Fit'] = value
+            break
+    
+    return item_specifics
+
+def research_brand_with_ebay(pipeline_data, ebay_finder):
+    """
+    Research the detected brand using eBay sold comps.
+    Call this after brand detection is complete.
+    
+    Args:
+        pipeline_data: Your PipelineData object with brand, garment_type, size, gender
+        ebay_finder: Instance of eBayCompsFinder
+    
+    Returns:
+        Updated pipeline_data with eBay metrics
+    """
+    if not ebay_finder or not ebay_finder.app_id:
+        logger.warning("[EBAY] Skipping research - no App ID configured")
+        return pipeline_data
+    
+    # Skip if brand unknown
+    if pipeline_data.brand == "Unknown":
+        logger.info("[EBAY] Skipping - brand unknown")
+        return pipeline_data
+    
+    logger.info(f"[EBAY] Researching {pipeline_data.brand} {pipeline_data.garment_type}...")
+    
+    # Build item specifics from pipeline data
+    item_specifics = build_ebay_item_specifics(pipeline_data)
+    
+    # Search eBay sold comps
+    comps_data = ebay_finder.search_sold_comps(
+        brand=pipeline_data.brand,
+        garment_type=pipeline_data.garment_type,
+        size=pipeline_data.size,
+        gender=pipeline_data.gender,
+        item_specifics=item_specifics,
+        days_back=90
+    )
+    
+    if comps_data.get('success'):
+        # Update pipeline data with real market data
+        pipeline_data.price_estimate = {
+            'low': comps_data['price_range']['low'],
+            'mid': comps_data['avg_sold_price'],
+            'high': comps_data['price_range']['high'],
+            'median': comps_data['median_sold_price']
+        }
+        
+        # Add new metrics
+        pipeline_data.sell_through_rate = comps_data['sell_through_rate']
+        pipeline_data.avg_days_to_sell = comps_data['days_to_sell_avg']
+        pipeline_data.ebay_sold_count = comps_data['total_sold']
+        pipeline_data.ebay_active_count = comps_data['total_active']
+        pipeline_data.pricing_confidence = comps_data['confidence']
+        pipeline_data.ebay_comps = comps_data  # Store full data
+        
+        # Add to data sources
+        if not hasattr(pipeline_data, 'data_sources'):
+            pipeline_data.data_sources = []
+        pipeline_data.data_sources.append('eBay Sold Comps')
+        
+        logger.info(f"[EBAY] ✅ Updated pricing: ${comps_data['avg_sold_price']:.2f} avg, "
+                   f"{comps_data['sell_through_rate']:.1f}% sell-through")
+    else:
+        logger.warning(f"[EBAY] Research failed: {comps_data.get('error', 'Unknown error')}")
+        # Keep original pricing estimate
+    
+    return pipeline_data
+
+def display_ebay_comps(pipeline_data):
+    """Display eBay comps in Streamlit UI"""
+    if hasattr(pipeline_data, 'ebay_comps') and pipeline_data.ebay_comps:
+        st.subheader("📊 eBay Market Research")
+        
+        comps = pipeline_data.ebay_comps
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "Avg Sold Price",
+                f"${comps['avg_sold_price']:.2f}",
+                delta=f"${comps['median_sold_price']:.2f} median"
+            )
+        
+        with col2:
+            st.metric(
+                "Sell-Through Rate",
+                f"{comps['sell_through_rate']:.1f}%",
+                delta=f"{comps['total_sold']} sold"
+            )
+        
+        with col3:
+            if comps['days_to_sell_avg']:
+                st.metric(
+                    "Avg Days to Sell",
+                    f"{comps['days_to_sell_avg']:.0f} days"
+                )
+            else:
+                st.metric("Avg Days to Sell", "N/A")
+        
+        with col4:
+            st.metric(
+                "Active Listings",
+                comps['total_active'],
+                delta=f"{comps['confidence']} confidence"
+            )
+        
+        # Price range
+        st.write(f"**Price Range:** ${comps['price_range']['low']:.2f} - ${comps['price_range']['high']:.2f}")
+        
+        # Show recent sold items
+        if comps.get('sold_items'):
+            with st.expander("View Recent Sold Items"):
+                for item in comps['sold_items'][:10]:
+                    st.write(f"**${item['price']:.2f}** - {item['title']}")
+                    if item['days_to_sell']:
+                        st.caption(f"Sold in {item['days_to_sell']} days - {item['condition']}")
+                    st.write(f"[View on eBay]({item['url']})")
+                    st.divider()
 
 # ==========================
 # WORKING ELGATO CONTROLLER WITH FAST DISCOVERY
@@ -6478,6 +6991,14 @@ class EnhancedPipelineManager:
         self.pricing_api = EBayPricingAPI()
         self.mock_tag_generator = MockTagGenerator()
         
+        # Initialize eBay sold comps research
+        try:
+            self.ebay_finder = eBayCompsFinder()
+            print("  - eBay sold comps research initialized")
+        except Exception as e:
+            print(f"  - eBay finder initialization failed: {e}")
+            self.ebay_finder = None
+        
         # Initialize learning system
         try:
             self.dataset_manager = TagDatasetManager()
@@ -6643,6 +7164,15 @@ class EnhancedPipelineManager:
                 
                 # Reset camera exposure for next run
                 self.camera_manager.reset_auto_exposure()
+                
+                # Research brand with eBay sold comps
+                if self.ebay_finder:
+                    try:
+                        logger.info(f"[EBAY] Starting research for {self.pipeline_data.brand}...")
+                        self.pipeline_data = research_brand_with_ebay(self.pipeline_data, self.ebay_finder)
+                    except Exception as e:
+                        logger.warning(f"[EBAY] Research failed: {e}")
+                        # Continue without eBay data
                 
                 return {'success': True, 'message': f"Brand: {result.get('brand')}, Size: {result.get('size')}"}
             else:
@@ -7703,6 +8233,9 @@ class EnhancedPipelineManager:
         
         # Show confidence scores
         render_confidence_scores(self.pipeline_data)
+        
+        # === EBAY SOLD COMPS RESEARCH ===
+        display_ebay_comps(self.pipeline_data)
         
         # Store tag detection removed - was overdetecting and creating false positives
         # === CORRECTION PANEL ===
