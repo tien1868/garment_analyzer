@@ -187,24 +187,32 @@ class eBayCompsFinder:
     
     def _build_search_keywords(self, brand: str, garment_type: str, 
                                size: str = None, gender: str = None) -> str:
-        """Build optimized eBay search keywords"""
+        """
+        Build optimized eBay search keywords with PROPER garment type inclusion.
+        
+        CRITICAL FIX: Include garment_type in search query (e.g., "Paul Smith Shirt" not just "Paul Smith")
+        """
+        # FIX 1: PROPER QUERY FORMAT - Include garment type!
+        # Example: "Paul Smith Shirt" not just "Paul Smith"
         keywords = [brand, garment_type]
         
-        # Add size if specific
+        # Add gender prefix if relevant
+        if gender and gender.lower() not in ['unisex', 'unknown']:
+            if gender.lower() in ['women', 'womens', "women's"]:
+                keywords.insert(0, "women's")
+            elif gender.lower() in ['men', 'mens', "men's"]:
+                keywords.insert(0, "men's")
+        
+        # Add size if available
         if size and size != 'Unknown':
             # Clean size string
             size_clean = size.replace('US', '').replace('IT', '').replace('EU', '').strip()
             if size_clean and not size_clean.lower() in ['one size', 'os', 'onesize']:
                 keywords.append(f"size {size_clean}")
         
-        # Add gender if specific
-        if gender and gender.lower() in ['men', 'women', 'womens', 'mens']:
-            if gender.lower() in ['women', 'womens']:
-                keywords.append("women's")
-            elif gender.lower() in ['men', 'mens']:
-                keywords.append("men's")
-        
-        return ' '.join(keywords)
+        search_query = ' '.join(keywords)
+        logger.info(f"[EBAY] Search query: '{search_query}'")
+        return search_query
     
     def _search_ebay(self, keywords: str, item_filter: list = None,
                      item_specifics: dict = None, max_results: int = 100) -> dict:
@@ -271,15 +279,26 @@ class eBayCompsFinder:
                         except:
                             pass
                     
+                    # FIX 3: VALID EBAY URLs - Use viewItemURL from API response
+                    item_url = item.get('viewItemURL', [''])[0]
+                    item_id = item.get('itemId', [''])[0]
+                    title = item.get('title', [''])[0]
+                    
+                    # Ensure we have a valid URL
+                    if not item_url and item_id:
+                        # Fallback URL construction if viewItemURL is missing
+                        item_url = f"https://www.ebay.com/itm/{item_id}"
+                    
                     items.append({
-                        'title': item.get('title', [''])[0],
+                        'title': title,
                         'price': price,
                         'condition': item.get('condition', [{}])[0].get('conditionDisplayName', [''])[0],
-                        'url': item.get('viewItemURL', [''])[0],
+                        'url': item_url,  # This is the correct, working eBay URL
                         'start_time': start_time,
                         'end_time': end_time,
                         'days_to_sell': days_to_sell,
-                        'item_id': item.get('itemId', [''])[0]
+                        'item_id': item_id,
+                        'sold': True  # Mark as sold for reference
                     })
                 except Exception as e:
                     logger.debug(f"Failed to parse item: {e}")
@@ -2307,32 +2326,25 @@ def build_ebay_listing_improved(pipeline_data):
 # CAMERA MANAGER 
 # ==========================
 class OpenAIVisionCameraManager:
-    """Camera manager with 12MP Arducam support and focus scoring"""
+    """Camera manager with 12MP Arducam support and Logitech C930e for garment analysis"""
     
     def __init__(self):
         # Suppress OpenCV warnings
         self.suppress_cv2_warnings()
         
         self.arducam_index = None
-        self.realsense_index = None
         self.arducam_cap = None
-        self.realsense_cap = None
         
-        # RealSense SDK components for proper color stream
+        # NEW: Logitech C930e for garment analysis (replaces RealSense)
+        self.c930e = LogitechC930eManager()
+        
+        # Keep existing RealSense variables for backward compatibility (will be deprecated)
+        self.realsense_index = None
+        self.realsense_cap = None
         self.realsense_pipeline = None
         self.realsense_config = None
-        self.realsense_sdk_available = REALSENSE_SDK_AVAILABLE
+        self.realsense_sdk_available = False  # Disabled in favor of C930e
         self.rs = None
-        
-        # Initialize RealSense SDK if available
-        if self.realsense_sdk_available:
-            try:
-                import pyrealsense2 as rs
-                self.rs = rs
-                logger.info("✅ RealSense SDK initialized in camera manager")
-            except ImportError:
-                self.realsense_sdk_available = False
-                logger.warning("⚠️ RealSense SDK import failed in camera manager")
         
         self.roi_coords = self.load_roi_config()
         
@@ -2346,11 +2358,11 @@ class OpenAIVisionCameraManager:
             self.original_resolution = (1280, 720)
         
         self.arducam_settings = self.load_arducam_settings()
-        self.camera_status = {'arducam': False, 'realsense': False}
-        self.camera_failures = {'arducam': 0, 'realsense': 0}
+        self.camera_status = {'arducam': False, 'c930e': False}
+        self.camera_failures = {'arducam': 0, 'c930e': 0}
         self.max_failures = 3
-        self.last_frame_time = {'arducam': 0, 'realsense': 0}
-        self.frame_cache = {'arducam': None, 'realsense': None}
+        self.last_frame_time = {'arducam': 0, 'c930e': 0}
+        self.frame_cache = {'arducam': None, 'c930e': None}
         self.cache_duration = 0.5  # Cache frames for 500ms - refresh less often
         self.skip_frames = 2  # Only process every 3rd frame for better performance
         
@@ -2366,7 +2378,7 @@ class OpenAIVisionCameraManager:
         
         self.find_cameras()  # Auto-detect working cameras
         self.initialize_cameras()  # Initialize once at startup
-        logger.info("12MP Arducam Camera Manager initialized")
+        logger.info("Updated Camera Manager initialized (ArduCam + C930e)")
     
     def suppress_cv2_warnings(self):
         """Suppress OpenCV warning messages"""
@@ -2474,7 +2486,15 @@ class OpenAIVisionCameraManager:
             except Exception as e:
                 logger.error(f"Failed to initialize ArduCam: {e}")
         
-        # Initialize RealSense with proper SDK for color stream
+        # Initialize C930e for garment analysis (replaces RealSense)
+        if self.c930e.initialize():
+            self.c930e.optimize_for_led_lighting()
+            self.camera_status['c930e'] = True
+            logger.info("✅ C930e initialized for garment analysis")
+        else:
+            logger.error("❌ C930e initialization failed")
+        
+        # DEPRECATED: RealSense initialization (kept for backward compatibility)
         if self.realsense_index is not None and self.realsense_index != self.arducam_index:
             if self.realsense_sdk_available:
                 try:
@@ -3277,22 +3297,38 @@ class OpenAIVisionCameraManager:
             else:
                 return None
     
-    def get_garment_frame(self):
-        """Get garment frame - use ArduCam if RealSense problematic"""
+    def get_garment_frame(self, preview=False):
+        """
+        Get garment frame from C930e (replaces RealSense).
         
-        # Try RealSense first
-        frame = self.get_realsense_frame()
+        Args:
+            preview: If True, return downsampled frame for UI
         
-        # Verify it's actually color
+        Returns:
+            RGB frame or None
+        """
+        # Use C930e for garment analysis
+        frame = self.c930e.get_frame(use_preview_res=preview)
+        
         if frame is not None:
-            if len(frame.shape) == 3 and frame.shape[2] == 3:
-                unique_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
-                if unique_colors > 1000:  # Arbitrary threshold for "real color"
-                    return frame
+            # Periodically adjust for garment brightness
+            if hasattr(self, '_adjustment_counter'):
+                self._adjustment_counter += 1
+            else:
+                self._adjustment_counter = 0
             
-            logger.warning("RealSense not providing color - falling back to ArduCam")
+            # Adjust every 30 frames (about once per second)
+            if self._adjustment_counter % 30 == 0:
+                self.c930e.adjust_for_garment_color(frame)
+            
+            return frame
         
-        # Fallback: use ArduCam for garments too
+        # Fallback: use ArduCam if C930e fails
+        logger.warning("C930e not available - falling back to ArduCam for garment analysis")
+        return self.get_arducam_frame()
+    
+    def get_tag_frame(self):
+        """Get tag frame from ArduCam (high resolution for OCR)"""
         return self.get_arducam_frame()
     
     def detect_tag_for_auto_zoom(self, frame):
@@ -3863,7 +3899,10 @@ class OpenAIVisionCameraManager:
             self.arducam_cap.release()
             self.arducam_cap = None
         
-        # Release RealSense SDK pipeline first
+        # Release C930e
+        self.c930e.release()
+        
+        # DEPRECATED: Release RealSense SDK pipeline (kept for backward compatibility)
         if self.realsense_pipeline:
             self.realsense_pipeline.stop()
             self.realsense_pipeline = None
@@ -3909,9 +3948,10 @@ class OpenAIVisionCameraManager:
     def capture_garment_for_analysis(self):
         """Capture with extended ROI for full-length items like dresses"""
         
-        frame = self.get_realsense_frame()
+        # Use C930e for garment capture (replaces RealSense)
+        frame = self.get_garment_frame(preview=False)
         if frame is None:
-            logger.warning("[GARMENT-CAPTURE] No RealSense frame available")
+            logger.warning("[GARMENT-CAPTURE] No C930e frame available")
             return None
         
         try:
@@ -4099,7 +4139,7 @@ def display_camera_with_roi_overlay(camera_manager, camera_type='arducam', roi_t
     if camera_type == 'arducam':
         full_frame = camera_manager.get_arducam_frame()
     else:
-        full_frame = camera_manager.get_realsense_frame()
+        full_frame = camera_manager.get_garment_frame(preview=False)
     
     if full_frame is None:
         return None, None
@@ -5847,6 +5887,447 @@ class DefectDetector:
             logger.error(f"Defect detection error: {e}")
             return {'success': False, 'error': str(e)}
 
+
+# ==========================
+# IMPROVED BUTTON PLACEMENT DETECTION
+# ==========================
+
+def analyze_button_placement_fixed(image):
+    """
+    IMPROVED button placement detection for accurate gender classification
+    
+    KEY IMPROVEMENTS:
+    1. Check BOTH button locations AND buttonhole locations
+    2. Stricter criteria for "men's right, women's left" rule
+    3. Better confidence scoring
+    4. Verify with collar/lapel analysis
+    """
+    if image is None:
+        return {
+            'gender': 'Unisex',
+            'confidence': 'Low',
+            'button_side': 'unknown',
+            'indicators': ['No image provided']
+        }
+    
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        height, width = gray.shape
+        
+        # Define center-front vertical strip (middle 20% of image)
+        center_strip_left = int(width * 0.40)
+        center_strip_right = int(width * 0.60)
+        center_strip = gray[:, center_strip_left:center_strip_right]
+        
+        # IMPROVED: Detect both buttons AND buttonholes
+        # Buttons: small circular shapes
+        # Buttonholes: small oval/rectangular shapes with high contrast edges
+        
+        # 1. BUTTON DETECTION (circular Hough transform)
+        circles = cv2.HoughCircles(
+            center_strip,
+            cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=20,
+            param1=50,
+            param2=30,
+            minRadius=5,
+            maxRadius=25
+        )
+        
+        # 2. BUTTONHOLE DETECTION (edge-based)
+        edges = cv2.Canny(center_strip, 50, 150)
+        buttonhole_contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours that look like buttonholes (small, elongated rectangles)
+        buttonholes = []
+        for contour in buttonhole_contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = h / w if w > 0 else 0
+            area = cv2.contourArea(contour)
+            
+            # Buttonholes are typically: small area, vertical orientation (h > w), elongated
+            if 50 < area < 500 and 1.5 < aspect_ratio < 5:
+                buttonholes.append((x, y, w, h))
+        
+        # 3. ANALYZE POSITIONS
+        left_count = 0
+        right_count = 0
+        
+        # Count buttons
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+            center_x = center_strip.shape[1] // 2
+            
+            for circle in circles[0, :]:
+                x, y, r = circle
+                if x < center_x - 10:  # Left side (with margin)
+                    left_count += 1
+                elif x > center_x + 10:  # Right side (with margin)
+                    right_count += 1
+        
+        # Count buttonholes
+        center_x = center_strip.shape[1] // 2
+        for (x, y, w, h) in buttonholes:
+            button_center_x = x + w // 2
+            if button_center_x < center_x - 10:
+                left_count += 1
+            elif button_center_x > center_x + 10:
+                right_count += 1
+        
+        # 4. DECISION LOGIC
+        indicators = []
+        confidence = 'Low'
+        
+        # Need at least 2 buttons/buttonholes to make determination
+        total_features = left_count + right_count
+        
+        if total_features < 2:
+            gender = 'Unisex'
+            indicators.append(f'Insufficient buttons/buttonholes detected ({total_features})')
+        
+        elif left_count > right_count * 1.5:  # Strong left bias
+            gender = "Women's"
+            confidence = 'High' if total_features >= 4 else 'Medium'
+            indicators.append(f'Buttons/buttonholes on LEFT ({left_count} left vs {right_count} right)')
+            indicators.append("Women's garments button LEFT over RIGHT")
+        
+        elif right_count > left_count * 1.5:  # Strong right bias
+            gender = "Men's"
+            confidence = 'High' if total_features >= 4 else 'Medium'
+            indicators.append(f'Buttons/buttonholes on RIGHT ({right_count} right vs {left_count} left)')
+            indicators.append("Men's garments button RIGHT over LEFT")
+        
+        else:
+            # Ambiguous or center-buttoned (cardigans, etc.)
+            gender = 'Unisex'
+            confidence = 'Low'
+            indicators.append(f'Ambiguous button placement ({left_count} left, {right_count} right)')
+        
+        # 5. VERIFY with collar/lapel if detected
+        # Check top 30% of center strip for collar types
+        collar_region = center_strip[:int(height * 0.3), :]
+        collar_edges = cv2.Canny(collar_region, 50, 150)
+        
+        # Look for V-shape (women's V-neck) or straight lines (men's collar)
+        lines = cv2.HoughLinesP(collar_edges, 1, np.pi/180, threshold=50, minLineLength=30, maxLineGap=10)
+        
+        if lines is not None:
+            # Analyze line angles
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                angles.append(angle)
+            
+            avg_angle = np.mean(angles) if angles else 90
+            
+            # V-necks have angles around 45°, crew necks around 90° (horizontal)
+            if 30 < avg_angle < 60:
+                indicators.append(f'V-neck collar detected (angle: {avg_angle:.1f}°)')
+            elif avg_angle > 80:
+                indicators.append(f'Crew/straight collar detected (angle: {avg_angle:.1f}°)')
+        
+        return {
+            'gender': gender,
+            'confidence': confidence,
+            'button_side': 'left' if left_count > right_count else 'right' if right_count > left_count else 'center',
+            'left_features': left_count,
+            'right_features': right_count,
+            'total_features': total_features,
+            'indicators': indicators
+        }
+    
+    except Exception as e:
+        logger.error(f"[BUTTON-DETECTION] Error: {e}")
+        return {
+            'gender': 'Unisex',
+            'confidence': 'Low',
+            'button_side': 'unknown',
+            'indicators': [f'Detection failed: {e}']
+        }
+
+
+# ==========================
+# LOGITECH C930E INTEGRATION
+# Replace your RealSense camera code with this
+# ==========================
+
+class LogitechC930eManager:
+    """Optimized manager for Logitech C930e webcam (1080p @ 30fps)"""
+    
+    def __init__(self):
+        self.cap = None
+        self.camera_index = None
+        self.frame_cache = None
+        self.last_frame_time = 0
+        self.cache_duration = 0.3  # 300ms cache
+        self.is_initialized = False
+        
+        # C930e optimal settings
+        self.resolution = (1920, 1080)  # Full HD
+        self.preview_resolution = (1280, 720)  # For UI display
+        self.fps = 30
+        
+        logger.info("Logitech C930e Manager initialized")
+    
+    def find_c930e(self):
+        """
+        Auto-detect Logitech C930e webcam.
+        Returns camera index if found, None otherwise.
+        """
+        logger.info("Searching for Logitech C930e webcam...")
+        
+        # Try DirectShow on Windows (most reliable)
+        backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+        
+        # Scan camera indices
+        for i in range(10):
+            try:
+                cap = cv2.VideoCapture(i, backend)
+                if cap.isOpened():
+                    # Try to read a frame
+                    ret, frame = cap.read()
+                    
+                    if ret and frame is not None:
+                        # Get camera name (Windows only with DirectShow)
+                        if os.name == 'nt':
+                            # Try to identify by name
+                            # Note: OpenCV doesn't expose camera names directly,
+                            # but C930e typically appears after built-in webcams
+                            
+                            # Test resolution capability (C930e supports 1080p)
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                            
+                            actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            
+                            # C930e will successfully set 1080p
+                            if actual_width >= 1920 and actual_height >= 1080:
+                                logger.info(f"✅ Found C930e-compatible camera at index {i} ({actual_width}x{actual_height})")
+                                cap.release()
+                                self.camera_index = i
+                                return i
+                    
+                    cap.release()
+                    
+            except Exception as e:
+                logger.debug(f"Camera {i} check failed: {e}")
+                continue
+        
+        logger.warning("⚠️ Could not auto-detect C930e. Will use first available 1080p camera.")
+        return None
+    
+    def initialize(self, camera_index=None):
+        """Initialize C930e with optimal settings for garment analysis"""
+        
+        if camera_index is None:
+            camera_index = self.find_c930e()
+        
+        if camera_index is None:
+            # Fallback: try index 1 (usually external webcam)
+            camera_index = 1
+            logger.warning(f"Using fallback camera index {camera_index}")
+        
+        try:
+            backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            self.cap = cv2.VideoCapture(camera_index, backend)
+            
+            if not self.cap.isOpened():
+                logger.error(f"Failed to open camera at index {camera_index}")
+                return False
+            
+            # Configure C930e for optimal garment capture
+            self._configure_camera()
+            
+            # Verify it's working
+            ret, test_frame = self.cap.read()
+            if ret and test_frame is not None:
+                actual_res = (test_frame.shape[1], test_frame.shape[0])
+                logger.info(f"✅ C930e initialized at {actual_res[0]}x{actual_res[1]}")
+                
+                # Verify color mode
+                if len(test_frame.shape) == 3 and test_frame.shape[2] == 3:
+                    unique_colors = len(np.unique(test_frame.reshape(-1, 3), axis=0))
+                    logger.info(f"✅ Color mode verified: {unique_colors} unique colors")
+                    self.is_initialized = True
+                    return True
+                else:
+                    logger.error("Camera not in RGB mode!")
+                    return False
+            else:
+                logger.error("Could not capture test frame")
+                return False
+                
+        except Exception as e:
+            logger.error(f"C930e initialization failed: {e}")
+            return False
+    
+    def _configure_camera(self):
+        """Configure C930e with optimal settings for garment photography"""
+        
+        if not self.cap or not self.cap.isOpened():
+            return
+        
+        try:
+            # Set resolution to Full HD
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+            
+            # Set FPS
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+            
+            # Force RGB color mode
+            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+            
+            # CRITICAL: Use MJPG codec for high bandwidth over USB
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            
+            # Optimize for garment photography with controlled lighting
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual exposure mode
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, -5)  # Lower exposure for LED lighting
+            self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 128)  # Default brightness
+            self.cap.set(cv2.CAP_PROP_CONTRAST, 130)  # Slightly higher contrast
+            self.cap.set(cv2.CAP_PROP_SATURATION, 128)  # Neutral saturation for color accuracy
+            self.cap.set(cv2.CAP_PROP_SHARPNESS, 128)  # Moderate sharpness
+            
+            # White balance - auto for LED lighting
+            self.cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+            
+            # C930e has excellent autofocus
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+            
+            # Low gain for clean image with LED lighting
+            self.cap.set(cv2.CAP_PROP_GAIN, 0)
+            
+            # Minimal buffer for latest frames
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # Warm up the camera
+            logger.info("Warming up C930e (30 frames)...")
+            for _ in range(30):
+                self.cap.read()
+            
+            # Log actual settings
+            actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+            
+            logger.info(f"C930e configured: {actual_width}x{actual_height} @ {actual_fps}fps")
+            
+        except Exception as e:
+            logger.error(f"Failed to configure C930e: {e}")
+    
+    def get_frame(self, use_preview_res=False):
+        """
+        Get frame from C930e.
+        
+        Args:
+            use_preview_res: If True, downsample to preview resolution for UI
+        
+        Returns:
+            RGB frame (numpy array) or None if failed
+        """
+        # Check cache
+        current_time = time.time()
+        if (self.frame_cache is not None and 
+            current_time - self.last_frame_time < self.cache_duration):
+            frame = self.frame_cache
+            if use_preview_res and frame.shape[:2] != self.preview_resolution[::-1]:
+                return cv2.resize(frame, self.preview_resolution, interpolation=cv2.INTER_AREA)
+            return frame
+        
+        if not self.is_initialized:
+            logger.warning("C930e not initialized")
+            return None
+        
+        try:
+            # Skip buffered frames (get latest)
+            for _ in range(2):
+                self.cap.grab()
+            
+            ret, frame = self.cap.retrieve()
+            
+            if not ret or frame is None:
+                logger.warning("Failed to capture frame from C930e")
+                return None
+            
+            # Validate frame
+            if frame.size == 0 or np.any(np.isnan(frame)) or np.any(np.isinf(frame)):
+                logger.warning("Invalid frame data from C930e")
+                return None
+            
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Cache full resolution frame
+            self.frame_cache = rgb_frame
+            self.last_frame_time = current_time
+            
+            # Return preview resolution if requested
+            if use_preview_res:
+                return cv2.resize(rgb_frame, self.preview_resolution, interpolation=cv2.INTER_AREA)
+            
+            return rgb_frame
+            
+        except Exception as e:
+            logger.error(f"Error capturing from C930e: {e}")
+            return None
+    
+    def optimize_for_led_lighting(self):
+        """Optimize camera settings for LED studio lighting"""
+        if not self.cap or not self.cap.isOpened():
+            return
+        
+        logger.info("Optimizing C930e for LED lighting...")
+        
+        # Lower exposure to prevent overexposure from bright LEDs
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+        
+        # Slightly higher contrast for better detail
+        self.cap.set(cv2.CAP_PROP_CONTRAST, 140)
+        
+        # Cooler white balance for LED (usually around 5500K)
+        # C930e auto WB handles this well, but we can force it
+        self.cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+        
+        logger.info("✅ C930e optimized for LED lighting")
+    
+    def adjust_for_garment_color(self, frame):
+        """
+        Auto-adjust camera settings based on garment brightness.
+        Call this periodically or when you detect overexposure.
+        """
+        if frame is None or not self.cap or not self.cap.isOpened():
+            return
+        
+        # Analyze brightness
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        mean_brightness = np.mean(gray)
+        
+        current_exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+        
+        # Adjust exposure based on brightness
+        if mean_brightness > 180:  # Too bright (white garments)
+            new_exposure = max(-8, current_exposure - 1)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+            logger.info(f"Reduced exposure to {new_exposure} for bright garment")
+        elif mean_brightness < 80:  # Too dark (black garments)
+            new_exposure = min(-3, current_exposure + 1)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+            logger.info(f"Increased exposure to {new_exposure} for dark garment")
+    
+    def release(self):
+        """Release camera resources"""
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.is_initialized = False
+        logger.info("C930e released")
+
+
 # ==========================
 # MOCK TAG GENERATOR
 # ==========================
@@ -6929,9 +7410,8 @@ class EnhancedPipelineManager:
         # Consolidated steps (calibration removed)
         self.steps = [
             "Capture & Analyze Tag",
-            "Capture & Analyze Garment",
+            "Analyze Garment & Defects",
             "Measure Garment",
-            "Detect Defects",
             "Calculate Price"
         ]
         self.current_step = 0
@@ -7025,19 +7505,29 @@ class EnhancedPipelineManager:
     def start_background_garment_analysis(self, garment_image):
         """Start garment analysis in background thread"""
         if self.background_garment_thread and self.background_garment_thread.is_alive():
+            logger.info("[BACKGROUND-ANALYSIS] Already running, skipping")
             return False  # Already running
         
+        if not self.garment_analyzer:
+            logger.error("[BACKGROUND-ANALYSIS] Garment analyzer not initialized")
+            return False
+        
+        logger.info("[BACKGROUND-ANALYSIS] Starting garment analysis in background thread")
         self.background_garment_result = None
         self.background_garment_error = None
         
         def run_analysis():
             try:
+                logger.info("[BACKGROUND-ANALYSIS] Thread started, analyzing garment...")
                 self.background_garment_result = self.garment_analyzer.analyze_garment(garment_image)
+                logger.info(f"[BACKGROUND-ANALYSIS] Analysis complete: {self.background_garment_result.get('success', False)}")
             except Exception as e:
+                logger.error(f"[BACKGROUND-ANALYSIS] Analysis failed: {e}")
                 self.background_garment_error = str(e)
         
         self.background_garment_thread = threading.Thread(target=run_analysis)
         self.background_garment_thread.start()
+        logger.info("[BACKGROUND-ANALYSIS] Background thread started")
         return True
     
     def get_background_garment_result(self):
@@ -7092,30 +7582,32 @@ class EnhancedPipelineManager:
                 
                 # Convert international sizing to US
                 if raw_size and raw_size != 'Unknown':
-                    # Enhanced size conversion for common EU sizes
+                    # Simplified size conversion - true to value for most cases
                     if raw_size.isdigit():
-                        eu_size = int(raw_size)
-                        # EU to US conversion for clothing
-                        if self.pipeline_data.gender == 'men':
-                            if eu_size <= 36: us_size = "XS"
-                            elif eu_size <= 38: us_size = "S"
-                            elif eu_size <= 40: us_size = "M"
-                            elif eu_size <= 42: us_size = "L"
-                            elif eu_size <= 44: us_size = "XL"
-                            elif eu_size <= 46: us_size = "XXL"
-                            else: us_size = f"EU {eu_size}"
-                        else:  # women's
-                            if eu_size <= 34: us_size = "XS"
-                            elif eu_size <= 36: us_size = "S"
-                            elif eu_size <= 38: us_size = "M"
-                            elif eu_size <= 40: us_size = "L"
-                            elif eu_size <= 42: us_size = "XL"
-                            elif eu_size <= 44: us_size = "XXL"
-                            else: us_size = f"EU {eu_size}"
+                        size_num = int(raw_size)
                         
-                        self.pipeline_data.size = us_size
-                        self.pipeline_data.raw_size = f"EU {eu_size}"
-                        logger.info(f"EU size converted: {eu_size} -> {us_size}")
+                        # Special handling only for 0,1,2,3 sizes (CRUSH, James Perse, etc.)
+                        if size_num <= 3:
+                            # Convert small numeric sizes to letter sizes
+                            if self.pipeline_data.gender == 'men':
+                                if size_num == 0: us_size = "XXS"
+                                elif size_num == 1: us_size = "XS"
+                                elif size_num == 2: us_size = "S"
+                                elif size_num == 3: us_size = "M"
+                            else:  # women's
+                                if size_num == 0: us_size = "XXS"
+                                elif size_num == 1: us_size = "XS"
+                                elif size_num == 2: us_size = "S"
+                                elif size_num == 3: us_size = "M"
+                            
+                            self.pipeline_data.size = us_size
+                            self.pipeline_data.raw_size = f"Size {size_num}"
+                            logger.info(f"Small size converted: {size_num} -> {us_size}")
+                        else:
+                            # True to value for sizes 4 and above
+                            self.pipeline_data.size = str(size_num)
+                            self.pipeline_data.raw_size = f"Size {size_num}"
+                            logger.info(f"True to value size: {size_num}")
                     else:
                         # Try standard conversion for non-numeric sizes
                         converted_size = convert_size_to_us(
@@ -7156,11 +7648,20 @@ class EnhancedPipelineManager:
                     pass  # Ignore if not running in Streamlit context
                 
                 # Start background garment analysis
+                logger.info("[TAG-ANALYSIS] Capturing garment for analysis...")
                 garment_image = self.camera_manager.capture_garment_for_analysis()
                 if garment_image is not None:
+                    logger.info(f"[TAG-ANALYSIS] Garment captured: {garment_image.shape}")
                     # Enhance center front region for better classification
                     enhanced_image = self.camera_manager.enhance_garment_for_classification(garment_image)
-                    self.start_background_garment_analysis(enhanced_image)
+                    logger.info("[TAG-ANALYSIS] Starting background garment analysis...")
+                    success = self.start_background_garment_analysis(enhanced_image)
+                    if success:
+                        logger.info("[TAG-ANALYSIS] Background analysis started successfully")
+                    else:
+                        logger.warning("[TAG-ANALYSIS] Failed to start background analysis")
+                else:
+                    logger.warning("[TAG-ANALYSIS] No garment image captured")
                 
                 # Reset camera exposure for next run
                 self.camera_manager.reset_auto_exposure()
@@ -7174,7 +7675,7 @@ class EnhancedPipelineManager:
                         logger.warning(f"[EBAY] Research failed: {e}")
                         # Continue without eBay data
                 
-                return {'success': True, 'message': f"Brand: {result.get('brand')}, Size: {result.get('size')}"}
+                return {'success': True, 'message': f"Brand: {self.pipeline_data.brand}, Size: {self.pipeline_data.size}"}
             else:
                 # Reset camera exposure even on failure
                 self.camera_manager.reset_auto_exposure()
@@ -7385,130 +7886,352 @@ class EnhancedPipelineManager:
             return 70
     
     def handle_step_1_garment_analysis(self):
-        """Clean handler for Step 1: Garment Analysis"""
+        """Combined Garment Analysis + Defect Detection with GPT-4o"""
         try:
-            # Check for background results first
-            background_result = self.get_background_garment_result()
-            if background_result and background_result.get('success'):
-                # Use background results
-                self.pipeline_data.garment_type = background_result.get('garment_type', 'Unknown')
-                self.pipeline_data.gender = background_result.get('gender', 'Unisex')
-                self.pipeline_data.gender_confidence = background_result.get('gender_confidence', 'Medium')
-                self.pipeline_data.gender_indicators = background_result.get('gender_indicators', [])
-                self.pipeline_data.style = background_result.get('style', 'Casual')
-                self.pipeline_data.era = background_result.get('era', 'Contemporary')
-                self.pipeline_data.condition = background_result.get('condition', 'Good')
-                
-                return {'success': True, 'message': 'Background analysis complete', 'from_background': True}
+            logger.info("[GARMENT-ANALYSIS] Step 1: Starting combined garment analysis + defect detection...")
             
-            # Manual analysis if background failed - use extended ROI for better framing
+            # Capture garment image
             garment_image = self.camera_manager.capture_garment_for_analysis()
             if garment_image is None:
                 return {'success': False, 'error': 'No garment image available'}
             
-            # Enhance center front region for better button/zipper detection
+            # Enhance center front region for better analysis
             enhanced_image = self.camera_manager.enhance_garment_for_classification(garment_image)
             
             roi_image = self.camera_manager.apply_roi(enhanced_image, 'work')
             if roi_image is None:
                 return {'success': False, 'error': 'Garment ROI not set'}
             
-            # Store image and analyze
+            # Store image
             self.pipeline_data.garment_image = roi_image
-            if self.garment_analyzer:
-                result = self.garment_analyzer.analyze_garment(roi_image)
-            else:
-                return {'success': False, 'error': 'Garment analyzer not available'}
             
-            # FIX: Check if we got valid data, not just success flag
-            if result.get('success') or result.get('garment_type'):  # CHANGED THIS LINE
-                # Store ALL the fields including Item Specifics
-                self.pipeline_data.garment_type = result.get('garment_type', 'Unknown')
-                self.pipeline_data.subtype = result.get('subtype', 'Unknown')
-                self.pipeline_data.has_front_opening = result.get('has_front_opening', False)
-                self.pipeline_data.collar_type = result.get('collar_type', 'Unknown')
-                self.pipeline_data.neckline = result.get('neckline', 'Unknown')
-                self.pipeline_data.sleeve_length = result.get('sleeve_length', 'Unknown')
-                self.pipeline_data.silhouette = result.get('silhouette', 'Unknown')
-                self.pipeline_data.fit = result.get('fit', 'Unknown')
-                self.pipeline_data.gender = result.get('gender', 'Unisex')
-                self.pipeline_data.gender_confidence = result.get('gender_confidence', 'Medium')
-                self.pipeline_data.gender_indicators = result.get('gender_indicators', [])
-                self.pipeline_data.style = result.get('style', 'Casual')
-                self.pipeline_data.era = result.get('era', 'Contemporary')
-                self.pipeline_data.condition = result.get('condition', 'Good')
+            # Use combined analysis (garment + defects in one call)
+            if hasattr(self, 'openai_client') and self.openai_client:
+                result = self.analyze_garment_comprehensive_with_retry(
+                    roi_image, 
+                    self.pipeline_data, 
+                    self.openai_client
+                )
+                self.pipeline_data = result
                 
-                # VALIDATION: Check cardigan vs pullover classification
-                validation = validate_cardigan_pullover_classification(result)
-                if not validation['valid']:
-                    logger.error(f"⚠️ Classification Issue: {validation['error']}")
-                    logger.warning(f"💡 Suggested correction: {validation['suggestion']}")
-                    # Store validation result for UI display
-                    self.pipeline_data.validation_issue = validation
-                elif validation.get('requires_user_confirmation'):
-                    logger.warning(f"⚠️ {validation.get('warning', 'Low confidence classification')}")
-                    self.pipeline_data.validation_issue = validation
+                logger.info(f"✅ Combined analysis complete: {self.pipeline_data.garment_type}, "
+                           f"Condition: {self.pipeline_data.condition}, "
+                           f"Defects: {len(self.pipeline_data.defects)}")
                 
-                # CV VALIDATION: Check for obvious misclassifications
-                if result.get('garment_type') == 'ambiguous_dress_or_top':
-                    # Run quick CV check
-                    cv_hints = self.camera_manager.quick_garment_type_check(self.pipeline_data.garment_image)
-                    
-                    if cv_hints and cv_hints.get('likely_jacket'):
-                        logger.info("[CV-CHECK] Overriding ambiguous - CV detected jacket structure")
-                        self.pipeline_data.garment_type = 'Jacket'
-                        result['garment_type'] = 'Jacket'
-                        result['needs_user_confirmation'] = False
-                        result['reasoning'] += " (CV override: structured shoulders detected)"
-                
-                # Validate cardigan classification
-                if result.get('garment_type', '').lower() == 'cardigan':
-                    has_opening = result.get('has_front_opening', False)
-                    visible_features = result.get('visible_features', [])
-                    
-                    # Cardigan MUST have front opening
-                    if not has_opening:
-                        logger.warning("[GARMENT] AI said cardigan but no front opening detected - likely misclassification")
-                        # Check for turtleneck indicators
-                        features_str = ' '.join(visible_features).lower()
-                        if 'turtleneck' in features_str or 'high collar' in features_str:
-                            logger.info("[GARMENT] Correcting: cardigan → turtleneck (no front opening + high collar)")
-                            self.pipeline_data.garment_type = 'Turtleneck'
-                            result['garment_type'] = 'Turtleneck'
-                            result['subtype'] = 'turtleneck pullover'
-                            result['reasoning'] += " [AUTO-CORRECTED: no front opening detected]"
-                        else:
-                            logger.info("[GARMENT] Correcting: cardigan → pullover (no front opening)")
-                            self.pipeline_data.garment_type = 'Pullover'
-                            result['garment_type'] = 'Pullover'
-                            result['subtype'] = 'pullover sweater'
-                            result['reasoning'] += " [AUTO-CORRECTED: no front opening detected]"
-                
-                # NEW: Store confirmation flag
-                self.pipeline_data.needs_user_confirmation = result.get('needs_user_confirmation', False)
-                
-                # If needs confirmation, don't advance yet
-                if self.pipeline_data.needs_user_confirmation:
-                    logger.info("[GARMENT] Analysis ambiguous - requiring user confirmation")
-                    return {
-                        'success': True, 
-                        'message': 'Partial analysis - user confirmation needed',
-                        'needs_confirmation': True
-                    }
-                
-                # Stop live feed after successful analysis
-                st.session_state.live_preview_enabled = False
-                
-                # Log what we got
-                logger.info(f"[GARMENT] Stored: {self.pipeline_data.garment_type} | {self.pipeline_data.gender}")
-                
-                return {'success': True, 'message': 'Analysis complete', 'from_background': False}
+                return {'success': True, 'message': 'Combined analysis complete'}
             else:
-                return {'success': False, 'error': result.get('error', 'Garment analysis failed')}
+                return {'success': False, 'error': 'OpenAI client not available'}
                 
         except Exception as e:
             logger.error(f"Step 1 handler error: {e}")
             return {'success': False, 'error': str(e)}
+    
+    def analyze_garment_comprehensive(self, image, pipeline_data, client):
+        """
+        Combined garment analysis and defect detection in ONE API call.
+        
+        Analyzes:
+        - Garment type, style, fit, color, pattern
+        - Measurements (if visible)
+        - Condition and defects
+        - Material assessment
+        - All in one unified response
+        """
+        
+        logger.info("🔍 Starting combined garment analysis + defect detection...")
+        
+        # Encode image
+        img_base64 = self.encode_image_to_base64(image)
+        
+        # Build comprehensive prompt
+        prompt = self.build_combined_analysis_prompt(pipeline_data)
+        
+        try:
+            # Single API call for everything
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert garment analyst specializing in fashion resale. You provide detailed, accurate assessments of clothing items including condition grading."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{img_base64}",
+                                    "detail": "high"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=2000,
+                temperature=0.3  # Lower temp for consistent, factual responses
+            )
+            
+            # Parse the comprehensive response
+            result = response.choices[0].message.content
+            
+            # Extract all data from single response
+            pipeline_data = self.parse_combined_analysis(result, pipeline_data)
+            
+            logger.info(f"✅ Combined analysis complete: {pipeline_data.garment_type}, "
+                       f"Condition: {pipeline_data.condition}, "
+                       f"Defects: {len(pipeline_data.defects)}")
+            
+            return pipeline_data
+            
+        except Exception as e:
+            logger.error(f"Combined analysis failed: {e}")
+            return pipeline_data
+    
+    def encode_image_to_base64(self, image):
+        """Encode image to base64 for API call"""
+        if isinstance(image, np.ndarray):
+            _, buffer = cv2.imencode('.jpg', image)
+            return base64.b64encode(buffer).decode()
+        else:
+            # If it's already a PIL image
+            buffer = io.BytesIO()
+            image.save(buffer, format='JPEG')
+            return base64.b64encode(buffer.getvalue()).decode()
+    
+    def build_combined_analysis_prompt(self, pipeline_data):
+        """Build comprehensive prompt that covers both garment analysis AND defect detection."""
+        
+        # Get context from tag analysis
+        brand_context = f"Brand: {pipeline_data.brand}" if pipeline_data.brand != "Unknown" else ""
+        size_context = f"Size: {pipeline_data.size}" if pipeline_data.size != "Unknown" else ""
+        material_context = f"Material: {pipeline_data.material}" if pipeline_data.material != "Unknown" else ""
+        
+        context = f"{brand_context} {size_context} {material_context}".strip()
+        context_section = f"\n\nCONTEXT FROM TAG:\n{context}" if context else ""
+        
+        prompt = f"""Analyze this garment comprehensively and provide a detailed assessment in JSON format.{context_section}
+
+GARMENT ANALYSIS REQUIRED:
+1. **Garment Type & Subtype**
+   - Main type (dress, shirt, pants, jacket, sweater, skirt, etc.)
+   - Specific subtype (e.g., "cardigan" vs "pullover", "A-line dress" vs "sheath dress")
+   - Verify front opening presence for cardigans/jackets
+
+2. **Style & Design Details**
+   - Neckline (turtleneck, v-neck, crew neck, scoop, cowl, boat neck, collared)
+   - Collar type if applicable (turtleneck, collared, hooded, none)
+   - Sleeve length (long, short, 3/4, sleeveless)
+   - Silhouette (for dresses: a-line, sheath, fit-and-flare, shift, empire)
+   - Fit type (slim, regular, relaxed, oversized)
+   - Overall style (casual, formal, business, athletic, bohemian, etc.)
+
+3. **Material & Color**
+   - Primary material/fabric (cotton, wool, silk, polyester, blend, etc.)
+   - Color (be specific: "navy blue" not just "blue")
+   - Pattern (solid, striped, floral, plaid, geometric, etc.)
+   - Texture notes if visible
+
+4. **Measurements** (if discernible)
+   - Bust/chest width
+   - Length
+   - Waist
+   - Note: Only include if clearly measurable in the image
+
+5. **Gender Indication**
+   - Gender (Men's, Women's, Unisex)
+   - Confidence (High/Medium/Low)
+   - Key indicators (cut, styling, buttons, fit)
+
+DEFECT & CONDITION ASSESSMENT REQUIRED:
+6. **Condition Grade** (use standard resale grading)
+   - New With Tags (NWT)
+   - New Without Tags (NWOT)
+   - Excellent (like new, no visible wear)
+   - Very Good (minimal wear, no defects)
+   - Good (light wear, minor issues)
+   - Fair (noticeable wear, some defects)
+   - Poor (significant defects, major wear)
+
+7. **Defect Detection** (inspect thoroughly)
+   - Stains (location, size, severity, type if identifiable)
+   - Holes/tears (location, size)
+   - Pilling (location, extent)
+   - Fading (where, how much)
+   - Seam issues (loose threads, separation)
+   - Missing buttons/hardware
+   - Wear patterns (elbows, knees, collar, cuffs)
+   - Discoloration
+   - Stretching/shape loss
+   - Any other damage
+
+8. **Visual Quality Notes**
+   - Fabric integrity
+   - Color vibrancy
+   - Overall presentation
+   - Cleanliness
+
+RESPONSE FORMAT (JSON):
+{{
+  "garment_type": "specific type",
+  "subtype": "more specific description",
+  "has_front_opening": true/false,
+  "neckline": "specific neckline type",
+  "collar_type": "type or none",
+  "sleeve_length": "length",
+  "silhouette": "type (for dresses)",
+  "fit": "fit type",
+  "style": "overall style",
+  "primary_color": "specific color",
+  "pattern": "pattern type",
+  "material": "fabric type",
+  "texture_notes": "observations",
+  "gender": "Men's/Women's/Unisex",
+  "gender_confidence": "High/Medium/Low",
+  "gender_indicators": ["indicator 1", "indicator 2"],
+  "condition_grade": "exact grade from list above",
+  "defects": [
+    {{
+      "type": "stain/hole/pilling/fading/etc",
+      "location": "where on garment",
+      "severity": "minor/moderate/major",
+      "description": "detailed description",
+      "estimated_size": "approximate size if measurable"
+    }}
+  ],
+  "measurements": {{
+    "bust_chest": "measurement or null",
+    "length": "measurement or null",
+    "waist": "measurement or null",
+    "notes": "any measurement notes"
+  }},
+  "overall_notes": "comprehensive assessment including strengths and weaknesses",
+  "resale_viability": "Excellent/Good/Fair/Poor - assessment of resale potential",
+  "confidence": "0-100 - overall confidence in analysis"
+}}
+
+Be thorough, specific, and honest. If no defects are found, say so explicitly. If you cannot determine something, mark it as "Unknown" or null.
+"""
+        
+        return prompt
+    
+    def parse_combined_analysis(self, api_response: str, pipeline_data):
+        """Parse the combined API response and update pipeline_data."""
+        
+        try:
+            # Extract JSON from response (handle markdown code blocks)
+            json_str = api_response
+            if "```json" in api_response:
+                json_str = api_response.split("```json")[1].split("```")[0].strip()
+            elif "```" in api_response:
+                json_str = api_response.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(json_str)
+            
+            # Garment Analysis Fields
+            pipeline_data.garment_type = data.get('garment_type', 'Unknown')
+            pipeline_data.subtype = data.get('subtype', 'Unknown')
+            pipeline_data.has_front_opening = data.get('has_front_opening', False)
+            pipeline_data.neckline = data.get('neckline', 'Unknown')
+            pipeline_data.collar_type = data.get('collar_type', 'Unknown')
+            pipeline_data.sleeve_length = data.get('sleeve_length', 'Unknown')
+            pipeline_data.silhouette = data.get('silhouette', 'Unknown')
+            pipeline_data.fit = data.get('fit', 'Regular')
+            pipeline_data.style = data.get('style', 'Unknown')
+            
+            # Color & Material
+            pipeline_data.primary_color = data.get('primary_color', 'Unknown')
+            pipeline_data.pattern = data.get('pattern', 'None')
+            
+            # Only update material if we don't have it from tag
+            if pipeline_data.material == "Unknown":
+                pipeline_data.material = data.get('material', 'Unknown')
+            
+            # Gender
+            pipeline_data.gender = data.get('gender', 'Unisex')
+            pipeline_data.gender_confidence = data.get('gender_confidence', 'Medium')
+            pipeline_data.gender_indicators = data.get('gender_indicators', [])
+            
+            # Condition & Defects
+            pipeline_data.condition = data.get('condition_grade', 'Good')
+            
+            # Parse defects
+            defects_list = data.get('defects', [])
+            pipeline_data.defects = []
+            for defect in defects_list:
+                pipeline_data.defects.append({
+                    'type': defect.get('type', 'Unknown'),
+                    'location': defect.get('location', 'Unknown'),
+                    'severity': defect.get('severity', 'moderate'),
+                    'description': defect.get('description', ''),
+                    'estimated_size': defect.get('estimated_size', 'Unknown')
+                })
+            
+            pipeline_data.defect_count = len(pipeline_data.defects)
+            
+            # Measurements
+            measurements = data.get('measurements', {})
+            if measurements:
+                if measurements.get('bust_chest'):
+                    pipeline_data.measurements['bust_chest'] = measurements['bust_chest']
+                if measurements.get('length'):
+                    pipeline_data.measurements['length'] = measurements['length']
+                if measurements.get('waist'):
+                    pipeline_data.measurements['waist'] = measurements['waist']
+            
+            # Overall assessment
+            pipeline_data.overall_notes = data.get('overall_notes', '')
+            pipeline_data.resale_viability = data.get('resale_viability', 'Good')
+            pipeline_data.confidence = float(data.get('confidence', 75)) / 100.0
+            
+            # Add data source
+            if 'Combined AI Analysis' not in pipeline_data.data_sources:
+                pipeline_data.data_sources.append('Combined AI Analysis')
+            
+            logger.info(f"✅ Parsed combined analysis: {pipeline_data.garment_type}, "
+                       f"{len(pipeline_data.defects)} defects, "
+                       f"confidence: {pipeline_data.confidence:.0%}")
+            
+            return pipeline_data
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            logger.error(f"Response was: {api_response[:500]}")
+            return pipeline_data
+        except Exception as e:
+            logger.error(f"Error parsing combined analysis: {e}")
+            return pipeline_data
+    
+    def analyze_garment_comprehensive_with_retry(self, image, pipeline_data, client, max_retries=3):
+        """Combined analysis with retry mechanism."""
+        
+        retry_manager = SimpleRetryManager(RetryConfig(
+            max_attempts=max_retries,
+            timeout_seconds=30,
+            backoff_factor=1.5
+        ))
+        
+        def _analysis_operation():
+            """Wrapper for retry mechanism"""
+            result = self.analyze_garment_comprehensive(image, pipeline_data, client)
+            
+            # Validate we got meaningful results
+            if result.garment_type != 'Unknown' or len(result.defects) > 0:
+                return {'success': True, 'data': result}
+            else:
+                return {'success': False, 'error': 'Incomplete analysis'}
+        
+        result = retry_manager.execute_with_retry(
+            operation_name="Combined Garment Analysis",
+            operation_func=_analysis_operation
+        )
+        
+        if result.get('success'):
+            return result['data']
+        else:
+            logger.error(f"Combined analysis failed after retries: {result.get('error')}")
+            return pipeline_data
     
     def get_brand_specific_garment_hints(self, brand):
         """Get garment type hints based on brand for faster analysis"""
@@ -7764,17 +8487,18 @@ class EnhancedPipelineManager:
     def render_compact_layout(self):
         """Renders the main dashboard layout: buttons on top, then chalkboard/pipeline, then the main content."""
         
-        # TITLE
-        st.title("🔍 Garment Analysis")
-        
         # ===================================================
         # ====== 1. ACTION BUTTONS AT THE VERY TOP ======
         # ===================================================
         self.render_action_panel()
-        st.markdown("---")
+        
+        # ========================================================================
+        # ====== 2. COMPACT CAMERA FEEDS (Higher up, smaller) ======
+        # ========================================================================
+        self.render_camera_feeds()
         
         # ======================================================================
-        # ====== 2. CHALKBOARD (Left) and PIPELINE PROGRESS (Right) ======
+        # ====== 3. CHALKBOARD (Left) and PIPELINE PROGRESS (Right) ======
         # ======================================================================
         col_chalkboard, col_pipeline = st.columns([2, 1])
         
@@ -7784,22 +8508,18 @@ class EnhancedPipelineManager:
         with col_pipeline:
             st.markdown("#### 📊 Pipeline Progress")
             self.render_cool_step_pipeline()
-
-        st.markdown("---")
         
         # ========================================================================
-        # ====== 3. MAIN CONTENT AREA (Centered Camera or Step Info) ======
+        # ====== 4. MAIN CONTENT AREA (Centered Camera or Step Info) ======
         # ========================================================================
         # This section will render the content for the current step
         if self.current_step == 0:
             self._render_step_0_compact()
         elif self.current_step == 1:
-            self._render_step_1_compact()
+            self._render_step_1_garment_analysis()  # Combined Garment & Defect Analysis
         elif self.current_step == 2:
             self._render_step_3_compact()  # Measurements (was step 3)
         elif self.current_step == 3:
-            self._render_step_4_compact()  # Defects (was step 4)
-        elif self.current_step == 4:
             self._render_step_5_compact()  # Results (was step 5)
         else:
             self._render_final_review_compact()
@@ -7827,6 +8547,15 @@ class EnhancedPipelineManager:
         garment_type = getattr(self.pipeline_data, 'garment_type', 'Not analyzed')
         if garment_type == 'Unknown':
             garment_type = 'Not analyzed'
+        
+        # Check if background analysis is in progress
+        if garment_type == 'Not analyzed':
+            background_result = self.get_background_garment_result()
+            if background_result is None:
+                garment_type = 'Analyzing...'
+            elif not background_result.get('success'):
+                garment_type = 'Analysis failed'
+        
         st.markdown(f"**GARMENT:** Type: {garment_type}")
         
         # Size information
@@ -8857,14 +9586,14 @@ class EnhancedPipelineManager:
             <style>
             .chalkboard {
                 background: linear-gradient(135deg, #2d3436 0%, #1e272e 100%);
-                border: 12px solid #8b6914;
-                border-radius: 8px;
-                padding: 15px;
+                border: 8px solid #8b6914;
+                border-radius: 6px;
+                padding: 10px;
                 box-shadow: 
                     inset 0 0 8px rgba(0,0,0,0.5),
                     0 3px 5px rgba(0,0,0,0.3);
                 position: relative;
-                margin: 10px auto;
+                margin: 5px auto;
                 max-width: 600px;
                 width: 100%;
             }
@@ -8877,17 +9606,17 @@ class EnhancedPipelineManager:
             }
             .chalk-title {
                 color: #ffeaa7;
-                font-size: 20px;
+                font-size: 16px;
                 font-weight: bold;
                 text-align: center;
-                margin-bottom: 12px;
+                margin-bottom: 8px;
                 font-family: 'Comic Sans MS', cursive;
                 text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
             }
             .chalk-section {
                 border-left: 2px solid #ffeaa7;
-                padding-left: 8px;
-                margin: 8px 0;
+                padding-left: 6px;
+                margin: 4px 0;
             }
             .chalk-value {
                 color: #74b9ff;
@@ -9229,62 +9958,43 @@ class EnhancedPipelineManager:
         st.markdown("---")
     
     def render_camera_feeds(self):
-        """Camera feed rendering with live brightness analysis"""
+        """Single centered camera feed below the board"""
         if st.session_state.pipeline_manager.camera_manager is None:
             st.error("Camera manager not initialized")
             return
         
-        # For step 0 (Camera Setup), skip camera feeds since we show compact preview above
-        if self.current_step == 0:
-            # Camera preview is shown in render_tag_preview_compact() above
-            return
+        # Show single centered camera feed
+        st.markdown("#### 📹 Live Camera Feed")
         
+        # Auto-adjust toggle
+        auto_enabled = st.checkbox("Auto-Adjust Lights", value=st.session_state.pipeline_manager.auto_optimizer.enabled, key="auto_adjust_main")
+        if auto_enabled != st.session_state.pipeline_manager.auto_optimizer.enabled:
+            st.session_state.pipeline_manager.auto_optimizer.enabled = auto_enabled
+        
+        # Show appropriate camera based on current step
+        if self.current_step == 0:
+            # Tag analysis - show ArduCam
+            try:
+                time.sleep(0.1)
+                ardu_frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
+                if ardu_frame is not None:
+                    frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(ardu_frame.copy(), 'tag')
+                    st.image(frame_with_roi, caption="Tag Camera - Position tag in green box", width=500)
+                else:
+                    st.warning("ArduCam not accessible")
+            except Exception as e:
+                st.error(f"Camera error: {str(e)}")
         else:
-            # For other steps, show both cameras if needed
-            st.header("Live Camera Feeds")
-            
-            # Auto-adjust toggle
-            auto_enabled = st.checkbox("Auto-Adjust Lights", value=st.session_state.pipeline_manager.auto_optimizer.enabled, key="auto_adjust_main")
-            if auto_enabled != st.session_state.pipeline_manager.auto_optimizer.enabled:
-                st.session_state.pipeline_manager.auto_optimizer.enabled = auto_enabled
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("ArduCam - Tag Camera")
-                try:
-                    # Small delay to avoid USB bandwidth issues
-                    time.sleep(0.1)
-                    ardu_frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-                    if ardu_frame is not None:
-                        # Live brightness analysis for ArduCam
-                        if st.session_state.pipeline_manager.auto_optimizer.enabled:
-                            # Brightness analysis removed from preview for better performance
-                            pass
-                        
-                        frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(ardu_frame.copy(), 'tag')
-                        st.image(frame_with_roi, caption="Tag Camera", width='stretch')
-                    else:
-                        st.warning("ArduCam not accessible")
-                except Exception as e:
-                    st.error(f"Camera error: {str(e)}")
-            
-            with col2:
-                st.subheader("RealSense - Garment Camera")
-                try:
-                    real_frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
-                    if real_frame is not None:
-                        # Live brightness analysis for RealSense
-                        if st.session_state.pipeline_manager.auto_optimizer.enabled:
-                            # Brightness analysis removed from preview for better performance
-                            pass
-                        
-                        frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(real_frame.copy(), 'work')
-                        st.image(frame_with_roi, caption="Garment Camera", width='stretch')
-                    else:
-                        st.warning("RealSense not accessible")
-                except Exception as e:
-                    st.error(f"Camera error: {str(e)}")
+            # Garment analysis and beyond - show C930e
+            try:
+                real_frame = st.session_state.pipeline_manager.camera_manager.get_garment_frame(preview=True)
+                if real_frame is not None:
+                    frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(real_frame.copy(), 'work')
+                    st.image(frame_with_roi, caption="Garment Camera", width=500)
+                else:
+                    st.warning("C930e not accessible")
+            except Exception as e:
+                st.error(f"Camera error: {str(e)}")
         
         # Camera status is now shown at the top in render_camera_status_and_start()
         
@@ -9512,11 +10222,73 @@ class EnhancedPipelineManager:
                 st.success(f"✅ Size set to: {manual_size}")
     
     def _render_step_1_garment_analysis(self):
-        """Render Step 1: Garment Capture & Analysis with user confirmation"""
-        st.markdown("### 👔 Capture & Analyze Garment")
+        """Render Step 1: Combined Garment & Defect Analysis with GPT-4o"""
+        st.markdown("### 👔 Analyze Garment & Defects")
         
-        # Check if analysis needs user confirmation
-        needs_confirmation = getattr(st.session_state.pipeline_manager.pipeline_data, 'needs_user_confirmation', False)
+        # Check if analysis has already been completed
+        garment_type = getattr(self.pipeline_data, 'garment_type', None)
+        if garment_type and garment_type != 'Not analyzed':
+            st.success("✅ Combined analysis completed!")
+            
+            # Display comprehensive results
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.subheader("Garment Details")
+                st.info(f"**Type:** {garment_type}")
+                st.info(f"**Subtype:** {getattr(self.pipeline_data, 'subtype', 'Unknown')}")
+                st.info(f"**Style:** {getattr(self.pipeline_data, 'style', 'Unknown')}")
+                st.info(f"**Color:** {getattr(self.pipeline_data, 'primary_color', 'Unknown')}")
+                st.info(f"**Material:** {getattr(self.pipeline_data, 'material', 'Unknown')}")
+            
+            with col2:
+                st.subheader("Design Features")
+                st.info(f"**Neckline:** {getattr(self.pipeline_data, 'neckline', 'Unknown')}")
+                st.info(f"**Sleeves:** {getattr(self.pipeline_data, 'sleeve_length', 'Unknown')}")
+                st.info(f"**Fit:** {getattr(self.pipeline_data, 'fit', 'Unknown')}")
+                st.info(f"**Gender:** {getattr(self.pipeline_data, 'gender', 'Unknown')}")
+                st.info(f"**Confidence:** {getattr(self.pipeline_data, 'gender_confidence', 'Unknown')}")
+            
+            with col3:
+                st.subheader("Condition & Defects")
+                condition = getattr(self.pipeline_data, 'condition', 'Unknown')
+                defect_count = getattr(self.pipeline_data, 'defect_count', 0)
+                
+                # Color-code condition
+                if condition in ['New With Tags', 'New Without Tags', 'Excellent']:
+                    st.success(f"**Grade:** {condition}")
+                elif condition in ['Very Good', 'Good']:
+                    st.info(f"**Grade:** {condition}")
+                else:
+                    st.warning(f"**Grade:** {condition}")
+                
+                st.metric("Defects Found", defect_count)
+                st.metric("Resale Viability", getattr(self.pipeline_data, 'resale_viability', 'Unknown'))
+            
+            # Show defects if any
+            defects = getattr(self.pipeline_data, 'defects', [])
+            if defects:
+                st.subheader("⚠️ Defects Detected")
+                for i, defect in enumerate(defects, 1):
+                    with st.expander(f"Defect {i}: {defect.get('type', 'Unknown').title()} - {defect.get('severity', 'Unknown').title()}"):
+                        st.write(f"**Location:** {defect.get('location', 'Unknown')}")
+                        st.write(f"**Description:** {defect.get('description', 'No description')}")
+                        if defect.get('estimated_size') != 'Unknown':
+                            st.write(f"**Size:** {defect.get('estimated_size')}")
+            else:
+                st.success("✅ No defects detected - garment is in excellent condition")
+            
+            return
+        
+        # Show capture button
+        if st.button("📸 Capture & Analyze Garment + Defects", type="primary"):
+            with st.spinner("Analyzing garment and detecting defects with GPT-4o..."):
+                result = self.handle_step_1_garment_analysis()
+                if result and result.get('success'):
+                    st.success("✅ Combined analysis completed!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Analysis failed: {result.get('error', 'Unknown error')}")
         
         # Check for validation issues (cardigan vs pullover)
         validation_issue = getattr(st.session_state.pipeline_manager.pipeline_data, 'validation_issue', None)
@@ -9752,7 +10524,7 @@ class EnhancedPipelineManager:
         if st.session_state.pipeline_manager.camera_manager:
             try:
                 # Get fresh frame from RealSense
-                frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
+                frame = st.session_state.pipeline_manager.camera_manager.get_garment_frame(preview=True)
                 
                 if frame is not None:
                     # Draw ROI
@@ -10094,16 +10866,16 @@ class EnhancedPipelineManager:
             else: return "XXXL"
     
     def render_action_panel(self):
-        """Action panel with buttons at the top right, close together"""
+        """Action panel with 3 buttons nicely aligned at the top right"""
         logger.info(f"[PANEL] render_action_panel() called for step {self.current_step}")
         
-        # TOP RIGHT BUTTONS: All navigation buttons at the top right, close together
-        col_space, col_buttons = st.columns([3, 1])  # Push buttons to the right
+        # TOP RIGHT BUTTONS: 3 buttons evenly spaced at the top right
+        col_space, col_buttons = st.columns([2, 1])  # Push buttons to the right
         
         with col_buttons:
             if self.current_step == 0:
-                # Step 0: Start New and Next buttons
-                col_start, col_next = st.columns(2)
+                # Step 0: Start New, Reset, and Next buttons
+                col_start, col_reset, col_next = st.columns(3)
                 
                 with col_start:
                     def start_new():
@@ -10117,7 +10889,16 @@ class EnhancedPipelineManager:
                         logger.info("[BUTTON] 🆕 Start New clicked - pipeline reset")
                         st.rerun()
                     
-                    st.button("🆕 Start New", on_click=start_new, key="start_new_button", type="primary")
+                    st.button("🆕 Start", on_click=start_new, key="start_new_button", type="primary")
+                
+                with col_reset:
+                    def reset_pipeline():
+                        self.current_step = 0
+                        self.pipeline_data = PipelineData()
+                        logger.info("[BUTTON] 🔄 Reset clicked - pipeline reset")
+                        st.rerun()
+                    
+                    st.button("🔄 Reset", on_click=reset_pipeline, key="reset_button", type="secondary")
                 
                 with col_next:
                     # Next button will be handled below
@@ -10193,7 +10974,7 @@ class EnhancedPipelineManager:
                         
                         elif old == 1:  # Garment Analysis
                             # Capture garment image for training data
-                            garment_frame = self.camera_manager.get_realsense_frame()
+                            garment_frame = self.camera_manager.get_garment_frame(preview=False)
                             if garment_frame is not None:
                                 st.session_state.captured_garment_image = garment_frame
                                 logger.info("[TRAINING] Garment image captured for training data")
@@ -10740,7 +11521,7 @@ def render_roi_positioning_mode():
         st.caption("You should see your ENTIRE garment in this view - not cropped")
         
         # Get RealSense frame (FULL FRAME - no ROI applied)
-        frame = pm.camera_manager.get_realsense_frame()
+        frame = pm.camera_manager.get_garment_frame(preview=True)
         
         if frame is not None:
             # Store actual frame size
@@ -11147,7 +11928,7 @@ def render_defect_collection_mode():
     with col1:
         st.subheader("Click on defects to mark them")
         
-        frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
+        frame = st.session_state.pipeline_manager.camera_manager.get_garment_frame(preview=True)
         if frame is not None:
             
             # Draw existing marks on frame
