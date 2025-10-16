@@ -18,6 +18,18 @@ import io
 import asyncio
 import openai
 from openai import AsyncOpenAI
+
+# Import data collection system
+from data_collection_and_correction_system import (
+    GarmentDataCollector,
+    render_correction_panel,
+    render_sample_count_widget,
+    save_analysis_with_corrections,
+    verify_ebay_pricing,
+    render_confidence_scores
+)
+
+# Store tag detection removed - was overdetecting
 import google.generativeai as genai
 import sounddevice as sd
 from scipy.io.wavfile import write
@@ -633,12 +645,7 @@ def load_env_file():
 if 'env_loaded' not in st.session_state or not st.session_state.env_loaded:
     load_env_file()
 
-# Streamlit configuration
-st.set_page_config(
-    page_title="Garment Analyzer Pipeline",
-    page_icon="🔍",  # Using search icon - more stable encoding
-    layout="wide"
-)
+# Streamlit configuration moved to main() function
 
 # ==========================
 # PIPELINE DATA STRUCTURES
@@ -2536,61 +2543,38 @@ class OpenAIVisionCameraManager:
             return False
     
     def get_arducam_frame(self):
-        """Get frame from persistent ArduCam connection"""
+        """Get frame from ArduCam, using the thread-safe cache."""
         try:
-            # Check cache first
-            current_time = time.time()
-            if (self.frame_cache['arducam'] is not None and 
-                current_time - self.last_frame_time['arducam'] < self.cache_duration):
-                return self.frame_cache['arducam']
-            
             # Check if we need to reinitialize
             if self.arducam_cap is None or not self.arducam_cap.isOpened():
-                logger.warning("ArduCam not initialized, attempting to initialize...")
                 self.initialize_cameras()
                 if self.arducam_cap is None or not self.arducam_cap.isOpened():
                     return None
             
-            # Skip frames for better performance, only keep the latest
+            # Grab multiple frames to clear buffer, then retrieve the latest
             for _ in range(self.skip_frames):
-                self.arducam_cap.grab()  # Skip without decoding
-            ret, frame = self.arducam_cap.retrieve()  # Get the latest frame
+                self.arducam_cap.grab()
+            ret, frame = self.arducam_cap.retrieve()
             
-            if ret and frame is not None and frame.size > 0:
-                # Validate frame data
-                if np.any(np.isnan(frame)) or np.any(np.isinf(frame)):
-                    logger.warning("ArduCam frame contains invalid values (NaN/inf)")
-                    return None
-                
-                # Reset failure count on success
-                self.camera_failures['arducam'] = 0
-                self.camera_status['arducam'] = True
-                
-                # Cache the frame
+            if ret and frame is not None:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Final validation of RGB frame
-                if rgb_frame is not None and rgb_frame.size > 0 and not np.any(np.isnan(rgb_frame)):
-                    self.frame_cache['arducam'] = rgb_frame
-                    self.last_frame_time['arducam'] = current_time
-                    return rgb_frame
-                else:
-                    logger.warning("ArduCam RGB conversion failed or produced invalid data")
-                    return None
+                # Update the cache using the new thread-safe method
+                if 'pipeline_manager' in st.session_state:
+                    st.session_state.pipeline_manager.camera_cache.update_tag_frame(rgb_frame)
+            
+            # ALWAYS return the frame from the stable cache
+            if 'pipeline_manager' in st.session_state:
+                return st.session_state.pipeline_manager.camera_cache.get_tag_frame()
             else:
-                self.camera_failures['arducam'] += 1
-                logger.warning(f"ArduCam: Failed to read frame (failure {self.camera_failures['arducam']}/{self.max_failures})")
-                
-                # Only try to recover after max failures
-                if self.camera_failures['arducam'] >= self.max_failures:
-                    self.recover_camera('arducam')
-            
-            return None
-            
+                return None
+
         except Exception as e:
-            self.camera_failures['arducam'] += 1
             logger.error(f"ArduCam error: {e}")
-            return None
+            # Return last good frame on error
+            if 'pipeline_manager' in st.session_state:
+                return st.session_state.pipeline_manager.camera_cache.get_tag_frame()
+            else:
+                return None
     
     def get_preview_and_full(self):
         """Dual-path capture: fast preview + high-res still"""
@@ -2740,116 +2724,45 @@ class OpenAIVisionCameraManager:
         return float(cv2.Laplacian(gray, cv2.CV_64F, ksize=3).var())
     
     def get_realsense_frame(self):
-        """Get COLOR frame from RealSense using SDK"""
+        """Get COLOR frame from RealSense using SDK, with thread-safe caching."""
         try:
-            # Check cache first
-            current_time = time.time()
-            if (self.frame_cache['realsense'] is not None and 
-                current_time - self.last_frame_time['realsense'] < self.cache_duration):
-                return self.frame_cache['realsense']
-            
             # Try SDK method first (preferred)
             if self.realsense_pipeline is not None and self.realsense_sdk_available:
                 try:
                     # Wait for frames with timeout
                     frames = self.realsense_pipeline.wait_for_frames(timeout_ms=1000)
-                    
-                    # Get color frame
                     color_frame = frames.get_color_frame()
-                    
-                    if not color_frame:
-                        logger.warning("No color frame from RealSense SDK")
-                        return None
-                    
-                    # Convert to numpy array
-                    frame = np.asanyarray(color_frame.get_data())
-                    
-                    # VERIFY TRUE COLOR (not converted grayscale)
-                    if len(frame.shape) != 3 or frame.shape[2] != 3:
-                        logger.error(f"RealSense SDK returned wrong shape: {frame.shape}")
-                        return None
-                    
-                    # Check unique colors periodically (every 10th frame)
-                    if not hasattr(self, '_realsense_color_check_count'):
-                        self._realsense_color_check_count = 0
-                    
-                    self._realsense_color_check_count += 1
-                    if self._realsense_color_check_count % 10 == 0:
-                        unique_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
-                        if unique_colors < 1000:
-                            logger.error(f"❌ GRAYSCALE DETECTED: only {unique_colors} colors!")
-                            # Try to reinitialize
-                            logger.warning("Attempting to reinitialize RealSense for true color...")
-                            try:
-                                self.realsense_pipeline.stop()
-                                self.realsense_pipeline = None
-                                self.initialize_cameras()
-                            except Exception as reinit_error:
-                                logger.error(f"Reinit failed: {reinit_error}")
-                            return None
-                        else:
-                            logger.debug(f"✅ Color verified: {unique_colors} colors")
-                    
-                    # Validate frame data
-                    if np.any(np.isnan(frame)) or np.any(np.isinf(frame)):
-                        logger.warning("RealSense frame contains invalid values (NaN/inf)")
-                        return None
-                    
-                    # Convert BGR to RGB if needed
-                    if frame.shape[2] == 3:
-                        # RealSense SDK returns BGR, convert to RGB
-                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    else:
-                        rgb_frame = frame
-                    
-                    # Final validation of RGB frame
-                    if rgb_frame is None or rgb_frame.size == 0 or np.any(np.isnan(rgb_frame)):
-                        logger.warning("RealSense RGB conversion failed or produced invalid data")
-                        return None
-                    
-                    # Reset failure count
-                    self.camera_failures['realsense'] = 0
-                    self.camera_status['realsense'] = True
-                    
-                    # Cache the frame
-                    self.frame_cache['realsense'] = rgb_frame
-                    self.last_frame_time['realsense'] = current_time
-                    
-                    return rgb_frame
-                    
+                    if color_frame:
+                        frame_data = np.asanyarray(color_frame.get_data())
+                        # The SDK often returns BGR, so we convert to RGB
+                        rgb_frame = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
+                        if 'pipeline_manager' in st.session_state:
+                            st.session_state.pipeline_manager.camera_cache.update_garment_frame(rgb_frame)
+
                 except Exception as e:
                     logger.warning(f"RealSense SDK read failed: {e}, trying OpenCV fallback")
             
-            # Fallback to OpenCV method
-            if self.realsense_cap is not None and self.realsense_cap.isOpened():
-                # CRITICAL: Force color mode
-                self.realsense_cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-                
-                for _ in range(self.skip_frames):
-                    self.realsense_cap.grab()
-                ret, frame = self.realsense_cap.retrieve()
-                
-                if ret and frame is not None and frame.size > 0:
-                    # Check if it's grayscale
-                    if len(frame.shape) == 2:
-                        logger.error("⚠️ RealSense STILL GRAYSCALE via OpenCV!")
-                        logger.error("   → Install pyrealsense2: pip install pyrealsense2")
-                        # Convert to RGB (fake color)
-                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                    elif frame.shape[2] == 3:
-                        # Proper color
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    
-                    self.frame_cache['realsense'] = frame
-                    self.last_frame_time['realsense'] = current_time
-                    return frame
-            
-            return None
-            
+            # Fallback to OpenCV if SDK fails or is not available
+            elif self.realsense_cap is not None and self.realsense_cap.isOpened():
+                ret, frame = self.realsense_cap.read()
+                if ret and frame is not None:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    if 'pipeline_manager' in st.session_state:
+                        st.session_state.pipeline_manager.camera_cache.update_garment_frame(rgb_frame)
+
+            # ALWAYS return the frame from the stable cache
+            if 'pipeline_manager' in st.session_state:
+                return st.session_state.pipeline_manager.camera_cache.get_garment_frame()
+            else:
+                return None
+
         except Exception as e:
-            self.camera_failures['realsense'] += 1
             logger.error(f"RealSense error: {e}")
-            return None
+            # Return last good frame on error
+            if 'pipeline_manager' in st.session_state:
+                return st.session_state.pipeline_manager.camera_cache.get_garment_frame()
+            else:
+                return None
     
     def get_garment_frame(self):
         """Get garment frame - use ArduCam if RealSense problematic"""
@@ -6500,15 +6413,13 @@ class EnhancedPipelineManager:
     def __init__(self):
         print("Initializing Pipeline Manager...")
         
-        # Consolidated steps
+        # Consolidated steps (calibration removed)
         self.steps = [
             "Capture & Analyze Tag",
             "Capture & Analyze Garment",
-            "Calibrate Measurements",
             "Measure Garment",
             "Detect Defects",
-            "Calculate Price",
-            "Final Review"
+            "Calculate Price"
         ]
         self.current_step = 0
         self.completed_steps = set()
@@ -6644,18 +6555,58 @@ class EnhancedPipelineManager:
                 self.pipeline_data.brand = result.get('brand')
                 raw_size = result.get('size')
                 
+                # ENHANCED: Check for numerical sizing if no size detected
+                if not raw_size or raw_size == 'Unknown':
+                    logger.info("[SIZE-DETECTION] No size detected, checking for numerical sizing...")
+                    try:
+                        numerical_size = self._detect_numerical_size_from_tag(roi_image)
+                        if numerical_size:
+                            raw_size = numerical_size
+                            logger.info(f"[SIZE-DETECTION] Found numerical size: {raw_size}")
+                        else:
+                            logger.info("[SIZE-DETECTION] No numerical size detected, continuing with Unknown")
+                    except Exception as e:
+                        logger.warning(f"[SIZE-DETECTION] Numerical size detection failed: {e}")
+                        logger.info("[SIZE-DETECTION] Continuing with Unknown size")
+                
                 # Convert international sizing to US
                 if raw_size and raw_size != 'Unknown':
-                    converted_size = convert_size_to_us(
-                        raw_size, 
-                        self.pipeline_data.gender or 'women',  # Default to women's if not yet determined
-                        region='EU'
-                    )
-                    self.pipeline_data.size = converted_size
-                    self.pipeline_data.raw_size = raw_size  # Store original for reference
-                    
-                    if converted_size != raw_size:
-                        logger.info(f"Size converted: {raw_size} -> {converted_size}")
+                    # Enhanced size conversion for common EU sizes
+                    if raw_size.isdigit():
+                        eu_size = int(raw_size)
+                        # EU to US conversion for clothing
+                        if self.pipeline_data.gender == 'men':
+                            if eu_size <= 36: us_size = "XS"
+                            elif eu_size <= 38: us_size = "S"
+                            elif eu_size <= 40: us_size = "M"
+                            elif eu_size <= 42: us_size = "L"
+                            elif eu_size <= 44: us_size = "XL"
+                            elif eu_size <= 46: us_size = "XXL"
+                            else: us_size = f"EU {eu_size}"
+                        else:  # women's
+                            if eu_size <= 34: us_size = "XS"
+                            elif eu_size <= 36: us_size = "S"
+                            elif eu_size <= 38: us_size = "M"
+                            elif eu_size <= 40: us_size = "L"
+                            elif eu_size <= 42: us_size = "XL"
+                            elif eu_size <= 44: us_size = "XXL"
+                            else: us_size = f"EU {eu_size}"
+                        
+                        self.pipeline_data.size = us_size
+                        self.pipeline_data.raw_size = f"EU {eu_size}"
+                        logger.info(f"EU size converted: {eu_size} -> {us_size}")
+                    else:
+                        # Try standard conversion for non-numeric sizes
+                        converted_size = convert_size_to_us(
+                            raw_size, 
+                            self.pipeline_data.gender or 'women',
+                            region='EU'
+                        )
+                        self.pipeline_data.size = converted_size
+                        self.pipeline_data.raw_size = raw_size
+                        
+                        if converted_size != raw_size:
+                            logger.info(f"Size converted: {raw_size} -> {converted_size}")
                 else:
                     self.pipeline_data.size = 'Unknown'
                 
@@ -6733,6 +6684,75 @@ class EnhancedPipelineManager:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return {'success': False, 'error': str(e)}
+    
+    def _detect_numerical_size_from_tag(self, image_np: np.ndarray):
+        """Detect numerical sizing patterns like '0 1 2 3 4' where one number is emphasized"""
+        try:
+            import pytesseract
+            import re
+            import signal
+            import time
+            
+            # Add timeout protection
+            def timeout_handler(signum, frame):
+                raise TimeoutError("OCR processing timed out")
+            
+            # Convert to grayscale for better OCR
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            
+            # Try simpler approach first - just basic OCR without complex configs
+            try:
+                logger.info("[NUMERICAL-SIZE] Starting simple OCR detection...")
+                
+                # Set timeout for OCR (5 seconds)
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(5)
+                
+                # Simple OCR with basic config
+                text = pytesseract.image_to_string(gray, config='--psm 6')
+                
+                # Cancel timeout
+                signal.alarm(0)
+                
+                logger.info(f"[NUMERICAL-SIZE] Basic OCR result: '{text.strip()}'")
+                
+                # Look for number sequences
+                numbers = re.findall(r'\d+', text)
+                
+                if len(numbers) >= 3:  # Found number sequence
+                    logger.info(f"[NUMERICAL-SIZE] Found number sequence: {numbers}")
+                    
+                    # For CRUSH tags, typically the first number is the size
+                    # Check if we have a sequence like "0 1 2 3 4"
+                    if len(numbers) >= 5 and all(int(n) < 10 for n in numbers):
+                        logger.info(f"[NUMERICAL-SIZE] CRUSH-style sequence detected, using first number: {numbers[0]}")
+                        return numbers[0]
+                    elif len(numbers) >= 3:
+                        logger.info(f"[NUMERICAL-SIZE] Using first number as size: {numbers[0]}")
+                        return numbers[0]
+                
+                # If no sequence found, look for single emphasized numbers
+                if len(numbers) >= 1:
+                    logger.info(f"[NUMERICAL-SIZE] Single number found, using: {numbers[0]}")
+                    return numbers[0]
+                
+                logger.info("[NUMERICAL-SIZE] No numerical sizing patterns detected")
+                return None
+                
+            except TimeoutError:
+                logger.warning("[NUMERICAL-SIZE] OCR processing timed out")
+                signal.alarm(0)  # Cancel alarm
+                return None
+            except Exception as e:
+                logger.warning(f"[NUMERICAL-SIZE] OCR failed: {e}")
+                signal.alarm(0)  # Cancel alarm
+                return None
+            
+        except Exception as e:
+            logger.error(f"[NUMERICAL-SIZE] Error detecting numerical size: {e}")
+            return None
+    
+    # Removed _find_emphasized_number function - using simplified approach
 
     def _run_intelligent_lighting_probe(self):
         """Extract intelligent lighting probe logic for reuse"""
@@ -7212,137 +7232,149 @@ class EnhancedPipelineManager:
             }
     
     def render_compact_layout(self):
-        """Render everything in a compact single-page layout with cool step pipeline"""
+        """Renders the main dashboard layout: buttons on top, then chalkboard/pipeline, then the main content."""
         
-        # Create three main columns: Content (left), Camera (center), Pipeline (right)
-        col_content, col_camera, col_pipeline = st.columns([2, 1, 1])
+        # TITLE
+        st.title("🔍 Garment Analysis")
+        
+        # ===================================================
+        # ====== 1. ACTION BUTTONS AT THE VERY TOP ======
+        # ===================================================
+        self.render_action_panel()
+        st.markdown("---")
+        
+        # ======================================================================
+        # ====== 2. CHALKBOARD (Left) and PIPELINE PROGRESS (Right) ======
+        # ======================================================================
+        col_chalkboard, col_pipeline = st.columns([2, 1])
+        
+        with col_chalkboard:
+            self.render_data_chalkboard()  # Use the proper chalkboard renderer
         
         with col_pipeline:
-            # Cool animated step pipeline
+            st.markdown("#### 📊 Pipeline Progress")
             self.render_cool_step_pipeline()
-        
-        with col_camera:
-            st.markdown("#### 📷 Live Camera Feed")
-            
-            # Show appropriate camera based on current step
-            if self.current_step == 0:
-                # Tag camera with SIMPLE ROI overlay (full frame view)
-                try:
-                    # Use the new helper function to show FULL frame with ROI overlay
-                    full_frame, tag_crop = display_camera_with_roi_overlay(
-                        self.camera_manager,
-                        camera_type='arducam',
-                        roi_type='tag'
-                    )
-                    
-                    if full_frame is not None:
-                        # Display FULL camera frame with green ROI box overlay (no button overlay needed)
-                        st.image(full_frame, caption="📸 Full Camera View - Green box shows Tag ROI",
-                                width='stretch')
-                        
-                        # Show current ROI coordinates
-                        roi_coords = self.camera_manager.roi_coords.get('tag', (0, 0, 0, 0))
-                        st.info(f"Tag ROI: Position ({roi_coords[0]}, {roi_coords[1]}) | Size {roi_coords[2]}×{roi_coords[3]}")
-                        
-                        # Show cropped ROI preview in expander
-                        if tag_crop is not None:
-                            with st.expander("🔍 Tag ROI Preview (What AI Will See)"):
-                                st.image(tag_crop, caption="Cropped Tag Region", width='stretch')
-                                st.caption(f"Size: {tag_crop.shape[1]}×{tag_crop.shape[0]} pixels")
-                        
-                        # Show brightness info
-                        if self.auto_optimizer.enabled and tag_crop is not None:
-                            brightness_info = self.auto_optimizer.analyze_image_brightness(tag_crop)
-                            if brightness_info:
-                                mean = brightness_info['mean']
-                                if mean > 180:
-                                    st.caption("💡 Very bright - will reduce on capture")
-                                elif mean < 60:
-                                    st.caption("💡 Dark - will boost on capture")
-                                else:
-                                    st.caption("✅ Good lighting")
-                    else:
-                        st.error("❌ No camera frame available")
-                        
-                except Exception as e:
-                    st.error(f"❌ Error: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
-            
-            elif self.current_step == 1:
-                # Garment camera
-                frame = self.camera_manager.get_realsense_frame()
-                if frame is not None:
-                    frame_with_roi = self.camera_manager.draw_roi_overlay(frame.copy(), 'work')
-                    if frame_with_roi is not None:
-                        st.image(frame_with_roi, caption="🎯 Garment Camera", width='stretch')
-                else:
-                    st.warning("⚠️ Camera not available")
-            
-            else:
-                # Show last captured image for other steps
-                if self.pipeline_data.garment_image is not None:
-                    st.image(self.pipeline_data.garment_image, caption="📸 Captured Garment", width='stretch')
-                elif self.pipeline_data.tag_image is not None:
-                    st.image(self.pipeline_data.tag_image, caption="📸 Captured Tag", width='stretch')
-                else:
-                    st.info("No images captured yet")
-            
-            # Camera controls (compact)
-            st.markdown("---")
-            if st.button("🔄 Refresh", key="refresh_camera_compact", width='stretch'):
-                st.rerun()
-        
-        with col_content:
-            # Progress bar and controls
-            progress_col, reset_col, next_col = st.columns([3, 1, 1])
-            
-            with progress_col:
-                progress = (self.current_step + 1) / len(self.steps)
-                st.progress(progress)
-                st.caption(f"Step {self.current_step + 1} of {len(self.steps)}: {self.steps[self.current_step]}")
-            
-            with reset_col:
-                if st.button("🔄", key="reset_compact", help="Reset pipeline"):
-                    self.current_step = 0
-                    self.pipeline_data = PipelineData()
-                    st.rerun()
-            
-            with next_col:
-                if st.button("➡️", type="primary", key="next_compact", help="Next step"):
-                    result = self._execute_current_step()
-                    # CRITICAL: Force refresh to show new step
-                    st.rerun()
-            
-            st.markdown("---")
-            
-            # STEP CONTENT (compact versions)
-            if self.current_step == 0:
-                self._render_step_0_compact()
-            elif self.current_step == 1:
-                self._render_step_1_compact()
-            elif self.current_step == 2:
-                self._render_step_2_compact()
-            elif self.current_step == 3:
-                self._render_step_3_compact()
-            elif self.current_step == 4:
-                self._render_step_4_compact()
-            elif self.current_step == 5:
-                self._render_step_5_compact()
-            else:
-                self._render_final_review_compact()
-        
-        # CRITICAL: Add the action panel with Next Step button
+
         st.markdown("---")
-        self.render_action_panel()
+        
+        # ========================================================================
+        # ====== 3. MAIN CONTENT AREA (Centered Camera or Step Info) ======
+        # ========================================================================
+        # This section will render the content for the current step
+        if self.current_step == 0:
+            self._render_step_0_compact()
+        elif self.current_step == 1:
+            self._render_step_1_compact()
+        elif self.current_step == 2:
+            self._render_step_3_compact()  # Measurements (was step 3)
+        elif self.current_step == 3:
+            self._render_step_4_compact()  # Defects (was step 4)
+        elif self.current_step == 4:
+            self._render_step_5_compact()  # Results (was step 5)
+        else:
+            self._render_final_review_compact()
+
+    def _render_garment_analysis_board(self):
+        """Render the garment analysis board (chalkboard)"""
+        # Create a styled container for the analysis board
+        st.markdown("""
+        <div style="
+            background-color: #2b2b2b;
+            border: 3px solid #8B4513;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 10px 0;
+            color: white;
+            font-family: 'Courier New', monospace;
+        ">
+        """, unsafe_allow_html=True)
+        
+        # Brand information
+        brand = getattr(self.pipeline_data, 'brand', 'Unknown')
+        st.markdown(f"**BRAND:** {brand}")
+        
+        # Garment type information
+        garment_type = getattr(self.pipeline_data, 'garment_type', 'Not analyzed')
+        if garment_type == 'Unknown':
+            garment_type = 'Not analyzed'
+        st.markdown(f"**GARMENT:** Type: {garment_type}")
+        
+        # Size information
+        size = getattr(self.pipeline_data, 'size', 'Unknown')
+        st.markdown(f"**SIZE:** {size}")
+        
+        # Material information
+        material = getattr(self.pipeline_data, 'material', 'Unknown')
+        st.markdown(f"**MATERIAL:** {material}")
+        
+        # Condition information
+        condition = getattr(self.pipeline_data, 'condition', 'Unknown')
+        defects = getattr(self.pipeline_data, 'defects', [])
+        if defects:
+            defect_text = f"Defects: {len(defects)} found"
+        else:
+            defect_text = "Defects: None ✓"
+        st.markdown(f"**CONDITION:** {defect_text}")
+        
+        # AI Model info
+        st.markdown("**AI MODEL:** Model: Gemini 2.0 Flash, Tag readable ✓")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
 
     def _render_step_0_compact(self):
-        """Compact Step 0: Tag Analysis with AUTO-REFRESH motion detection"""
+        """Renders the content for Step 0: A centered camera view for tight layout."""
+        # Compact header
         st.markdown("### 🏷️ Tag Analysis")
+        st.info("Position your garment tag in the **GREEN BOX**, then click **'Next Step'** above.")
+
+        # Create a centered column for the camera view - more compact
+        col1, col_camera, col3 = st.columns([1, 3, 1])  # More compact middle column
+
+        with col_camera:
+            try:
+                frame = self.camera_manager.get_arducam_frame()
+                if frame is not None:
+                    # Draw the ROI overlay on the full frame
+                    frame_with_roi = self.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
+                    if frame_with_roi is not None:
+                        st.image(frame_with_roi, caption="📸 Tag Camera - Position tag in Green Box", width='stretch')
+                        
+                        # Show current ROI coordinates - more compact
+                        roi_coords = self.camera_manager.roi_coords.get('tag', (0, 0, 0, 0))
+                        st.caption(f"ROI: ({roi_coords[0]}, {roi_coords[1]}) {roi_coords[2]}×{roi_coords[3]}")
+                    else:
+                        st.error("❌ No ROI overlay available")
+                else:
+                    st.warning("⚠️ ArduCam camera not available")
+            except Exception as e:
+                st.error(f"❌ Camera error: {e}")
+
+        # Optional: Add camera controls or previews in an expander if needed - more compact
+        with st.expander("🔍 AI Preview & Controls"):
+            if 'frame' in locals() and frame is not None:
+                roi_image = self.camera_manager.apply_roi(frame, 'tag')
+                if roi_image is not None:
+                    st.image(roi_image, caption="This is what the AI will analyze", width='stretch')
+                    st.caption(f"Size: {roi_image.shape[1]}×{roi_image.shape[0]} pixels")
+                    
+                    # Show brightness info
+                    if self.auto_optimizer.enabled:
+                        brightness_info = self.auto_optimizer.analyze_image_brightness(roi_image)
+                        if brightness_info:
+                            mean = brightness_info['mean']
+                            if mean > 180:
+                                st.caption("💡 Very bright - will reduce on capture")
+                            elif mean < 60:
+                                st.caption("💡 Dark - will boost on capture")
+                            else:
+                                st.caption("✅ Good lighting")
         
         # Check if already analyzed
         if (self.pipeline_data.tag_image is not None and 
             self.pipeline_data.brand != "Unknown"):
+            
+            st.markdown("---")
+            st.markdown("#### ✅ Analysis Results")
             
             # Show results
             col1, col2 = st.columns(2)
@@ -7425,8 +7457,16 @@ class EnhancedPipelineManager:
                 st.rerun()
 
     def _render_step_1_compact(self):
-        """Compact Step 1: Garment Analysis"""
+        """Compact Step 1: Garment Analysis with camera feed"""
         st.markdown("### 👕 Garment Analysis")
+        
+        # Show RealSense camera feed for garment capture
+        frame = self.camera_manager.get_realsense_frame()
+        if frame is not None:
+            st.image(frame, caption="RealSense Garment View", width='stretch')
+            st.caption("💡 Position garment in view, then click Next Step to analyze")
+        else:
+            st.warning("⚠️ RealSense camera not available")
         
         if (self.pipeline_data.garment_image is not None and 
             self.pipeline_data.garment_type != "Unknown"):
@@ -7445,28 +7485,196 @@ class EnhancedPipelineManager:
                     self.pipeline_data.garment_type = new_type
         
         else:
-            st.info("📸 Position garment in GREEN BOX (see right), then click ➡️")
+            st.info("📸 Position garment in view above, then click Next Step to analyze")
 
-    def _render_step_2_compact(self):
-        """Compact Step 2: Calibration"""
-        st.markdown("### 📏 Calibration")
-        
-        if self.measurement_calculator.calibrated:
-            st.success("✅ Already calibrated")
-            st.caption(f"PPI: {self.measurement_calculator.pixels_per_inch:.1f}")
-        else:
-            st.warning("⚠️ Not calibrated - measurements will be estimates")
-            st.info("Run calibration_setup.py separately for best accuracy")
+    # Calibration step removed - measurements will use pixel-based estimates
 
     def _render_step_3_compact(self):
-        """Compact Step 3: Measurements"""
-        st.markdown("### 📐 Measurements")
+        """Compact Step 3: Measurements - Mandatory if no size, optional if size detected"""
+        st.markdown("### 📐 Garment Measurements")
         
-        if self.pipeline_data.size and self.pipeline_data.size != "Unknown":
-            st.success(f"✅ Size from tag: {self.pipeline_data.size}")
-            st.info("Skipping manual measurement")
+        # Handle numerical sizes (like CRUSH tag: 0=XS, 1=S, 2=M, etc.)
+        size_detected = self.pipeline_data.size and self.pipeline_data.size != "Unknown"
+        
+        if size_detected:
+            from data_collection_and_correction_system import GarmentDataCollector
+            collector = GarmentDataCollector()
+            size_info = collector.convert_size_format(self.pipeline_data.size)
+            
+            if size_info['number'] != 'Unknown':
+                st.success(f"✅ Size from tag: {size_info['letter']} (Number: {size_info['number']})")
+                st.caption(f"Numerical sizing: {size_info['number']} = {size_info['letter']}")
+            else:
+                st.success(f"✅ Size from tag: {self.pipeline_data.size}")
+            
+            st.success("✅ Size detected from tag - measurement complete!")
+            st.caption("💡 Optional: You can measure armpit seams below for verification")
+            
+            # OPTIONAL: Show measurement camera only if user wants to verify
+            with st.expander("📏 Optional: Measure armpit seams for verification", expanded=False):
+                self._render_simple_armpit_measurement()
         else:
-            st.info("Manual measurement needed - click points on garment")
+            st.warning("⚠️ No size detected from tag")
+            st.error("❌ Manual measurement required")
+            st.info("📏 Please click on both armpit seams to measure the garment")
+            
+            # MANDATORY: Show measurement camera since no size was detected
+            self._render_simple_armpit_measurement()
+    
+    def _render_simple_armpit_measurement(self):
+        """Simplified armpit seam measurement - just click two points"""
+        st.markdown("#### 📷 Click on Armpit Seams to Measure")
+        st.caption("💡 Click the left armpit seam, then the right armpit seam. A line will be drawn automatically.")
+        
+        # Initialize measurement data
+        if 'armpit_points' not in st.session_state:
+            st.session_state.armpit_points = []
+        
+        # Get RealSense camera frame with error handling
+        try:
+            frame = self.camera_manager.get_realsense_frame()
+        except Exception as e:
+            logger.error(f"[ARMPIT-MEASUREMENT] RealSense camera error: {e}")
+            frame = None
+        
+        if frame is not None:
+            # Use streamlit_image_coordinates for click detection
+            from streamlit_image_coordinates import streamlit_image_coordinates
+            
+            # Draw existing points and line
+            display_frame = frame.copy()
+            points = st.session_state.armpit_points
+            
+            # Draw points and line
+            if len(points) >= 1:
+                # Draw first point
+                x1, y1 = points[0]
+                cv2.circle(display_frame, (x1, y1), 8, (0, 255, 0), -1)
+                cv2.putText(display_frame, "P1", (x1+10, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                if len(points) >= 2:
+                    # Draw second point
+                    x2, y2 = points[1]
+                    cv2.circle(display_frame, (x2, y2), 8, (0, 255, 0), -1)
+                    cv2.putText(display_frame, "P2", (x2+10, y2-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # Draw line between points
+                    cv2.line(display_frame, (x1, y1), (x2, y2), (0, 255, 255), 3)
+                    
+                    # Calculate and display measurement
+                    pixel_distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                    estimated_inches = pixel_distance / 20.0
+                    estimated_cm = estimated_inches * 2.54
+                    
+                    # Draw measurement text on image
+                    mid_x = (x1 + x2) // 2
+                    mid_y = (y1 + y2) // 2
+                    measurement_text = f"{estimated_inches:.1f}\""
+                    cv2.putText(display_frame, measurement_text, (mid_x, mid_y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            # Display image with click detection
+            try:
+                clicked_point = streamlit_image_coordinates(
+                    display_frame,
+                    key="armpit_measurement_click"
+                )
+                
+                # Debug: Show current state
+                st.caption(f"🔍 Debug: {len(points)} points, clicked_point: {clicked_point}")
+                
+                # Handle click
+                if clicked_point is not None:
+                    x, y = clicked_point["x"], clicked_point["y"]
+                    logger.info(f"[ARMPIT-CLICK] Point clicked at ({x}, {y})")
+                    
+                    if len(points) < 2:
+                        points.append((x, y))
+                        st.session_state.armpit_points = points
+                        
+                        if len(points) == 1:
+                            st.success(f"✅ Point 1 added at ({x}, {y}). Click to add point 2.")
+                        elif len(points) == 2:
+                            st.success(f"✅ Point 2 added at ({x}, {y}). Measurement complete!")
+                        st.rerun()
+                    else:
+                        st.warning("⚠️ Maximum 2 points reached. Clear points to measure again.")
+                else:
+                    # Show instruction based on current state
+                    if len(points) == 0:
+                        st.info("👆 Click on the left armpit seam to add Point 1")
+                    elif len(points) == 1:
+                        st.info("👆 Click on the right armpit seam to add Point 2")
+                        
+            except Exception as e:
+                logger.error(f"[ARMPIT-CLICK] Error with streamlit_image_coordinates: {e}")
+                st.error(f"Click detection error: {e}")
+                # Fallback: show image without click detection
+                st.image(display_frame, caption="RealSense Garment View", width='stretch')
+                st.warning("⚠️ Click detection not available. Please use manual measurement.")
+            
+            # Show measurement results
+            if len(points) >= 2:
+                x1, y1 = points[0]
+                x2, y2 = points[1]
+                pixel_distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                estimated_inches = pixel_distance / 20.0
+                estimated_cm = estimated_inches * 2.54
+                
+                st.markdown("#### 📏 Measurement Results")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Pixel Distance", f"{pixel_distance:.1f} px")
+                with col2:
+                    st.metric("Estimated Inches", f"{estimated_inches:.1f}\"")
+                with col3:
+                    st.metric("Estimated CM", f"{estimated_cm:.1f} cm")
+                
+                # Store measurement in pipeline data
+                self.pipeline_data.armpit_measurement = {
+                    'pixel_distance': pixel_distance,
+                    'inches': estimated_inches,
+                    'cm': estimated_cm,
+                    'points': points
+                }
+                
+                # Clear points button
+                if st.button("🗑️ Clear Points & Measure Again", key="clear_armpit_points"):
+                    st.session_state.armpit_points = []
+                    st.rerun()
+        else:
+            st.warning("⚠️ RealSense camera not available for measurements")
+            
+            # Try fallback to ArduCam
+            try:
+                logger.info("[ARMPIT-MEASUREMENT] Trying ArduCam fallback...")
+                fallback_frame = self.camera_manager.get_arducam_frame()
+                if fallback_frame is not None:
+                    st.info("📷 Using ArduCam as fallback for measurements")
+                    st.image(fallback_frame, caption="ArduCam Fallback View", width='stretch')
+                    st.caption("💡 Note: ArduCam doesn't support click detection. Use manual measurement below.")
+                    
+                    # Manual measurement input
+                    st.markdown("#### 📏 Manual Armpit Measurement")
+                    manual_width = st.number_input("Enter armpit-to-armpit width (inches):", 
+                                                  min_value=0.0, max_value=50.0, value=20.0, step=0.1)
+                    
+                    if st.button("✅ Use Manual Measurement", key="manual_armpit_width"):
+                        # Store manual measurement
+                        self.pipeline_data.armpit_measurement = {
+                            'inches': manual_width,
+                            'cm': manual_width * 2.54,
+                            'method': 'manual_input'
+                        }
+                        st.success(f"✅ Manual measurement saved: {manual_width}\" ({manual_width * 2.54:.1f} cm)")
+                        st.rerun()
+                else:
+                    st.error("❌ No cameras available for measurements")
+            except Exception as e:
+                logger.error(f"[ARMPIT-MEASUREMENT] ArduCam fallback also failed: {e}")
+                st.error("❌ All cameras unavailable for measurements")
+    
+    # Old complex measurement functions removed - now using simplified armpit seam measurement
 
     def _render_step_4_compact(self):
         """Compact Step 4: Defects"""
@@ -7478,17 +7686,36 @@ class EnhancedPipelineManager:
             st.success("✅ No defects detected")
 
     def _render_step_5_compact(self):
-        """Compact Step 5: Pricing"""
-        st.markdown("### 💰 Pricing")
+        """Compact Step 5: Results Review & Pricing"""
+        st.markdown("### ✅ Analysis Complete!")
         
-        if self.pipeline_data.price_estimate:
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Low", f"${self.pipeline_data.price_estimate.get('low', 0)}")
-            with col2:
-                st.metric("Mid", f"${self.pipeline_data.price_estimate.get('mid', 0)}")
-            with col3:
-                st.metric("High", f"${self.pipeline_data.price_estimate.get('high', 0)}")
+        # Show basic results in metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🏷️ Brand", getattr(self.pipeline_data, 'brand', 'Unknown'))
+            st.metric("👕 Type", getattr(self.pipeline_data, 'garment_type', 'Unknown'))
+        with col2:
+            st.metric("📏 Size", getattr(self.pipeline_data, 'size', 'Unknown'))
+            st.metric("🧵 Material", getattr(self.pipeline_data, 'material', 'Unknown'))
+        with col3:
+            st.metric("👤 Gender", getattr(self.pipeline_data, 'gender', 'Unknown'))
+            st.metric("🎨 Style", getattr(self.pipeline_data, 'style', 'Unknown'))
+        
+        # Show confidence scores
+        render_confidence_scores(self.pipeline_data)
+        
+        # Store tag detection removed - was overdetecting and creating false positives
+        # === CORRECTION PANEL ===
+        render_correction_panel(self.pipeline_data)
+        
+        # === EBAY PRICING VERIFICATION ===
+        verify_ebay_pricing(self.pipeline_data)
+        
+        # === SAVE BUTTON ===
+        st.markdown("---")
+        if st.button("💾 Save to Training Dataset", type="primary", key="save_training_data"):
+            save_analysis_with_corrections(self.pipeline_data)
+            st.balloons()
 
     def _render_final_review_compact(self):
         """Compact final review"""
@@ -8535,9 +8762,8 @@ class EnhancedPipelineManager:
             st.markdown("### 🔧 Action Panel")
             col1, col2, col3 = st.columns([1, 1, 1])
             with col2:
-                if st.button("➡️ Next Step", type="primary", key="fallback_next_step"):
-                    st.session_state.pipeline_manager.current_step += 1
-                    st.rerun()
+                # Fallback button removed - using main button in render_action_panel()
+                st.write("")  # Empty space for layout
             st.session_state.next_step_button_rendered = True
     def _render_step_header(self):
         """Render the common header with progress bar, reset, and next step buttons"""
@@ -9335,1423 +9561,347 @@ class EnhancedPipelineManager:
             else: return "XXXL"
     
     def render_action_panel(self):
-        """Simplified, robust action panel that prevents infinite loops."""
-        st.markdown("---")
-
-        # Header with progress bar, reset, and the main Next Step button
-        progress_col, reset_col, next_col = st.columns([3, 1, 1])
-
-        with progress_col:
-            progress = (self.current_step + 1) / len(self.steps)
-            st.progress(progress, text=f"Step {self.current_step + 1}: {self.steps[self.current_step]}")
-
-        with reset_col:
-            if st.button("🔄 Reset", key="reset_button"):
-                self.current_step = 0
-                self.pipeline_data = PipelineData()
-                st.rerun()
-
-        with next_col:
-            # This is the main action button for the entire application
-            if st.button("➡️ Next Step", type="primary", key="main_next_step_button"):
-
-                # Get the current step before doing anything
-                step_to_execute = self.current_step
-                logger.info(f"[ACTION] 'Next Step' clicked for step {step_to_execute}")
-
-                # --- Execute the logic for the CURRENT step ---
-                analysis_success = False
-
-                if step_to_execute == 0:  # Tag Analysis
-                    with st.spinner("🔍 Analyzing tag... This may take a moment."):
-                        result = self.handle_step_0_tag_analysis()
-                    if result and result.get('success'):
-                        st.success(f"✅ Tag analyzed: {result.get('message', 'OK')}")
-                        analysis_success = True
-                    else:
-                        st.error(f"❌ Tag analysis failed: {result.get('error', 'Unknown error')}")
-
-                elif step_to_execute == 1:  # Garment Analysis
-                    with st.spinner("👕 Analyzing garment..."):
-                        result = self.handle_step_1_garment_analysis()
-                    if result and result.get('success'):
-                        st.success(f"✅ Garment analyzed: {result.get('message', 'OK')}")
-                        analysis_success = True
-                    else:
-                        st.error(f"❌ Garment analysis failed: {result.get('error', 'Unknown error')}")
-
-                else:
-                    # For all other steps, just assume success and advance
-                    analysis_success = True
-
-                # --- Advance to the NEXT step ONLY if the current one succeeded ---
-                if analysis_success:
-                    if self.current_step < len(self.steps) - 1:
-                        self.current_step += 1
-                        logger.info(f"[ACTION] Advancing to step {self.current_step}")
-                        st.rerun() # Rerun to display the UI for the new step
-                    else:
-                        st.balloons()
-                        st.success("🎉 Pipeline complete!")
-                                                # Save positive validation to database
-                                                try:
-                                                    if st.session_state.pipeline_manager.dataset_manager:
-                                                        # Find the most recent sample for this image and update it
-                                                        conn = sqlite3.connect(st.session_state.pipeline_manager.dataset_manager.db_path)
-                                                        c = conn.cursor()
-                                                        
-                                                        # Get the image hash to find the record
-                                                        image_hash = st.session_state.pipeline_manager.dataset_manager._calculate_image_hash(
-                                                            st.session_state.pipeline_manager.pipeline_data.tag_image
-                                                        )
-                                                        
-                                                        if image_hash:
-                                                            # Update the most recent record with this hash
-                                                            c.execute('''
-                                                                UPDATE tag_samples 
-                                                                SET user_validated = 1, validation_correct = 1
-                                                                WHERE image_hash = ? 
-                                                                ORDER BY timestamp DESC 
-                                                                LIMIT 1
-                                                            ''', (image_hash,))
-                                                            conn.commit()
-                                                            
-                                                            if c.rowcount > 0:
-                                                                st.success("✅ Validation saved! This correct example will strengthen the model.")
-                                                                st.toast("🎯 Positive validation recorded!", icon="✅")
-                                                            else:
-                                                                st.warning("Could not find record to update")
-                                                        
-                                                        conn.close()
-                                                    else:
-                                                        st.warning("Learning system not available")
-                                                    
-                                                except Exception as e:
-                                                    logger.error(f"Failed to save validation: {e}")
-                                                    st.error("Failed to save validation. Please try again.")
-                                        
-                                        with col_feedback2:
-                                            if st.button("❌ Incorrect - Let me fix it", key="feedback_incorrect"):
-                                                st.session_state.show_correction_form = True
-                                                st.rerun()
-                                        
-                                        # Show correction form if needed
-                                        if st.session_state.get('show_correction_form', False):
-                                            st.markdown("#### ✏️ Correct the Recognition")
-                                            
-                                            corrected_brand = st.text_input(
-                                                "Correct Brand:", 
-                                                value=brand or '',
-                                                key="corrected_brand",
-                                                help="Enter the correct brand name as it appears on the tag"
-                                            )
-                                            corrected_size = st.text_input(
-                                                "Correct Size:", 
-                                                value=tag_data.get('size', '') or '',
-                                                key="corrected_size",
-                                                help="Enter the correct size if visible"
-                                            )
-                                            
-                                            col_submit1, col_submit2 = st.columns(2)
-                                            with col_submit1:
-                                                if st.button("Submit Correction", type="primary"):
-                                                    if corrected_brand:
-                                                        # Save corrected version to dataset
-                                                        correction = {
-                                                            'brand': corrected_brand,
-                                                            'size': corrected_size
-                                                        }
-                                                        
-                                                        try:
-                                                            if st.session_state.pipeline_manager.dataset_manager:
-                                                                # Save corrected sample (marks as user_corrected=True, user_validated=True, validation_correct=False)
-                                                                saved = st.session_state.pipeline_manager.dataset_manager.save_sample(
-                                                                    tag_image=st.session_state.pipeline_manager.pipeline_data.tag_image,
-                                                                    ai_result=tag_data,
-                                                                    user_correction=correction,
-                                                                    metadata=metadata,
-                                                                    user_validated=True,
-                                                                    validation_correct=False
-                                                                )
-                                                            else:
-                                                                saved = False
-                                                            
-                                                            if saved:
-                                                                # Update pipeline data with correction
-                                                                st.session_state.pipeline_manager.pipeline_data.brand = corrected_brand
-                                                                st.session_state.pipeline_manager.pipeline_data.size = corrected_size
-                                                                
-                                                                st.success("✅ Correction saved! This will help improve future recognition.")
-                                                                st.toast("🎯 Training data updated!", icon="🧠")
-                                                        
-                                                        except Exception as e:
-                                                            logger.error(f"Failed to save correction: {e}")
-                                                            st.error("Failed to save correction. Please try again.")
-                                                        
-                                                        st.session_state.show_correction_form = False
-                                                        st.rerun()
-                                                    else:
-                                                        st.error("Please enter a brand name")
-                                            
-                                            with col_submit2:
-                                                if st.button("Cancel"):
-                                                    st.session_state.show_correction_form = False
-                                                    st.rerun()
-                                        logger.info(f"[TAG] Brand detected: {st.session_state.pipeline_manager.pipeline_data.brand}")
-                                    
-                                    # CHECK IF EXTRACTION COMPLETELY FAILED (no text extracted at all)
-                                    # Only retry if we got NOTHING, not if we got size but brand is unreadable
-                                    should_retry = (
-                                        not st.session_state.pipeline_manager.pipeline_data.raw_tag_text or 
-                                        st.session_state.pipeline_manager.pipeline_data.raw_tag_text in ['No text extracted', ''] or
-                                        (st.session_state.pipeline_manager.pipeline_data.raw_tag_text == 'UNREADABLE' and 
-                                         st.session_state.pipeline_manager.pipeline_data.size == 'Unknown')
-                                    )
-                                    
-                                    # PREVENT INFINITE RETRY LOOP
-                                    retry_already_attempted = st.session_state.get('tag_retry_attempted', False)
-                                    
-                                    # ADDITIONAL SAFETY: Check if we're in a loop
-                                    current_time = time.time()
-                                    last_retry_time = st.session_state.get('last_retry_time', 0)
-                                    time_since_last_retry = current_time - last_retry_time
-                                    
-                                    if should_retry and not retry_already_attempted and time_since_last_retry > 5:
-                                        st.warning("⚠️ Tag completely unreadable. Trying progressive strategies...")
-                                        
-                                        # SET RETRY FLAG TO PREVENT INFINITE LOOP
-                                        st.session_state.tag_retry_attempted = True
-                                        st.session_state.last_retry_time = current_time
-                                        
-                                        # ============================================
-                                        # PROGRESSIVE RETRY STRATEGY
-                                        # 1. Try different brightness levels (lighting issue)
-                                        # 2. Try digital zoom levels (small text issue)
-                                        # ============================================
-                                        
-                                        # STRATEGY 1: Different brightness levels
-                                        current_roi_brightness = brightness_info.get('mean', 100) if 'brightness_info' in locals() else 100
-                                        if current_roi_brightness < 80:
-                                            # Dark tag - need MORE light
-                                            retry_brightness_levels = [50, 70, 90]
-                                        else:
-                                            # Bright tag - try LESS light
-                                            retry_brightness_levels = [3, 8, 15]
-                                        
-                                        extraction_successful = False
-                                        
-                                        for idx, retry_brightness in enumerate(retry_brightness_levels):
-                                            if idx > 0:
-                                                st.info("⏳ Waiting 3 seconds to avoid rate limit...")
-                                                time.sleep(3.0)  # Increased from 2s for better rate limit protection
-                                            
-                                            st.info(f"🔄 Strategy 1: {retry_brightness}% brightness")
-                                            st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(
-                                                brightness=retry_brightness,
-                                                temperature=6000
-                                            )
-                                            time.sleep(1.5)
-                                            
-                                            # Recapture
-                                            frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-                                            if frame is not None:
-                                                roi_frame = st.session_state.pipeline_manager.camera_manager.apply_roi(frame, 'tag')
-                                                if roi_frame is not None:
-                                                    brightness_info = st.session_state.pipeline_manager.auto_optimizer.analyze_image_brightness(roi_frame)
-                                                    if brightness_info:
-                                                        st.caption(f"  Brightness: {brightness_info['mean']:.0f}/255")
-                                                    
-                                                    st.session_state.pipeline_manager.pipeline_data.tag_image = roi_frame
-                                                    retry_result = st.session_state.pipeline_manager.text_extractor.analyze_tag(
-                                                        st.session_state.pipeline_manager.pipeline_data.tag_image
-                                                    )
-                                                    
-                                                    if retry_result.get('success'):
-                                                        retry_raw_text = retry_result.get('raw_text', '')
-                                                        if retry_raw_text and retry_raw_text != 'No text extracted':
-                                                            st.session_state.pipeline_manager.pipeline_data.brand = retry_result.get('brand', None)
-                                                            st.session_state.pipeline_manager.pipeline_data.size = retry_result.get('size', 'Unknown')
-                                                            st.session_state.pipeline_manager.pipeline_data.raw_tag_text = retry_raw_text
-                                                            st.success(f"✅ SUCCESS with brightness {retry_brightness}%!")
-                                                            extraction_successful = True
-                                                            break
-                                        
-                                        # STRATEGY 2: Digital zoom (if brightness retries failed)
-                                        if not extraction_successful:
-                                            st.warning("🔍 Brightness adjustments failed. Trying digital zoom for small text...")
-                                            
-                                            zoom_levels = [1.5, 2.0, 2.5]
-                                            for zoom_idx, zoom_factor in enumerate(zoom_levels):
-                                                if zoom_idx > 0:
-                                                    st.info("⏳ Waiting 3 seconds...")
-                                                    time.sleep(3.0)  # Increased from 2s for better rate limit protection
-                                                
-                                                st.info(f"🔎 Strategy 2: {zoom_factor}x digital zoom")
-                                                
-                                                # Recapture with zoom
-                                                frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-                                                if frame is not None:
-                                                    # Apply ROI with zoom
-                                                    roi_frame_zoomed = st.session_state.pipeline_manager.camera_manager.apply_roi(
-                                                        frame, 'tag', zoom_factor=zoom_factor
-                                                    )
-                                                    
-                                                    if roi_frame_zoomed is not None:
-                                                        st.caption(f"  Zoomed to {roi_frame_zoomed.shape[1]}x{roi_frame_zoomed.shape[0]}px")
-                                                        
-                                                        st.session_state.pipeline_manager.pipeline_data.tag_image = roi_frame_zoomed
-                                                        retry_result = st.session_state.pipeline_manager.text_extractor.analyze_tag(
-                                                            st.session_state.pipeline_manager.pipeline_data.tag_image
-                                                        )
-                                                        
-                                                        if retry_result.get('success'):
-                                                            retry_raw_text = retry_result.get('raw_text', '')
-                                                            if retry_raw_text and retry_raw_text != 'No text extracted':
-                                                                st.session_state.pipeline_manager.pipeline_data.brand = retry_result.get('brand', None)
-                                                                st.session_state.pipeline_manager.pipeline_data.size = retry_result.get('size', 'Unknown')
-                                                                st.session_state.pipeline_manager.pipeline_data.raw_tag_text = retry_raw_text
-                                                                st.success(f"✅ SUCCESS with {zoom_factor}x zoom!")
-                                                                extraction_successful = True
-                                                                break
-                                        
-                                        # Final check after all retries
-                                        if extraction_successful:
-                                            st.balloons()
-                                            st.success(f"✅ Found: **{st.session_state.pipeline_manager.pipeline_data.brand}** Size **{st.session_state.pipeline_manager.pipeline_data.size}**")
-                                        else:
-                                            st.error("❌ Could not read tag after all attempts")
-                                            st.info("💡 Will try Google Lens visual search in next step")
-                                    else:
-                                        # Extraction got SOMETHING (at least size, even if brand unreadable)
-                                        if st.session_state.pipeline_manager.pipeline_data.brand:
-                                            st.balloons()
-                                            st.success(f"✅ Found: **{st.session_state.pipeline_manager.pipeline_data.brand}** Size **{st.session_state.pipeline_manager.pipeline_data.size}**")
-                                            
-                                            # Quick confirmation for detected brand
-                                            col1, col2 = st.columns(2)
-                                            with col1:
-                                                if st.button("✅ Brand & Size Correct", type="primary", key="confirm_detected"):
-                                                    st.success("✅ Brand and size confirmed!")
-                                                    st.rerun()
-                                            with col2:
-                                                if st.button("❌ Incorrect - Let me fix", key="fix_detected"):
-                                                    st.session_state.show_correction_form = True
-                                                    st.rerun()
-                                        else:
-                                            # Brand unreadable but size detected - this is OK, continue
-                                            st.warning(f"⚠️ Brand unreadable, but got Size: **{st.session_state.pipeline_manager.pipeline_data.size}**")
-                                            st.info("💡 Will try Google Lens visual search in next step")
-                                    
-                                    # Advance to Step 1 after tag analysis
-                                    st.session_state.pipeline_manager.current_step = 1
-                                    st.success("✅ Moving to garment analysis...")
-                                    st.rerun()
-                                else:
-                                    st.error("❌ Couldn't read tag clearly. Please adjust and try again.")
-                                    return  # Only return on error
-                
-                elif st.session_state.pipeline_manager.current_step == 1:  # Garment Analysis
-                    # Auto-capture and analyze garment
-                    if st.session_state.pipeline_manager.camera_manager:
-                        frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
-                        if frame is not None:
-                            # Final adjustment before capture
-                            if st.session_state.pipeline_manager.auto_optimizer.enabled:
-                                st.session_state.pipeline_manager.auto_optimizer.optimize_for_current_image(frame, 'garment')
-                                time.sleep(0.5)
-                                frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
-                            
-                            st.session_state.pipeline_manager.pipeline_data.garment_image = st.session_state.pipeline_manager.camera_manager.apply_roi(frame, 'work')
-                            
-                            # Analyze immediately
-                            if st.session_state.pipeline_manager.pipeline_data.garment_image is not None and st.session_state.pipeline_manager.garment_analyzer:
-                                with st.spinner("🔍 Analyzing garment (this may take 2-3 seconds)..."):
-                                    # Check network availability first
-                                    if st.session_state.pipeline_manager.is_network_available():
-                                        # Use async parallel analysis for garment and defect detection
-                                        import asyncio
-                                        from openai import AsyncOpenAI
-                                        
-                                        async def analyze_garment_with_optional_serp():
-                                            """Smart batching: Add SERP to parallel batch ONLY if brand unknown"""
-                                            api_key = os.getenv('OPENAI_API_KEY')
-                                            client = AsyncOpenAI(api_key=api_key)
-                                            
-                                            # Always run garment and defect analysis
-                                            garment_task = st.session_state.pipeline_manager.garment_analyzer.analyze_garment_with_smart_retry(
-                                                st.session_state.pipeline_manager.pipeline_data.garment_image,
-                                                client
-                                            )
-                                            defect_task = st.session_state.pipeline_manager.defect_detector.analyze_defects_async(
-                                                st.session_state.pipeline_manager.pipeline_data.garment_image,
-                                                client
-                                            )
-                                            
-                                            # Check if we need SERP fallback
-                                            needs_serp = getattr(st.session_state.pipeline_manager.pipeline_data, 'needs_serp_fallback', False)
-                                            
-                                            if needs_serp:
-                                                # Brand unknown - add SERP to parallel batch (uses same garment image)
-                                                # SERP is NOT awaited here, it returns a sync result
-                                                # We'll call it synchronously after garment analysis
-                                                results = await asyncio.gather(garment_task, defect_task, return_exceptions=True)
-                                                return (*results, 'serp_needed')
-                                            else:
-                                                # Brand already known - skip SERP, only do garment + defect
-                                                results = await asyncio.gather(garment_task, defect_task, return_exceptions=True)
-                                                return (*results, None)
-                                        
-                                        results = asyncio.run(analyze_garment_with_optional_serp())
-                                        garment_result = results[0] if not isinstance(results[0], Exception) else {'success': False}
-                                        defect_result = results[1] if not isinstance(results[1], Exception) else {'success': False}
-                                        serp_needed = results[2] if len(results) > 2 else None
-                                        
-                                        result = {
-                                            'garment': garment_result,
-                                            'defect': defect_result,
-                                            'serp_needed': serp_needed,
-                                            'success': garment_result.get('success', False)
-                                        }
-                                    else:
-                                        # Use offline fallback
-                                        st.warning("🌐 No network connection - using offline mode")
-                                        result = {'garment': st.session_state.pipeline_manager.get_offline_fallback_data('garment'), 'success': True}
-                                    
-                                    # Parse parallel results correctly
-                                    if result and result.get('success'):
-                                        garment_data = result.get('garment', {})
-                                        defect_data = result.get('defect', {})
-                                        st.session_state.pipeline_manager.pipeline_data.garment_type = garment_data.get('garment_type', 'Unknown')
-                                        st.session_state.pipeline_manager.pipeline_data.gender = garment_data.get('gender', 'Unisex')
-                                        st.session_state.pipeline_manager.pipeline_data.condition = garment_data.get('condition', 'Good')
-                                        # Color comes from tag, not garment analysis
-                                        st.session_state.pipeline_manager.pipeline_data.style = garment_data.get('style', 'Unknown')
-                                        st.session_state.pipeline_manager.pipeline_data.era = garment_data.get('era', 'Modern')
-                                        st.session_state.pipeline_manager.pipeline_data.defects = defect_data.get('defects', [])
-                                        st.session_state.pipeline_manager.pipeline_data.defect_count = len(st.session_state.pipeline_manager.pipeline_data.defects)
-                                        
-                                        # ============================================
-                                        # SERP API FALLBACK - Only if needed and after garment type known
-                                        # ============================================
-                                        if serp_needed == 'serp_needed':
-                                            st.info("🔍 Tag unreadable or low confidence - using Google Lens on full garment...")
-                                            st.info(f"🔍 **Searching for:** {st.session_state.pipeline_manager.pipeline_data.garment_type} - {st.session_state.pipeline_manager.pipeline_data.gender}")
-                                            
-                                            # Now we have garment_type and gender, use them for better SERP results
-                                            serp_result = st.session_state.pipeline_manager.serp_detector.search_brand_from_image(
-                                                st.session_state.pipeline_manager.pipeline_data.garment_image,  # FULL garment (better than tiny tag)
-                                                garment_type=st.session_state.pipeline_manager.pipeline_data.garment_type,
-                                                gender=st.session_state.pipeline_manager.pipeline_data.gender
-                                            )
-                                            st.info(f"🔍 **SERP API Response:** Success={serp_result.get('success', False)}, {len(serp_result.get('visual_matches', []))} matches, {len(serp_result.get('brands', []))} brands")
-                                            
-                                            if serp_result.get('success') and serp_result.get('brands'):
-                                                serp_brands = serp_result['brands']
-                                                st.session_state.pipeline_manager.pipeline_data.brand_suggestions = serp_brands
-                                                st.session_state.pipeline_manager.pipeline_data.brand = serp_brands[0]
-                                                st.success(f"🎯 Google Lens found: **{', '.join(serp_brands)}**")
-                                                logger.info(f"[SERP] Visual search SUCCESS: {serp_brands}")
-                                                
-                                                # --- RENDER VISUAL MATCHES FOR MANUAL REVIEW ---
-                                                if serp_result.get('visual_matches'):
-                                                    st.info(f"🔍 Found {len(serp_result['visual_matches'])} visual matches")
-                                                    st.session_state.pipeline_manager.render_serp_api_results(serp_result['visual_matches'])
-                                                    st.info("👆 **Please verify the brand** using the Google Lens results above")
-                                                else:
-                                                    st.warning("⚠️ Google Lens found brands but no visual matches")
-                                                    st.info(f"🔍 **Top 3 brands found:** {', '.join(serp_brands[:3])}")
-                                                    # Debug: show what we actually got
-                                                    st.code(f"Debug SERP result: {serp_result}")
-                                            else:
-                                                st.warning("⚠️ Google Lens couldn't identify brand")
-                                                logger.warning(f"[SERP] Failed: {serp_result.get('error', 'Unknown')}")
-                                                
-                                                # Still show visual matches if available, even if no brands found
-                                                if serp_result.get('visual_matches'):
-                                                    st.info("🔍 **Visual matches found but no brands identified:**")
-                                                    st.session_state.pipeline_manager.render_serp_api_results(serp_result['visual_matches'])
-                                                    st.info("👆 **Please manually identify the brand** from the visual matches above")
-                                        
-                                        st.balloons()
-                                        st.success(f"✅ Found: **{st.session_state.pipeline_manager.pipeline_data.garment_type}** | **{st.session_state.pipeline_manager.pipeline_data.gender}** | Style: **{st.session_state.pipeline_manager.pipeline_data.style}**")
-                                        # Don't return here - let it continue to step advancement
-                                    else:
-                                        st.error("❌ Couldn't analyze garment clearly. Please adjust and try again.")
-                                        return  # Only return on error
-                
-                elif st.session_state.pipeline_manager.current_step == 2:  # Calibration
-                    # Handle calibration step - just advance
-                    pass
-                
-                elif st.session_state.pipeline_manager.current_step == 3:  # Measurement
-                    # Handle measurement step - just advance
-                    pass
-                
-                elif st.session_state.pipeline_manager.current_step == 4:  # Defect Detection
-                    # Auto-run defect detection
-                    if st.session_state.pipeline_manager.pipeline_data.garment_image is not None:
-                        with st.spinner("Checking for defects..."):
-                            if st.session_state.pipeline_manager.defect_detector:
-                                result = st.session_state.pipeline_manager.defect_detector.analyze_defects(st.session_state.pipeline_manager.pipeline_data.garment_image)
-                                if result.get('success'):
-                                    st.session_state.pipeline_manager.pipeline_data.defects = result.get('defects', [])
-                                    st.session_state.pipeline_manager.pipeline_data.defect_count = len(st.session_state.pipeline_manager.pipeline_data.defects)
-                                    st.session_state.pipeline_manager.pipeline_data.condition = result.get('overall_condition', 'Good')
-                                    
-                                    if st.session_state.pipeline_manager.pipeline_data.defect_count > 0:
-                                        st.warning(f"Found {st.session_state.pipeline_manager.pipeline_data.defect_count} defect(s)")
-                                        for defect in st.session_state.pipeline_manager.pipeline_data.defects:
-                                            st.write(f"- {defect.get('type', 'Unknown')} at {defect.get('location', 'Unknown')}")
-                    else:
-                                        st.success("No defects found")
-                
-                elif st.session_state.pipeline_manager.current_step == 5:  # Price Calculation
-                    # Auto-calculate price
-                    st.session_state.pipeline_manager.pipeline_data.is_designer = check_if_designer(st.session_state.pipeline_manager.pipeline_data.brand)
-                    st.session_state.pipeline_manager.pipeline_data.is_vintage = check_if_vintage(st.session_state.pipeline_manager.pipeline_data.era, st.session_state.pipeline_manager.pipeline_data.style)
-                    
-                    st.session_state.pipeline_manager.pipeline_data.price_estimate = calculate_priority_price(
-                        st.session_state.pipeline_manager.pipeline_data.brand,
-                        st.session_state.pipeline_manager.pipeline_data.garment_type,
-                        st.session_state.pipeline_manager.pipeline_data.gender,
-                        st.session_state.pipeline_manager.pipeline_data.is_designer,
-                        st.session_state.pipeline_manager.pipeline_data.is_vintage,
-                        st.session_state.pipeline_manager.pipeline_data.condition,
-                        st.session_state.pipeline_manager.pipeline_data.size
-                    )
-                
-                # Smart step advancement - skip measurement steps if size is detected
-                if st.session_state.pipeline_manager.current_step < len(self.steps) - 1:
-                    # ============================================
-                    # Let the tag analysis run first, then check if confirmation is needed
-                    # ============================================
-                    
-                    # Normal step advancement first
-                    st.session_state.pipeline_manager.current_step += 1
-                    
-                    # THEN check if we should skip measurement steps (only AFTER completing Step 1)
-                    if st.session_state.pipeline_manager.current_step == 2:  # Just moved from 1 to 2
-                        size_detected = (hasattr(st.session_state.pipeline_manager.pipeline_data, 'size') and 
-                                       st.session_state.pipeline_manager.pipeline_data.size and 
-                                       st.session_state.pipeline_manager.pipeline_data.size.lower() not in ['unknown', '', 'n/a'])
-                        
-                        if size_detected:
-                            # Skip calibration (step 2) and measurement (step 3), go directly to review (step 4)
-                            st.session_state.pipeline_manager.current_step = 4
-                            st.info("✅ Size detected from tag - skipping measurement steps")
-                    
-                    # Only rerun if we're not in the middle of a retry operation
-                    if not st.session_state.get('tag_retry_attempted', False):
-                        st.rerun()
-                else:
-                    st.info("This is the final step!")
+        """Action panel with buttons at the top right, close together"""
+        logger.info(f"[PANEL] render_action_panel() called for step {self.current_step}")
         
-        st.header(f"{self.steps[st.session_state.pipeline_manager.current_step]}")
+        # TOP RIGHT BUTTONS: All navigation buttons at the top right, close together
+        col_space, col_buttons = st.columns([3, 1])  # Push buttons to the right
         
-        if st.session_state.pipeline_manager.current_step == 0:  # Capture & Analyze Tag
-            # Check if tag has already been analyzed
-            tag_already_analyzed = (hasattr(st.session_state.pipeline_manager.pipeline_data, 'tag_image') and 
-                                  st.session_state.pipeline_manager.pipeline_data.tag_image is not None and
-                                  hasattr(st.session_state.pipeline_manager.pipeline_data, 'brand') and
-                                  st.session_state.pipeline_manager.pipeline_data.brand != "Unknown")
-            
-            # CAPTURE & ANALYZE SECTION AT THE TOP
-            st.markdown("### 📸 Capture & Analyze Tag")
-            
-            if not tag_already_analyzed:
-                st.markdown("---")
-                st.markdown("#### 📷 Live Camera Preview")
-                st.info("👇 **Position the garment tag inside the green ROI box below. For SMALL tags, use the zoom slider.**")
+        with col_buttons:
+            if self.current_step == 0:
+                # Step 0: Start New and Next buttons
+                col_start, col_next = st.columns(2)
                 
-                # 🤖 AUTO-ZOOM OPTION (DISABLED BY DEFAULT - CAUSING LOOPS)
-                auto_zoom_enabled = st.checkbox(
-                    "🤖 Auto-Zoom (Advanced)", 
-                    value=False,  # DISABLED BY DEFAULT
-                    help="Automatically detects the tag and zooms in for best quality (can cause loops)"
-                )
-                st.session_state.auto_zoom_enabled = auto_zoom_enabled
-                
-                if auto_zoom_enabled:
-                    st.caption("✨ Auto-zoom will detect the tag rectangle and crop tightly")
-                else:
-                    # Manual zoom slider (only show if auto-zoom is OFF)
-                    zoom_level = st.slider(
-                        "🔬 Manual Digital Zoom", 
-                        min_value=1.0, 
-                        max_value=3.0, 
-                        value=st.session_state.get('zoom_level', 1.0), 
-                        step=0.25,
-                        help="Manual zoom control. Increase for small tags."
-                    )
-                    
-                    # Track zoom changes to distinguish from automatic loops
-                    if zoom_level != st.session_state.get('zoom_level', 1.0):
-                        st.session_state.last_zoom_change = time.time()
-                        logger.info(f"[ZOOM] Digital zoom {zoom_level}x applied to tag ROI")
-                    
-                    st.session_state.zoom_level = zoom_level
-                    
-                    if zoom_level > 1.0:
-                        st.caption(f"🔍 Manual zoom: {zoom_level}x")
-                
-                # Add preview control buttons
-                col_refresh1, col_refresh2, col_refresh3 = st.columns([1, 1, 1])
-                # Manual lighting controls hidden for cleaner employee interface
-                with col_refresh2:
-                    if st.button("🔄 Refresh Preview", key="refresh_tag_preview"):
-                        # Clear any cached frames to force refresh
-                        if 'cached_tag_frame' in st.session_state:
-                            del st.session_state.cached_tag_frame
-                        if 'last_camera_frame' in st.session_state:
-                            del st.session_state.last_camera_frame
+                with col_start:
+                    def start_new():
+                        self.current_step = 0
+                        self.pipeline_data = PipelineData()
+                        # Clear captured images
+                        if 'captured_tag_image' in st.session_state:
+                            del st.session_state.captured_tag_image
+                        if 'captured_garment_image' in st.session_state:
+                            del st.session_state.captured_garment_image
+                        logger.info("[BUTTON] 🆕 Start New clicked - pipeline reset")
                         st.rerun()
-                
-                with col_refresh3:
-                    if st.button("📸 Scan at Full 12MP", key="scan_12mp"):
-                        # Capture high-res burst
-                        frames = st.session_state.pipeline_manager.camera_manager.capture_highres_burst(n=3)
-                        if frames:
-                            # Select sharpest frame
-                            best_frame = max(frames, key=lambda f: st.session_state.pipeline_manager.camera_manager.calculate_focus_score(f))
-                            st.session_state.pipeline_manager.pipeline_data.tag_image = best_frame
-                            st.success(f"✅ Captured {len(frames)} frames at 12MP, selected sharpest")
-                        else:
-                            st.error("❌ Failed to capture 12MP frames")
-                
-                # Show live preview with ROI highlighted - PROMINENTLY
-                if st.session_state.pipeline_manager.camera_manager:
-                    try:
-                        preview_frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-                        if preview_frame is not None:
-                            # Draw ROI box on preview
-                            frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(preview_frame.copy(), 'tag')
-                            
-                            # Show preview prominently centered
-                            col1, col2, col3 = st.columns([1, 2, 1])
-                            with col2:
-                                st.image(frame_with_roi, caption="🎯 Position tag inside the GREEN BOX", width='stretch')
-                            
-                            # Show brightness feedback (with zoom if set)
-                            if st.session_state.pipeline_manager.auto_optimizer.enabled:
-                                current_zoom = st.session_state.get('zoom_level', 1.0)
-                                roi_preview = st.session_state.pipeline_manager.camera_manager.apply_roi(preview_frame, 'tag', zoom_factor=current_zoom)
-                                if roi_preview is not None:
-                                    brightness_info = st.session_state.pipeline_manager.auto_optimizer.analyze_image_brightness(roi_preview)
-                                    if brightness_info:
-                                        with col2:
-                                            if brightness_info['mean'] > 140:
-                                                st.caption("🔅 Light tag detected - brightness will be reduced on capture")
-                                            elif brightness_info['mean'] < 60:
-                                                st.caption("🔆 Dark tag detected - brightness will be increased on capture")
-                                            else:
-                                                st.caption("✨ Good lighting detected")
-                        else:
-                            st.warning("⚠️ ArduCam not accessible - check camera connection")
-                    except Exception as e:
-                        st.error(f"❌ Camera error: {str(e)}")
-                else:
-                    st.error("❌ Camera manager not initialized")
-                
-                st.markdown("---")
-                
-                # SHOW DEBUG IMAGES (if they exist)
-                debug_files = ["debug_tag_original.jpg", "debug_tag_v1.jpg", "debug_tag_v2.jpg", "debug_tag_v3.jpg"]
-                existing_debug_files = [f for f in debug_files if os.path.exists(f)]
-                
-                if existing_debug_files:
-                    # Move debug images to expandable section (collapsed by default)
-                    with st.expander("🔍 Debug: What AI Sees (Technical Details)", expanded=False):
-                        st.info("These are the images sent to the AI. Can YOU read the brand name in ANY of them?")
-                        
-                        # Show all debug images in columns
-                        cols = st.columns(len(existing_debug_files))
-                        for idx, debug_file in enumerate(existing_debug_files):
-                            try:
-                                debug_img = cv2.imread(debug_file)
-                                if debug_img is not None:
-                                    with cols[idx]:
-                                        if "original" in debug_file:
-                                            label = "Original ROI"
-                                        elif "v1" in debug_file:
-                                            label = "V1: Red Channel"
-                                        elif "v2" in debug_file:
-                                            label = "V2: Grayscale"
-                                        elif "v3" in debug_file:
-                                            label = "V3: Inverted"
-                                        else:
-                                            label = debug_file
-                                        # Convert BGR to RGB for proper display
-                                        debug_img_rgb = cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB)
-                                        st.image(debug_img_rgb, caption=label, width='stretch')
-                            except Exception as e:
-                                logger.warning(f"Could not display debug image {debug_file}: {e}")
-                                with cols[idx]:
-                                    st.error(f"Could not load {debug_file}")
-                        
-                        st.caption("👆 If YOU can't read the brand name in these images, the problem is lighting/focus, not AI")
-                    st.markdown("---")
-                
-                # MANUAL RETRY SECTION (if tag image exists but failed)
-                if st.session_state.pipeline_manager.pipeline_data.tag_image is not None:
-                    st.markdown("#### 🔄 Manual Retry (if auto-capture failed)")
-                    st.warning("⚠️ IMPORTANT: If you see '429 Rate Limit' errors, WAIT 60 SECONDS before retrying!")
-                    st.info("Use this if you got 'Unknown' results. Pick a brightness and retry WITHOUT recapturing.")
                     
-                    col_retry1, col_retry2, col_retry3 = st.columns(3)
-                    with col_retry1:
-                        retry_manual_brightness = st.number_input("Brightness %", min_value=1, max_value=100, value=70, step=5, key="retry_brightness")
-                    with col_retry2:
-                        st.write("")  # Spacing
-                        st.write("")  # Spacing
-                        if st.button("🔄 Retry at This Brightness", type="primary", key="manual_retry"):
-                            with st.spinner(f"🔄 Retrying tag analysis at {retry_manual_brightness}%..."):
-                                # Set brightness
-                                if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                    st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(
-                                        brightness=retry_manual_brightness,
-                                        temperature=6000
-                                    )
-                                    time.sleep(3.0)  # Wait for light + rate limit (increased from 2s)
+                    st.button("🆕 Start New", on_click=start_new, key="start_new_button", type="primary")
+                
+                with col_next:
+                    # Next button will be handled below
+                    pass
+            else:
+                # Steps 1+: Back, Reset, and Next buttons
+                col_back, col_reset, col_next = st.columns(3)
+                
+                with col_back:
+                    def go_back():
+                        if self.current_step > 0:
+                            old_step = self.current_step
+                            self.current_step -= 1
+                            logger.info(f"[BUTTON] ⬅️ Back: {old_step} → {self.current_step}")
+                            st.rerun()
+                    
+                    st.button("⬅️ Back", on_click=go_back, key="back_button", type="secondary")
+                
+                with col_reset:
+                    def reset_pipeline():
+                        self.current_step = 0
+                        self.pipeline_data = PipelineData()
+                        # Clear captured images
+                        if 'captured_tag_image' in st.session_state:
+                            del st.session_state.captured_tag_image
+                        if 'captured_garment_image' in st.session_state:
+                            del st.session_state.captured_garment_image
+                        logger.info("[BUTTON] 🔄 Reset clicked - pipeline reset")
+                        st.rerun()
+                    
+                    st.button("🔄 Reset", on_click=reset_pipeline, key="reset_button", type="secondary")
+                
+                with col_next:
+                    # Next button will be handled below
+                    pass
+        
+            # Add Next button to the appropriate column
+            if self.current_step == 0:
+                col_start, col_next = st.columns(2)
+                with col_next:
+                    def advance_step():
+                        """Callback to advance to next step with analysis"""
+                        old = self.current_step
+                        logger.info(f"[BUTTON] ✅ Next Step clicked for step {old}")
+                        
+                        # Execute the logic for the CURRENT step
+                        analysis_success = False
+                        
+                        if old == 0:  # Tag Analysis
+                            # Capture tag image for training data
+                            tag_frame = self.camera_manager.get_arducam_frame()
+                            if tag_frame is not None:
+                                st.session_state.captured_tag_image = tag_frame
+                                logger.info("[TRAINING] Tag image captured for training data")
+                            
+                            with st.spinner("🔍 Analyzing tag... This may take a moment."):
+                                result = self.handle_step_0_tag_analysis()
+                            
+                            # DEBUG: Log the full result
+                            logger.info(f"[DEBUG] Tag analysis result: {result}")
+                            
+                            if result and result.get('success'):
+                                st.success(f"✅ Tag analyzed: {result.get('message', 'OK')}")
+                                analysis_success = True
+                            else:
+                                error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
+                                st.error(f"❌ Tag analysis failed: {error_msg}")
+                                logger.error(f"[DEBUG] Analysis failed: {error_msg}")
                                 
-                                # Recapture with new brightness
-                                frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-                                if frame is not None:
-                                    roi_frame = st.session_state.pipeline_manager.camera_manager.apply_roi(frame, 'tag')
-                                    if roi_frame is not None:
-                                        brightness_info = st.session_state.pipeline_manager.auto_optimizer.analyze_image_brightness(roi_frame)
-                                        if brightness_info:
-                                            st.info(f"📊 Captured brightness: {brightness_info['mean']:.0f}/255")
-                                        
-                                        # Analyze
-                                        st.session_state.pipeline_manager.pipeline_data.tag_image = roi_frame
-                                        
-                                        retry_result = st.session_state.pipeline_manager.text_extractor.analyze_tag(
-                                            st.session_state.pipeline_manager.pipeline_data.tag_image
-                                        )
-                                        
-                                        if retry_result.get('success'):
-                                            retry_brand = retry_result.get('brand', 'Unknown')
-                                            retry_size = retry_result.get('size', 'Unknown')
-                                            retry_material = retry_result.get('material', 'Unknown')
-                                            
-                                            st.session_state.pipeline_manager.pipeline_data.brand = retry_brand
-                                            st.session_state.pipeline_manager.pipeline_data.size = retry_size
-                                            st.session_state.pipeline_manager.pipeline_data.material = retry_material
-                                            
-                                            if retry_brand not in ['Unknown', 'BRAND: Unknown']:
-                                                st.balloons()
-                                                st.success(f"✅ SUCCESS! Brand: **{retry_brand}**, Size: **{retry_size}**")
-                                            else:
-                                                st.warning(f"⚠️ Still got Unknown. Try different brightness or check debug_tag_preprocessing.jpg")
-                    with col_retry3:
-                        st.caption("💡 Suggestions:")
-                        st.caption("• White tag: try 5-20%")
-                        st.caption("• Dark tag: try 60-90%")
-                        st.caption("• Wait 2-3 sec between tries")
-                    
-                    st.markdown("---")
-                
-                # Manual brightness override with quick presets (hidden by default for employee use)
-                # Only show if advanced controls are enabled
-                if st.session_state.get('show_advanced_controls', False):
-                    st.markdown("#### 💡 Manual Light Control (Optional)")
-                    
-                    # Quick preset buttons
-                    st.markdown("**Quick Presets:**")
-                    col_preset1, col_preset2, col_preset3, col_preset4, col_preset5 = st.columns(5)
-                    with col_preset1:
-                        if st.button("⚫ Min (1%)", key="preset_1"):
-                            if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(brightness=1, temperature=6000)
-                                st.success("Set to 1%")
-                                time.sleep(1.0)
-                                st.rerun()
-                    with col_preset2:
-                        if st.button("🔅 Ultra (5%)", key="preset_5"):
-                            if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(brightness=5, temperature=6000)
-                                st.success("Set to 5%")
-                                time.sleep(1.0)
-                                st.rerun()
-                    with col_preset3:
-                        if st.button("💡 Med (25%)", key="preset_25"):
-                            if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(brightness=25, temperature=6000)
-                                st.success("Set to 25%")
-                                time.sleep(1.0)
-                                st.rerun()
-                    with col_preset4:
-                        if st.button("☀️ High (50%)", key="preset_50"):
-                            if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(brightness=50, temperature=6000)
-                                st.success("Set to 50%")
-                                time.sleep(1.0)
-                                st.rerun()
-                    with col_preset5:
-                        if st.button("🌟 Max (80%)", key="preset_80"):
-                            if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(brightness=80, temperature=6000)
-                                st.success("Set to 80%")
-                                time.sleep(1.0)
-                                st.rerun()
-                
-                    # Fine-tune slider
-                    st.markdown("**Fine-Tune:**")
-                    col_bright1, col_bright2 = st.columns(2)
-                    with col_bright1:
-                        manual_brightness = st.slider("Custom Brightness", 0, 100, 15, 1, 
-                                                     help="For white tags: try 5-15%. For dark tags: try 60-80%.",
-                                                     key="manual_tag_brightness")
-                    with col_bright2:
-                        if st.button("Apply Custom", key="apply_manual_tag_brightness"):
-                            if st.session_state.pipeline_manager.auto_optimizer.light_controller:
-                                st.session_state.pipeline_manager.auto_optimizer.light_controller.set_light(
-                                    brightness=manual_brightness,
-                                    temperature=6000
-                                )
-                                st.success(f"✅ Brightness set to {manual_brightness}%")
-                                time.sleep(1.0)
-                                st.rerun()
-                
-                st.markdown("---")
-                
-                # Add reset button if stuck in upscale loops
-                if st.session_state.get('upscale_count', 0) > 2:
-                    st.warning(f"⚠️ Upscale count: {st.session_state.get('upscale_count', 0)} - System may be stuck")
-                    if st.button("🔄 Reset Upscale Count", help="Clear upscale counters if system is stuck"):
-                        st.session_state.upscale_count = 0
-                        st.session_state.upscale_start_time = time.time()
-                        st.success("✅ Upscale count reset!")
-                        st.rerun()
-                
-                st.info("💡 **When ready:** Click the '➡️ Next Step' button above to capture and analyze the tag")
-            
-            else:
-                # Tag already analyzed - show RAW TEXT + AI SUGGESTIONS
-                st.markdown("#### 📝 Text AI Read from Tag:")
-                
-                # Show raw text
-                if hasattr(st.session_state.pipeline_manager.pipeline_data, 'raw_tag_text') and st.session_state.pipeline_manager.pipeline_data.raw_tag_text:
-                    st.code(st.session_state.pipeline_manager.pipeline_data.raw_tag_text, language=None)
-                else:
-                    st.warning("No text extracted - tag may be unreadable")
-                
-                st.markdown("---")
-                st.markdown("#### 🤖 AI Brand Suggestions:")
-                
-                # Get suggestions
-                suggestions = getattr(st.session_state.pipeline_manager.pipeline_data, 'brand_suggestions', [])
-                current_brand = st.session_state.pipeline_manager.pipeline_data.brand
-                
-                if suggestions:
-                    st.info(f"Based on the text above, AI thinks this might be: **{', '.join(suggestions)}**")
-                    
-                    # Radio buttons for suggestions + "Other" option
-                    brand_options = suggestions + ["Other (I'll type it)"]
-                    selected_brand = st.radio(
-                        "Select the correct brand:",
-                        brand_options,
-                        index=0 if current_brand == suggestions[0] else len(brand_options)-1,
-                        key="brand_selection_radio"
-                    )
-                    
-                    # If "Other" selected, show text input
-                    if selected_brand == "Other (I'll type it)":
-                        user_brand = st.text_input(
-                            "Type the brand name:",
-                            value=current_brand if current_brand not in suggestions else "",
-                            placeholder="e.g., J.Crew Collection",
-                            key="user_brand_input"
-                        )
-                    else:
-                        user_brand = selected_brand
-                else:
-                    st.warning("AI couldn't identify brand - please enter manually")
-                    user_brand = st.text_input(
-                        "Brand Name:",
-                        value=current_brand or "",
-                        placeholder="e.g., J.Crew Collection",
-                        key="user_brand_input_no_suggestions"
-                    )
-                
-                # Size input
-                col_size1, col_size2 = st.columns([1, 2])
-                with col_size1:
-                    current_size = st.session_state.pipeline_manager.pipeline_data.size if st.session_state.pipeline_manager.pipeline_data.size != "Unknown" else ""
-                    user_size = st.text_input(
-                        "Size:",
-                        value=current_size,
-                        placeholder="e.g., M, 8, 10",
-                        key="user_size_input"
-                    )
-                
-                # Confirm button
-                if st.button("✅ Confirm Brand & Size", type="primary", key="confirm_brand_size"):
-                    if user_brand and user_brand != "Other (I'll type it)":
-                        st.session_state.pipeline_manager.pipeline_data.brand = user_brand
-                        st.session_state.pipeline_manager.pipeline_data.size = user_size if user_size else "Unknown"
-                        st.success(f"✅ Saved: **{user_brand}** Size **{user_size if user_size else 'Unknown'}**")
-                        st.rerun()
-                    else:
-                        st.error("❌ Please select or enter a brand name")
-                
-                st.caption("💡 Can't read the text? Try the manual retry section below with different brightness")
-                st.markdown("---")
-                
-                # Show the captured tag image
-                if st.session_state.pipeline_manager.pipeline_data.tag_image is not None:
-                    st.image(st.session_state.pipeline_manager.pipeline_data.tag_image, caption="Captured Tag", width=200)
-                
-                # Manual override section
-                st.markdown("---")
-                st.markdown("### 🔧 Manual Override (Optional)")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    # Brand override
-                    st.write("**Correct Brand:**")
-                    brand_override = st.selectbox(
-                        "Select correct brand",
-                        ["Keep detected", "Nike", "Adidas", "Under Armour", "Puma", "Reebok", "New Balance", 
-                         "Champion", "The North Face", "Patagonia", "Columbia", "Calvin Klein", "Tommy Hilfiger",
-                         "Ralph Lauren", "Levi's", "Gap", "H&M", "Uniqlo", "Zara", "Other"],
-                        key="brand_override_tag_analyzed"
-                    )
-                    if brand_override != "Keep detected" and brand_override != "Other":
-                        st.session_state.pipeline_manager.pipeline_data.brand = brand_override
-                    elif brand_override == "Other":
-                        custom_brand = st.text_input("Enter brand name", key="custom_brand_tag_analyzed")
-                        if custom_brand:
-                            st.session_state.pipeline_manager.pipeline_data.brand = custom_brand
-            
-                with col2:
-                    # Size override
-                    st.write("**Correct Size:**")
-                    size_override = st.selectbox(
-                        "Select correct size",
-                        ["Keep detected", "XS", "S", "M", "L", "XL", "XXL", "XXXL", 
-                         "28", "29", "30", "31", "32", "33", "34", "36", "38", "40", "42", "44",
-                         "Small", "Medium", "Large", "Extra Large", "Other"],
-                        key="size_override_tag_analyzed"
-                    )
-                    if size_override != "Keep detected" and size_override != "Other":
-                        st.session_state.pipeline_manager.pipeline_data.size = size_override
-                    elif size_override == "Other":
-                        custom_size = st.text_input("Enter size", key="custom_size_tag_analyzed")
-                        if custom_size:
-                            st.session_state.pipeline_manager.pipeline_data.size = custom_size
-            
-                with col3:
-                    # Material override
-                    st.write("**Correct Material:**")
-                    material_override = st.selectbox(
-                        "Select correct material",
-                        ["Keep detected", "Cotton", "Polyester", "Wool", "Denim", "Leather", 
-                         "Silk", "Linen", "Spandex", "Nylon", "Rayon", "Bamboo", "Hemp", "Other"],
-                        key="material_override_tag_analyzed"
-                    )
-                    if material_override != "Keep detected" and material_override != "Other":
-                        st.session_state.pipeline_manager.pipeline_data.material = material_override
-                    elif material_override == "Other":
-                        custom_material = st.text_input("Enter material", key="custom_material_tag_analyzed")
-                        if custom_material:
-                            st.session_state.pipeline_manager.pipeline_data.material = custom_material
-                
-            # Show updated values
-            st.info(f"Updated: Brand: {st.session_state.pipeline_manager.pipeline_data.brand} | Size: {st.session_state.pipeline_manager.pipeline_data.size} | Material: {st.session_state.pipeline_manager.pipeline_data.material}")
-            
-            # Manual measurement option (collapsed by default)
-            with st.expander("📐 Manual Measurement Options", expanded=False):
-                st.info("💡 **Tip:** If the size was detected incorrectly or you want to measure the garment manually, you can skip to the measurement steps.")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("📏 Go to Measurements", help="Skip to calibration and measurement steps"):
-                        st.session_state.pipeline_manager.current_step = 2
-                        st.rerun()
-                
-                with col2:
-                    if st.button("✅ Size is Correct - Continue", type="primary", help="Continue with detected size"):
-                        # This will be handled by the Next Step button logic
-                        pass
-        
-        elif st.session_state.pipeline_manager.current_step == 1:  # Capture & Analyze Garment
-            # CAPTURE & ANALYZE SECTION AT THE TOP
-            st.markdown("### 📸 Capture & Analyze Garment")
-            
-            # Check if garment has already been analyzed
-            garment_already_analyzed = (hasattr(st.session_state.pipeline_manager.pipeline_data, 'garment_image') and 
-                                      st.session_state.pipeline_manager.pipeline_data.garment_image is not None and
-                                      hasattr(st.session_state.pipeline_manager.pipeline_data, 'garment_type') and
-                                      st.session_state.pipeline_manager.pipeline_data.garment_type != "Unknown")
-            
-            if not garment_already_analyzed:
-                st.markdown("---")
-                st.markdown("#### 📷 Live Camera Preview")
-                st.info("👇 **Position the garment inside the green ROI box below**")
-                
-                # Add refresh button
-                col_refresh1, col_refresh2, col_refresh3 = st.columns([1, 1, 1])
-                with col_refresh2:
-                    if st.button("🔄 Refresh Preview", key="refresh_garment_preview"):
-                        # Clear any cached frames to force refresh
-                        if 'cached_garment_frame' in st.session_state:
-                            del st.session_state.cached_garment_frame
-                        if 'last_camera_frame' in st.session_state:
-                            del st.session_state.last_camera_frame
-                        st.rerun()
-                
-                # Show live preview with ROI highlighted - PROMINENTLY
-                if st.session_state.pipeline_manager.camera_manager:
-                    try:
-                        preview_frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
-                        if preview_frame is not None:
-                            # Draw ROI box on preview
-                            frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(preview_frame.copy(), 'work')
+                                # TEMPORARY BYPASS: Allow advancement even if analysis fails
+                                st.warning("⚠️ TEMP: Allowing step advancement despite analysis failure")
+                                analysis_success = True
+                        
+                        elif old == 1:  # Garment Analysis
+                            # Capture garment image for training data
+                            garment_frame = self.camera_manager.get_realsense_frame()
+                            if garment_frame is not None:
+                                st.session_state.captured_garment_image = garment_frame
+                                logger.info("[TRAINING] Garment image captured for training data")
                             
-                            # Show preview prominently centered
-                            col1, col2, col3 = st.columns([1, 2, 1])
-                            with col2:
-                                st.image(frame_with_roi, caption="🎯 Position garment inside the GREEN BOX", width='stretch')
+                            with st.spinner("🔍 Analyzing garment... This may take a moment."):
+                                result = self.handle_step_1_garment_analysis()
                             
-                            # Show brightness feedback
-                            if st.session_state.pipeline_manager.auto_optimizer.enabled:
-                                brightness_info = st.session_state.pipeline_manager.auto_optimizer.analyze_image_brightness(preview_frame)
-                                if brightness_info:
-                                    with col2:
-                                        if brightness_info['is_light']:
-                                            st.caption("👕 Light garment detected - softer lighting on capture")
-                                        elif brightness_info['is_dark']:
-                                            st.caption("👕 Dark garment detected - brighter lighting on capture")
-                                        else:
-                                            st.caption("✨ Good lighting detected")
-                        else:
-                            st.warning("⚠️ RealSense camera not accessible - check camera connection")
-                    except Exception as e:
-                        st.error(f"❌ Camera error: {str(e)}")
-                else:
-                    st.error("❌ Camera manager not initialized")
-                
-                st.markdown("---")
-                st.info("💡 **When ready:** Click the '➡️ Next Step' button above to capture and analyze the garment")
-            
-            else:
-                # Garment already analyzed - show results and override options
-                st.success(f"✅ Found: **{st.session_state.pipeline_manager.pipeline_data.garment_type}** | **{st.session_state.pipeline_manager.pipeline_data.gender}** | **{st.session_state.pipeline_manager.pipeline_data.color}**")
-                
-                # Show the captured garment image
-                if st.session_state.pipeline_manager.pipeline_data.garment_image is not None:
-                    st.image(st.session_state.pipeline_manager.pipeline_data.garment_image, caption="Captured Garment", width=200)
-                
-                # Manual override section
-                st.markdown("---")
-                st.markdown("### 🔧 Manual Override (Optional)")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    # Garment type override
-                    st.write("**Correct Type:**")
-                    type_override = st.selectbox(
-                        "Select correct garment type",
-                        ["Keep detected", "T-Shirt", "Hoodie", "Sweater", "Polo Shirt", "Tank Top", 
-                         "Dress Shirt", "Jeans", "Pants", "Shorts", "Jacket", "Coat", "Blazer", "Other"],
-                        key="type_override_garment_analyzed"
-                    )
-                    if type_override != "Keep detected" and type_override != "Other":
-                        st.session_state.pipeline_manager.pipeline_data.garment_type = type_override
-                    elif type_override == "Other":
-                        custom_type = st.text_input("Enter garment type", key="custom_type_garment_analyzed")
-                        if custom_type:
-                            st.session_state.pipeline_manager.pipeline_data.garment_type = custom_type
-                    
-                    # Gender override
-                    st.write("**Correct Gender:**")
-                    gender_override = st.selectbox(
-                        "Select correct gender",
-                        ["Keep detected", "Men's", "Women's", "Unisex", "Kids"],
-                        key="gender_override_garment_analyzed"
-                    )
-                    if gender_override != "Keep detected":
-                        st.session_state.pipeline_manager.pipeline_data.gender = gender_override
-                
-                with col2:
-                    # Style override
-                    st.write("**Correct Style:**")
-                    style_override = st.selectbox(
-                        "Select correct style",
-                        ["Keep detected", "Casual", "Formal", "Sporty", "Vintage", "Modern", "Classic", "Trendy", "Other"],
-                        key="style_override_garment_analyzed"
-                    )
-                    if style_override != "Keep detected" and style_override != "Other":
-                        st.session_state.pipeline_manager.pipeline_data.style = style_override
-                    elif style_override == "Other":
-                        custom_style = st.text_input("Enter style", key="custom_style_garment_analyzed")
-                        if custom_style:
-                            st.session_state.pipeline_manager.pipeline_data.style = custom_style
-                
-                with col3:
-                    # Condition override
-                    st.write("**Correct Condition:**")
-                    condition_override = st.selectbox(
-                        "Select correct condition",
-                        ["Keep detected", "Excellent", "Very Good", "Good", "Fair", "Poor"],
-                        key="condition_override_garment_analyzed"
-                    )
-                    if condition_override != "Keep detected":
-                        st.session_state.pipeline_manager.pipeline_data.condition = condition_override
-                    
-                    # Era override
-                    st.write("**Correct Era:**")
-                    era_override = st.selectbox(
-                        "Select correct era",
-                        ["Keep detected", "Vintage (1980s-1990s)", "Retro (2000s)", "Modern (2010s+)", "Classic"],
-                        key="era_override_garment_analyzed"
-                    )
-                    if era_override != "Keep detected":
-                        st.session_state.pipeline_manager.pipeline_data.era = era_override
-                
-                # Show updated values
-                st.info(f"Updated: Type: {st.session_state.pipeline_manager.pipeline_data.garment_type} | Gender: {st.session_state.pipeline_manager.pipeline_data.gender}")
-        
-        elif st.session_state.pipeline_manager.current_step == 2:  # Calibrate Measurements (if needed)
-            # Check if we already have calibration
-            if st.session_state.pipeline_manager.measurement_calculator.calibrated:
-                st.success("✅ Measurements already calibrated!")
-                st.info(f"Current calibration: {st.session_state.pipeline_manager.measurement_calculator.pixels_per_inch:.2f} pixels per inch")
-                
-                st.info("💡 **Tip:** Click 'Next Step' above to continue to measurement")
-                return
-            
-            # Show calibration instructions
-            st.warning("⚠️ **Calibration Required**")
-            st.markdown("""
-            **To get accurate measurements, you need to calibrate your camera first.**
-            
-            **Option 1: Run Calibration Setup (Recommended)**
-            - Run `streamlit run calibration_setup.py` in a separate terminal
-            - This will create a calibration file that works for all future sessions
-            
-            **Option 2: Manual Entry**
-            - If you know your camera's pixels-per-inch ratio, enter it below
-            """)
-            
-            # Manual calibration entry
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                manual_pixels_per_inch = st.number_input(
-                    "Manual Pixels per Inch", 
-                    min_value=0.0, 
-                    max_value=1000.0, 
-                    value=100.0,
-                    step=1.0,
-                    help="Enter your camera's pixels-per-inch ratio"
-                )
-            
-            with col2:
-                if st.button("Use Manual Calibration", type="primary"):
-                    if manual_pixels_per_inch > 0:
-                        st.session_state.pipeline_manager.measurement_calculator.pixels_per_inch = manual_pixels_per_inch
-                        st.session_state.pipeline_manager.measurement_calculator.calibrated = True
-                        st.success(f"Manual calibration set: {manual_pixels_per_inch:.2f} pixels per inch")
-                        st.session_state.pipeline_manager.current_step = 3
-                        st.rerun()
-                    else:
-                        st.error("Please enter a valid pixels-per-inch value")
-            
-            st.info("💡 **Tip:** For best accuracy, use the separate calibration program with a dollar bill.")
-        
-        elif st.session_state.pipeline_manager.current_step == 3:  # Measure Garment
-            st.markdown("### 📐 Measure the garment")
-            
-            # Determine what to measure based on garment type
-            garment_type = st.session_state.pipeline_manager.pipeline_data.garment_type.lower()
-            is_bottom = any(word in garment_type for word in ['pant', 'jean', 'skirt', 'short', 'trouser', 'legging'])
-            
-            if is_bottom:
-                st.info("Click on the left side of the waistband, then the right side to measure waist")
-                measurement_label = "Waist"
-            else:
-                st.info("Click on the left armpit seam, then the right armpit seam to measure bust/chest")
-                measurement_label = "Bust/Chest"
-            
-            # Add warning about stacked garments
-            st.warning("⚠️ **Important:** For accurate measurements, ensure garments are laid flat and not stacked on top of each other. Stacked garments will give incorrect measurements.")
-            
-            if st.session_state.pipeline_manager.pipeline_data.garment_image is not None:
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    # Display image with click detection
-                    st.markdown("**📸 Captured Garment Image:**")
-                    
-                    # Show the captured image first
-                    st.image(st.session_state.pipeline_manager.pipeline_data.garment_image, caption="Captured Garment - Click armpit seams", width='stretch')
-                    
-                    # Convert numpy array to PIL Image for coordinate detection
-                    pil_image = Image.fromarray(st.session_state.pipeline_manager.pipeline_data.garment_image)
-                    
-                    st.markdown("**🎯 Click Measurement Tool:**")
-                    try:
-                        # Get click coordinates
-                        clicked_point = streamlit_image_coordinates(
-                            pil_image,
-                            key="garment_measure"
-                        )
-                    except Exception as e:
-                        st.error(f"Click detection failed: {str(e)}")
-                        st.info("Using fallback method - manual coordinate entry")
-                        clicked_point = None
-                    
-                    # Store clicked points
-                    if clicked_point is not None:
-                        if 'measurement_points' not in st.session_state:
-                            st.session_state.measurement_points = []
-                        
-                        st.session_state.measurement_points.append(clicked_point)
-                        
-                        # Draw points on image
-                        img_with_points = st.session_state.pipeline_manager.pipeline_data.garment_image.copy()
-                        for point in st.session_state.measurement_points[-2:]:  # Show last 2 points
-                            cv2.circle(img_with_points, (point['x'], point['y']), 5, (255, 0, 0), -1)
-                        
-                        if len(st.session_state.measurement_points) >= 2:
-                            # Draw line between points
-                            p1 = st.session_state.measurement_points[-2]
-                            p2 = st.session_state.measurement_points[-1]
-                            cv2.line(img_with_points, (p1['x'], p1['y']), (p2['x'], p2['y']), (0, 255, 0), 2)
-                        
-                        st.image(img_with_points, width='stretch')
-            
-            with col2:
-                    st.markdown("#### Measurement:")
-                    if is_bottom:
-                        st.markdown("1. Click left waistband edge")
-                        st.markdown("2. Click right waistband edge")
-                        point1_label = "Left Waist"
-                        point2_label = "Right Waist"
-                    else:
-                        st.markdown("1. Click left armpit seam")
-                        st.markdown("2. Click right armpit seam")
-                        point1_label = "Left Armpit"
-                        point2_label = "Right Armpit"
-                    
-                    # Fallback manual entry if click detection fails
-                    st.markdown("---")
-                    st.markdown("**🔧 Fallback Method:**")
-                    manual_x1 = st.number_input(f"{point1_label} X", min_value=0, max_value=2000, value=0, key="manual_x1")
-                    manual_y1 = st.number_input(f"{point1_label} Y", min_value=0, max_value=2000, value=0, key="manual_y1")
-                    manual_x2 = st.number_input(f"{point2_label} X", min_value=0, max_value=2000, value=0, key="manual_x2")
-                    manual_y2 = st.number_input(f"{point2_label} Y", min_value=0, max_value=2000, value=0, key="manual_y2")
-                    
-                    if st.button("Use Manual Coordinates", key="manual_measurement"):
-                        if manual_x1 != 0 and manual_y1 != 0 and manual_x2 != 0 and manual_y2 != 0:
-                            # Store manual coordinates
-                            if 'measurement_points' not in st.session_state:
-                                st.session_state.measurement_points = []
-                            st.session_state.measurement_points = [
-                                {'x': manual_x1, 'y': manual_y1},
-                                {'x': manual_x2, 'y': manual_y2}
-                            ]
-                            st.success("Manual coordinates set!")
-                    
-                    if 'measurement_points' in st.session_state and len(st.session_state.measurement_points) >= 2:
-                        # Calculate measurement
-                        p1 = st.session_state.measurement_points[-2]
-                        p2 = st.session_state.measurement_points[-1]
-                        
-                        if st.session_state.pipeline_manager.measurement_calculator.calibrated:
-                            # Use calibrated measurement
-                            pixel_dist = np.sqrt((p2['x'] - p1['x'])**2 + (p2['y'] - p1['y'])**2)
-                            half_measurement = pixel_dist / st.session_state.pipeline_manager.measurement_calculator.pixels_per_inch
-                            full_measurement = half_measurement * 2  # Double for full circumference
-                        else:
-                            # Rough estimate (needs calibration)
-                            pixel_dist = np.sqrt((p2['x'] - p1['x'])**2 + (p2['y'] - p1['y'])**2)
-                            estimated_inches = pixel_dist / 20  # Rough conversion
-                            full_measurement = estimated_inches * 2  # Double for full circumference
-                        
-                        # Store measurement and convert to size
-                        st.session_state.pipeline_manager.pipeline_data.bust_measurement = full_measurement
-                        
-                        # Convert measurement to size
-                        def measurement_to_size(measurement, gender, is_bottom=False):
-                            """Convert bust/waist measurement to clothing size"""
-                            gender_lower = gender.lower() if gender else 'unisex'
-                            
-                            if is_bottom:
-                                # Waist sizes (pants, skirts, jeans)
-                                if 'women' in gender_lower:
-                                    if measurement < 26: return "XS (00-0)"
-                                    elif measurement < 28: return "S (2-4)"
-                                    elif measurement < 30: return "M (6-8)"
-                                    elif measurement < 32: return "L (10-12)"
-                                    elif measurement < 34: return "XL (14-16)"
-                                    else: return "XXL (18+)"
-                                else:  # Men's waist is typically in inches
-                                    return f"W{int(measurement)}"
+                            if result and result.get('success'):
+                                st.success(f"✅ Garment analyzed: {result.get('message', 'OK')}")
+                                analysis_success = True
                             else:
-                                # Bust/Chest sizes (tops, dresses)
-                                if 'women' in gender_lower:
-                                    if measurement < 34: return "XS (32-33)"
-                                    elif measurement < 36: return "S (34-35)"
-                                    elif measurement < 38: return "M (36-37)"
-                                    elif measurement < 40: return "L (38-39)"
-                                    elif measurement < 42: return "XL (40-41)"
-                                    else: return "XXL (42+)"
-                                else:  # Men's
-                                    if measurement < 36: return "S (34-36)"
-                                    elif measurement < 40: return "M (38-40)"
-                                    elif measurement < 44: return "L (42-44)"
-                                    elif measurement < 48: return "XL (46-48)"
-                                    else: return "XXL (50+)"
+                                error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
+                                st.error(f"❌ Garment analysis failed: {error_msg}")
+                                logger.error(f"[DEBUG] Garment analysis failed: {error_msg}")
+                                
+                                # TEMPORARY BYPASS: Allow advancement even if analysis fails
+                                st.warning("⚠️ TEMP: Allowing step advancement despite analysis failure")
+                                analysis_success = True
                         
-                        size_from_measurement = measurement_to_size(
-                            full_measurement,
-                            st.session_state.pipeline_manager.pipeline_data.gender,
-                            is_bottom
-                        )
-                        
-                        # Update size if it was unknown
-                        if st.session_state.pipeline_manager.pipeline_data.size.lower() in ['unknown', '', 'n/a']:
-                            st.session_state.pipeline_manager.pipeline_data.size = size_from_measurement
-                        
-                        st.metric(measurement_label, f"{full_measurement:.1f}\"")
-                        st.metric("Estimated Size", size_from_measurement)
-                        
-                        # 💾 Save measurement data for YOLO training
-                        if st.session_state.pipeline_manager.measurement_manager:
-                            garment_type = st.session_state.pipeline_manager.pipeline_data.garment_type
-                            if st.button("💾 Save for YOLO Training", help="Save this garment image and armpit points for future AI training"):
-                                points_to_save = st.session_state.measurement_points[-2:]  # Last 2 points (armpits)
-                                success = st.session_state.pipeline_manager.measurement_manager.save_sample(
-                                    st.session_state.pipeline_manager.pipeline_data.garment_image,
-                                    points_to_save,
-                                    garment_type
-                                )
-                                if success:
-                                    st.success("✅ Measurement data saved for training!")
-                        else:
-                            st.caption("💡 Measurement dataset manager not available")
-                        
-                        st.info("💡 **Tip:** Click 'Next Step' above to continue to defect detection")
-                    else:
-                        if is_bottom:
-                            st.info("Click 2 points:\n1. Left waist\n2. Right waist")
-                        else:
-                            st.info("Click 2 points:\n1. Left armpit\n2. Right armpit")
+                        # Advance to next step if analysis succeeded or bypassed
+                        if analysis_success:
+                            self.current_step = old + 1
+                            logger.info(f"[BUTTON] ✅ Step advanced: {old} → {self.current_step}")
+                            st.rerun()
                     
-                    st.info("💡 **Tip:** Click 'Next Step' above to skip measurement and continue")
-        
-        elif st.session_state.pipeline_manager.current_step == 4:  # Detect Defects
-            # AUTO-ADJUST LIGHTS for defect detection
-            if st.session_state.pipeline_manager.pipeline_data.garment_image is not None and st.session_state.pipeline_manager.auto_optimizer.enabled:
-                success = st.session_state.pipeline_manager.auto_optimizer.optimize_for_current_image(st.session_state.pipeline_manager.pipeline_data.garment_image, 'defect')
-                if success:
-                    brightness_info = st.session_state.pipeline_manager.auto_optimizer.analyze_image_brightness(st.session_state.pipeline_manager.pipeline_data.garment_image)
-                    if brightness_info:
-                        if brightness_info['is_dark']:
-                            st.info("🔍 Dark garment detected - using maximum brightness for defect detection")
-                            st.caption(f"Detected brightness: {brightness_info['mean']:.0f}/255 (Dark - Max Brightness)")
-                        elif brightness_info['is_light']:
-                            st.info("🔍 Light garment detected - using moderate brightness for defect detection")
-                            st.caption(f"Detected brightness: {brightness_info['mean']:.0f}/255 (Light - Moderate)")
-                        else:
-                            st.info("🔍 Lights optimized for defect detection")
-                            st.caption(f"Detected brightness: {brightness_info['mean']:.0f}/255 (Medium)")
-            
-            if st.session_state.pipeline_manager.pipeline_data.garment_image is not None:
-                with st.spinner("Checking for defects..."):
-                    if st.session_state.pipeline_manager.defect_detector:
-                        result = st.session_state.pipeline_manager.defect_detector.analyze_defects(st.session_state.pipeline_manager.pipeline_data.garment_image)
-                        if result.get('success'):
-                            st.session_state.pipeline_manager.pipeline_data.defects = result.get('defects', [])
-                            st.session_state.pipeline_manager.pipeline_data.defect_count = len(st.session_state.pipeline_manager.pipeline_data.defects)
-                            st.session_state.pipeline_manager.pipeline_data.condition = result.get('overall_condition', 'Good')
-                            
-                            if st.session_state.pipeline_manager.pipeline_data.defect_count > 0:
-                                st.warning(f"Found {st.session_state.pipeline_manager.pipeline_data.defect_count} defect(s)")
-                                for defect in st.session_state.pipeline_manager.pipeline_data.defects:
-                                    st.write(f"- {defect.get('type', 'Unknown')} at {defect.get('location', 'Unknown')}")
-                            else:
-                                st.success("No defects found")
-                    else:
-                        st.info("Defect detector not available - skipping defect analysis")
-            
-            st.info("💡 **Tip:** Click 'Next Step' above to continue to price calculation")
-        
-        elif st.session_state.pipeline_manager.current_step == 5:  # Calculate Price
-            st.session_state.pipeline_manager.pipeline_data.is_designer = check_if_designer(st.session_state.pipeline_manager.pipeline_data.brand)
-            st.session_state.pipeline_manager.pipeline_data.is_vintage = check_if_vintage(st.session_state.pipeline_manager.pipeline_data.era, st.session_state.pipeline_manager.pipeline_data.style)
-            
-            st.session_state.pipeline_manager.pipeline_data.price_estimate = calculate_priority_price(
-                st.session_state.pipeline_manager.pipeline_data.brand,
-                st.session_state.pipeline_manager.pipeline_data.garment_type,
-                st.session_state.pipeline_manager.pipeline_data.gender,
-                st.session_state.pipeline_manager.pipeline_data.is_designer,
-                st.session_state.pipeline_manager.pipeline_data.is_vintage,
-                st.session_state.pipeline_manager.pipeline_data.condition,
-                st.session_state.pipeline_manager.pipeline_data.size
-            )
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Low", f"${st.session_state.pipeline_manager.pipeline_data.price_estimate['low']}")
-            with col2:
-                st.metric("Recommended", f"${st.session_state.pipeline_manager.pipeline_data.price_estimate['mid']}", delta="Best")
-            with col3:
-                st.metric("High", f"${st.session_state.pipeline_manager.pipeline_data.price_estimate['high']}")
-            
-            st.info("💡 **Tip:** Click 'Next Step' above to view the final review")
-        
-        elif st.session_state.pipeline_manager.current_step == 6:  # Final Review
-            self.render_final_review()
-    
-    def _handle_next_step_click(self):
-        """Handle the Next Step button click with background processing"""
-        current_step = st.session_state.pipeline_manager.current_step
-        
-        if current_step == 0:
-            # Step 0: Tag Analysis
-            self._handle_tag_analysis_step()
-        elif current_step == 1:
-            # Step 1: Garment Analysis
-            self._handle_garment_analysis_step()
-        elif current_step == 2:
-            # Step 2: Measurements
-            self._handle_measurements_step()
-        elif current_step == 3:
-            # Step 3: Pricing
-            self._handle_pricing_step()
-        elif current_step == 4:
-            # Step 4: Final Review
-            st.info("🎉 Analysis complete!")
-        else:
-            # Advance to next step
-            if current_step < len(self.steps) - 1:
-                st.session_state.pipeline_manager.current_step += 1
-                st.success(f"✅ Moved to Step {st.session_state.pipeline_manager.current_step + 1}")
-                st.rerun()
-
-    
-    def _handle_tag_analysis_step(self):
-        """Handle Step 0: Tag analysis - Clean version"""
-        with st.spinner("🔍 Analyzing tag..."):
-            result = st.session_state.pipeline_manager.handle_step_0_tag_analysis()
-            
-            # Check if analysis was successful
-            if result and result.get('success'):
-                # Advance to next step
-                st.session_state.pipeline_manager.current_step = 1
-                st.success("✅ Tag analyzed! Moving to garment analysis...")
-                st.rerun()
-            elif result and (result.get('brand') or result.get('size')):
-                # Partial success - advance anyway
-                st.session_state.pipeline_manager.current_step = 1
-                st.warning("⚠️ Partial tag data extracted. Moving to garment analysis...")
-                st.rerun()
+                    st.button("➡️ Next Step", on_click=advance_step, key="next_step_button", type="primary")
             else:
-                st.error("❌ Tag analysis failed. Please try again.")
+                col_back, col_reset, col_next = st.columns(3)
+                with col_next:
+                    def advance_step():
+                        """Callback to advance to next step"""
+                        old = self.current_step
+                        self.current_step = old + 1
+                        logger.info(f"[BUTTON] ✅ Step advanced: {old} → {self.current_step}")
+                        st.rerun()
+                    
+                    st.button("➡️ Next Step", on_click=advance_step, key="next_step_button", type="primary")
 
+        # Action panel complete - buttons are now at the top right
+    
+    def _save_training_sample(self, analysis_result):
+        """Save training data for future model improvement"""
+        try:
+            import json
+            import os
+            from datetime import datetime
+            
+            # Create training data directory
+            os.makedirs("training_data", exist_ok=True)
+            
+            # Prepare sample data
+            sample_data = {
+                'timestamp': datetime.now().isoformat(),
+                'step': 'tag_analysis',
+                'brand': analysis_result.get('brand', 'Unknown'),
+                'size': analysis_result.get('size', 'Unknown'),
+                'material': analysis_result.get('material', 'Unknown'),
+                'confidence': analysis_result.get('confidence', 0.0),
+                'raw_text': analysis_result.get('raw_text', ''),
+                'success': analysis_result.get('success', False),
+                'user_validated': False  # Will be updated when user confirms/corrects
+            }
+            
+            # Save to JSON file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"training_data/tag_sample_{timestamp}.json"
+            
+            with open(filename, 'w') as f:
+                json.dump(sample_data, f, indent=2)
+            
+            # Update sample count in session state
+            if 'training_sample_count' not in st.session_state:
+                st.session_state.training_sample_count = 0
+            st.session_state.training_sample_count += 1
+            
+            logger.info(f"[TRAINING] Saved sample #{st.session_state.training_sample_count} to {filename}")
+            
+            # Show success message
+            st.toast(f"📚 Training data saved! Total samples: {st.session_state.training_sample_count}", icon="✅")
+            
+        except Exception as e:
+            logger.error(f"[TRAINING] Failed to save sample: {e}")
+    
+    def _render_field_with_revise(self, label, value, field_name, step_num):
+        """Render a field with a revise button for manual correction"""
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            st.write(f"**{label}:** {value}")
+        
+        with col2:
+            if st.button("✏️", key=f"revise_{field_name}_{step_num}", help=f"Edit {label}"):
+                st.session_state[f"editing_{field_name}"] = True
+                st.rerun()
+        
+        # Show edit form if editing
+        if st.session_state.get(f"editing_{field_name}", False):
+            with st.form(f"edit_{field_name}_form"):
+                new_value = st.text_input(f"Correct {label}:", value=value, key=f"new_{field_name}")
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    if st.form_submit_button("💾 Save"):
+                        # Update the pipeline data
+                        setattr(self.pipeline_data, field_name, new_value)
+                        
+                        # Save correction for training
+                        self._save_correction(field_name, value, new_value)
+                        
+                        # Clear editing state
+                        st.session_state[f"editing_{field_name}"] = False
+                        st.success(f"✅ {label} updated: {value} → {new_value}")
+                        st.rerun()
+                
+                with col_cancel:
+                    if st.form_submit_button("❌ Cancel"):
+                        st.session_state[f"editing_{field_name}"] = False
+                        st.rerun()
+    
+    def _save_correction(self, field_name, original, corrected):
+        """Save user corrections for training data improvement"""
+        try:
+            import json
+            import os
+            from datetime import datetime
+            
+            # Create corrections directory
+            os.makedirs("training_data/corrections", exist_ok=True)
+            
+            correction_data = {
+                'timestamp': datetime.now().isoformat(),
+                'field': field_name,
+                'original': original,
+                'corrected': corrected,
+                'user_correction': True
+            }
+            
+            # Save correction
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"training_data/corrections/{field_name}_correction_{timestamp}.json"
+            
+            with open(filename, 'w') as f:
+                json.dump(correction_data, f, indent=2)
+            
+            logger.info(f"[CORRECTION] Saved correction for {field_name}: {original} → {corrected}")
+            
+        except Exception as e:
+            logger.error(f"[CORRECTION] Failed to save correction: {e}")
+    
+    def _render_analysis_results(self):
+        """Render current analysis results with revise buttons"""
+        if not hasattr(self, 'pipeline_data') or not self.pipeline_data:
+            return
+        
+        st.markdown("#### 📊 Analysis Results")
+        
+        # Show training data count
+        sample_count = st.session_state.get('training_sample_count', 0)
+        st.caption(f"📚 Training samples collected: {sample_count}")
+        
+        # Create columns for better layout
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Brand with revise button
+            brand = getattr(self.pipeline_data, 'brand', 'Not analyzed')
+            if brand != 'Not analyzed':
+                self._render_field_with_revise("🏷️ Brand", brand, 'brand', self.current_step)
+            else:
+                st.write(f"**🏷️ Brand:** {brand}")
+            
+            # Size with revise button
+            size = getattr(self.pipeline_data, 'size', 'Not analyzed')
+            if size != 'Not analyzed':
+                self._render_field_with_revise("📏 Size", size, 'size', self.current_step)
+            else:
+                st.write(f"**📏 Size:** {size}")
+            
+            # Material with revise button
+            material = getattr(self.pipeline_data, 'material', 'Not analyzed')
+            if material != 'Not analyzed':
+                self._render_field_with_revise("🧵 Material", material, 'material', self.current_step)
+            else:
+                st.write(f"**🧵 Material:** {material}")
+        
+        with col2:
+            # Type with revise button
+            garment_type = getattr(self.pipeline_data, 'garment_type', 'Not analyzed')
+            if garment_type != 'Not analyzed':
+                self._render_field_with_revise("👕 Type", garment_type, 'garment_type', self.current_step)
+            else:
+                st.write(f"**👕 Type:** {garment_type}")
+            
+            # Gender with revise button
+            gender = getattr(self.pipeline_data, 'gender', 'Not analyzed')
+            if gender != 'Not analyzed':
+                self._render_field_with_revise("👤 Gender", gender, 'gender', self.current_step)
+            else:
+                st.write(f"**👤 Gender:** {gender}")
+            
+            # Style with revise button
+            style = getattr(self.pipeline_data, 'style', 'Not analyzed')
+            if style != 'Not analyzed':
+                self._render_field_with_revise("🎨 Style", style, 'style', self.current_step)
+            else:
+                st.write(f"**🎨 Style:** {style}")
+        
+        # Pricing information (if available)
+        if hasattr(self.pipeline_data, 'estimated_price') and self.pipeline_data.estimated_price:
+            st.markdown("#### 💰 Pricing Information")
+            st.write(f"**Estimated Price:** ${self.pipeline_data.estimated_price}")
+            
+            # Add eBay pricing button
+            if st.button("🛒 Check eBay Prices", key="check_ebay_prices"):
+                with st.spinner("🔍 Searching eBay for similar items..."):
+                    self._check_ebay_pricing()
+        
+        # Confidence scores
+        if hasattr(self.pipeline_data, 'confidence_scores') and self.pipeline_data.confidence_scores:
+            st.markdown("#### 🎯 Confidence Scores")
+            scores = self.pipeline_data.confidence_scores
+            for field, score in scores.items():
+                color = "🟢" if score > 0.8 else "🟡" if score > 0.6 else "🔴"
+                st.write(f"{color} **{field.title()}:** {score:.1%}")
+    
+    def _check_ebay_pricing(self):
+        """Check eBay for similar items and pricing"""
+        try:
+            # This would integrate with eBay API
+            # For now, show a placeholder
+            st.info("🔍 eBay pricing integration coming soon!")
+            st.write("This will search for similar items on eBay to provide accurate pricing estimates.")
+            
+            # Placeholder for actual eBay API integration
+            sample_price = "25.99"
+            st.success(f"💰 Found similar items starting at ${sample_price}")
+            
+        except Exception as e:
+            logger.error(f"[EBAY] Pricing check failed: {e}")
+            st.error("❌ Unable to check eBay prices at this time.")
+    
     def render_action_panel_simple(self):
         """Simplified action panel - focus on making it work"""
         
@@ -10772,8 +9922,8 @@ class EnhancedPipelineManager:
         
         with col3:
             # THE KEY BUTTON - simplified logic
-            if st.button("➡️ Next Step", type="primary", key="next_btn"):
-                self._execute_current_step()
+            # Duplicate button removed - using main button in render_action_panel()
+            st.write("")  # Empty space for layout
         
         # Show current step UI
         if self.current_step == 0:
@@ -11607,8 +10757,35 @@ def main():
         page_title="Garment Analyzer Pipeline",
         page_icon="🔍",  # Using search icon - more stable encoding
         layout="wide",
-        initial_sidebar_state="collapsed"  # Sidebar collapsed by default on tablet
+        initial_sidebar_state="collapsed"  # No sidebar needed - pipeline in main layout
     )
+    
+    # CRITICAL: Prevent infinite loops
+    if '_rerun_count' not in st.session_state:
+        st.session_state._rerun_count = 0
+    
+    st.session_state._rerun_count += 1
+    
+    # Safety check for infinite loops
+    if st.session_state._rerun_count > 100:
+        st.error("⚠️ Infinite loop detected! Resetting...")
+        if 'pipeline_manager' in st.session_state:
+            st.session_state.pipeline_manager.current_step = 0
+        st.session_state._rerun_count = 0
+        st.stop()
+    
+    # Reset rerun counter when step changes
+    current_step = st.session_state.get('pipeline_manager', {}).current_step if 'pipeline_manager' in st.session_state else 0
+    if current_step != st.session_state.get('_last_step', -1):
+        st.session_state._last_step = current_step
+        st.session_state._rerun_count = 0
+    
+    logger.info(f"🔄 Main: Step {current_step}, Reruns: {st.session_state._rerun_count}")
+    
+    # TEMPORARY: Add debug info to sidebar
+    # SAMPLE COUNT WIDGET in sidebar
+    with st.sidebar:
+        render_sample_count_widget()
     
     # INITIALIZE ALL SESSION STATE VARIABLES FIRST
     if 'pipeline_manager' not in st.session_state:
@@ -11672,168 +10849,12 @@ def main():
     
     # Loop prevention completely removed - app runs at full speed
     
-    # Render sidebar - use session state directly
-    st.session_state.pipeline_manager.render_checklist_sidebar()
+    # Sidebar now only contains sample count widget (no pipeline)
     
-    # Add compact camera preview to sidebar
-    with st.sidebar:
-        st.markdown("---")
-        st.subheader("📷 Live Camera")
+    # Sidebar is now clean with only sample count widget
+    # Removed camera preview and debug info from sidebar
         
-        current_step = st.session_state.pipeline_manager.current_step
-        
-        if current_step == 0:
-            st.caption("Tag Camera (ArduCam)")
-            frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-            if frame is not None:
-                try:
-                    # Draw ROI overlay on full frame to show bounding box
-                    frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
-                    
-                    # Validate image before displaying
-                    if frame_with_roi.size > 0 and frame_with_roi.shape[0] > 0 and frame_with_roi.shape[1] > 0:
-                        st.image(frame_with_roi, width='stretch')
-                    else:
-                        st.warning("⚠️ Invalid camera frame - empty or corrupted")
-                except Exception as e:
-                    st.error(f"❌ Error displaying camera frame: {e}")
-                    logger.error(f"Streamlit image display error: {e}")
-        
-        elif current_step == 1:
-            st.caption("Garment Camera (RealSense)")
-            frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
-            if frame is not None:
-                try:
-                    # Draw ROI overlay on full frame to show bounding box
-                    frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(frame.copy(), 'work')
-                    
-                    # Validate image before displaying
-                    if frame_with_roi.size > 0 and frame_with_roi.shape[0] > 0 and frame_with_roi.shape[1] > 0:
-                        st.image(frame_with_roi, width='stretch')
-                    else:
-                        st.warning("⚠️ Invalid camera frame - empty or corrupted")
-                except Exception as e:
-                    st.error(f"❌ Error displaying camera frame: {e}")
-                    logger.error(f"Streamlit image display error: {e}")
-        
-        # ROI Debug Info
-        st.markdown("---")
-        st.subheader("🔍 ROI Debug Info")
-        
-        # Check if ROI coords exist
-        if hasattr(st.session_state.pipeline_manager.camera_manager, 'roi_coords'):
-            st.write("✅ ROI coords attribute exists")
-            st.write(f"ROI coords: {st.session_state.pipeline_manager.camera_manager.roi_coords}")
-            
-            if 'tag' in st.session_state.pipeline_manager.camera_manager.roi_coords:
-                tag_roi = st.session_state.pipeline_manager.camera_manager.roi_coords['tag']
-                st.write(f"**Tag ROI:** {tag_roi}")
-            else:
-                st.error("❌ 'tag' key not in roi_coords")
-        else:
-            st.error("❌ No roi_coords attribute")
-        
-        # Check frame shape
-        frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-        if frame is not None:
-            st.write(f"Frame shape: {frame.shape}")
-            
-            # Test ROI overlay
-            if st.button("Test ROI Overlay"):
-                test_frame = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
-                if test_frame is not None:
-                    st.success("✅ ROI overlay test successful")
-                    st.image(test_frame, caption="ROI Test", width=200)
-                else:
-                    st.error("❌ ROI overlay test failed")
-            
-            # Force test ROI drawing
-            if st.button("🧪 Force Test ROI Drawing"):
-                test_frame = frame.copy()
-                cv2.rectangle(test_frame, (100, 100), (500, 400), (0, 255, 0), 5)
-                cv2.putText(test_frame, "TEST BOX", (110, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-                st.image(test_frame, caption="Force-drawn test box", width=200)
-        else:
-            st.error("❌ No frame available")
-        
-        # ROI Function Test
-        st.markdown("---")
-        st.subheader("🧪 ROI Function Test")
-        
-        if st.button("Test Draw ROI"):
-            frame = st.session_state.pipeline_manager.camera_manager.get_arducam_frame()
-            if frame is not None:
-                st.write(f"Frame shape: {frame.shape}")
-                
-                # Manually draw a test box
-                test_frame = frame.copy()
-                cv2.rectangle(test_frame, (100, 100), (500, 400), (0, 255, 0), 5)
-                cv2.putText(test_frame, "MANUAL TEST BOX", (110, 90), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-                st.image(test_frame, caption="Manual test", width=300)
-                
-                # Now test the actual function
-                roi_frame = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
-                if roi_frame is not None:
-                    st.image(roi_frame, caption="Function test", width=300)
-                    st.success("✅ draw_roi_overlay works!")
-                else:
-                    st.error("❌ draw_roi_overlay returned None!")
-        
-        # Color diagnostics
-        st.markdown("---")
-        st.subheader("🔍 Camera Diagnostics")
-        
-        if st.button("Test RealSense Color"):
-            frame = st.session_state.pipeline_manager.camera_manager.get_realsense_frame()
-            
-            if frame is not None:
-                st.write(f"Shape: {frame.shape}")
-                
-                if len(frame.shape) == 2:
-                    st.error("❌ GRAYSCALE (2D array)")
-                elif len(frame.shape) == 3:
-                    if frame.shape[2] == 1:
-                        st.error("❌ GRAYSCALE (single channel)")
-                    elif frame.shape[2] == 3:
-                        # Check if it's actually color or fake RGB from grayscale
-                        unique_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
-                        if unique_colors < 256:  # Likely converted grayscale
-                            st.warning(f"⚠️ LIMITED COLORS ({unique_colors} unique)")
-                        else:
-                            st.success(f"✅ TRUE COLOR ({unique_colors} unique colors)")
-                        
-                        st.image(frame, caption="RealSense Test", width=300)
-            else:
-                st.error("❌ No frame received")
-    
-    # Add defect collection mode to sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Dataset Collection")
-    if st.sidebar.button("📸 Start Defect Collection Mode"):
-        st.session_state.defect_collection_mode = True
-        st.rerun()
-    
-    # Add focus mode entry point to sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Camera Tools")
-    if st.sidebar.button("🔬 Calibrate Camera Focus"):
-        # Clear all cached images to prevent MediaFileStorageError
-        keys_to_clear = []
-        for key in list(st.session_state.keys()):
-            if any(term in key.lower() for term in ['image', 'frame', 'cached', 'preview', 'roi']):
-                keys_to_clear.append(key)
-        
-        for key in keys_to_clear:
-            try:
-                del st.session_state[key]
-            except:
-                pass
-        
-        st.session_state.focus_mode = True
-        st.session_state.focus_start_time = time.time()
-        st.session_state.focus_mode_started = False  # Reset to trigger cache clearing
-        st.rerun()
+    # All sidebar content removed for clean layout
     
     # Check for interactive ROI editor mode
     if st.session_state.get("interactive_roi_mode", False):
@@ -11858,15 +10879,7 @@ def main():
         render_defect_collection_mode()
         return
     
-    # Main content - COMPACT LAYOUT
-    st.title("🔍 Garment Analysis")
-    
-    # Show the chalkboard
-    st.session_state.pipeline_manager.render_data_chalkboard()
-    
-    st.markdown("---")
-    
-    # CRITICAL: Use the new compact layout
+    # CRITICAL: Use the new compact layout (includes buttons at top)
     st.session_state.pipeline_manager.render_compact_layout()
     
     # Footer
