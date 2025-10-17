@@ -7422,6 +7422,10 @@ class EnhancedPipelineManager:
         self.background_garment_result = None
         self.background_garment_error = None
         
+        # Initialize OpenAI client
+        self.openai_client = None
+        self._initialize_openai_client()
+        
         print("  - Steps initialized")
         
         # Use working light controller with fast discovery
@@ -7530,6 +7534,19 @@ class EnhancedPipelineManager:
         logger.info("[BACKGROUND-ANALYSIS] Background thread started")
         return True
     
+    def _initialize_openai_client(self):
+        """Initialize OpenAI client if API key is available"""
+        try:
+            api_key = os.getenv('OPENAI_API_KEY')
+            if api_key:
+                from openai import OpenAI
+                self.openai_client = OpenAI(api_key=api_key)
+                print("  - OpenAI client initialized")
+            else:
+                print("  - No OpenAI API key found")
+        except Exception as e:
+            print(f"  - OpenAI initialization failed: {e}")
+    
     def get_background_garment_result(self):
         """Get background garment analysis result if ready"""
         if self.background_garment_thread and not self.background_garment_thread.is_alive():
@@ -7582,32 +7599,14 @@ class EnhancedPipelineManager:
                 
                 # Convert international sizing to US
                 if raw_size and raw_size != 'Unknown':
-                    # Simplified size conversion - true to value for most cases
+                    # True to value sizing - no special conversions for now
                     if raw_size.isdigit():
                         size_num = int(raw_size)
                         
-                        # Special handling only for 0,1,2,3 sizes (CRUSH, James Perse, etc.)
-                        if size_num <= 3:
-                            # Convert small numeric sizes to letter sizes
-                            if self.pipeline_data.gender == 'men':
-                                if size_num == 0: us_size = "XXS"
-                                elif size_num == 1: us_size = "XS"
-                                elif size_num == 2: us_size = "S"
-                                elif size_num == 3: us_size = "M"
-                            else:  # women's
-                                if size_num == 0: us_size = "XXS"
-                                elif size_num == 1: us_size = "XS"
-                                elif size_num == 2: us_size = "S"
-                                elif size_num == 3: us_size = "M"
-                            
-                            self.pipeline_data.size = us_size
-                            self.pipeline_data.raw_size = f"Size {size_num}"
-                            logger.info(f"Small size converted: {size_num} -> {us_size}")
-                        else:
-                            # True to value for sizes 4 and above
-                            self.pipeline_data.size = str(size_num)
-                            self.pipeline_data.raw_size = f"Size {size_num}"
-                            logger.info(f"True to value size: {size_num}")
+                        # True to value for all numeric sizes
+                        self.pipeline_data.size = str(size_num)
+                        self.pipeline_data.raw_size = f"Size {size_num}"
+                        logger.info(f"True to value size: {size_num}")
                     else:
                         # Try standard conversion for non-numeric sizes
                         converted_size = convert_size_to_us(
@@ -7907,6 +7906,7 @@ class EnhancedPipelineManager:
             
             # Use combined analysis (garment + defects in one call)
             if hasattr(self, 'openai_client') and self.openai_client:
+                logger.info("[GARMENT-ANALYSIS] Starting combined analysis with GPT-4o...")
                 result = self.analyze_garment_comprehensive_with_retry(
                     roi_image, 
                     self.pipeline_data, 
@@ -7918,8 +7918,13 @@ class EnhancedPipelineManager:
                            f"Condition: {self.pipeline_data.condition}, "
                            f"Defects: {len(self.pipeline_data.defects)}")
                 
-                return {'success': True, 'message': 'Combined analysis complete'}
+                # Verify the analysis actually worked
+                if self.pipeline_data.garment_type != 'Unknown':
+                    return {'success': True, 'message': f'Combined analysis complete: {self.pipeline_data.garment_type}'}
+                else:
+                    return {'success': False, 'error': 'Analysis completed but no garment type detected'}
             else:
+                logger.error("[GARMENT-ANALYSIS] OpenAI client not available")
                 return {'success': False, 'error': 'OpenAI client not available'}
                 
         except Exception as e:
@@ -8492,13 +8497,8 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         # ===================================================
         self.render_action_panel()
         
-        # ========================================================================
-        # ====== 2. COMPACT CAMERA FEEDS (Higher up, smaller) ======
-        # ========================================================================
-        self.render_camera_feeds()
-        
         # ======================================================================
-        # ====== 3. CHALKBOARD (Left) and PIPELINE PROGRESS (Right) ======
+        # ====== 2. CHALKBOARD (Left) and PIPELINE PROGRESS (Right) ======
         # ======================================================================
         col_chalkboard, col_pipeline = st.columns([2, 1])
         
@@ -8508,6 +8508,11 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         with col_pipeline:
             st.markdown("#### 📊 Pipeline Progress")
             self.render_cool_step_pipeline()
+        
+        # ========================================================================
+        # ====== 3. CAMERA FEED (Right under board) ======
+        # ========================================================================
+        self.render_camera_feeds()
         
         # ========================================================================
         # ====== 4. MAIN CONTENT AREA (Centered Camera or Step Info) ======
@@ -8543,18 +8548,25 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         brand = getattr(self.pipeline_data, 'brand', 'Unknown')
         st.markdown(f"**BRAND:** {brand}")
         
-        # Garment type information
+        # Garment type information - check both pipeline data and background results
         garment_type = getattr(self.pipeline_data, 'garment_type', 'Not analyzed')
         if garment_type == 'Unknown':
             garment_type = 'Not analyzed'
         
-        # Check if background analysis is in progress
+        # Check if background analysis is in progress or completed
         if garment_type == 'Not analyzed':
             background_result = self.get_background_garment_result()
             if background_result is None:
                 garment_type = 'Analyzing...'
             elif not background_result.get('success'):
                 garment_type = 'Analysis failed'
+            elif background_result.get('success') and background_result.get('garment_type'):
+                # Use background result if available
+                garment_type = background_result.get('garment_type', 'Not analyzed')
+                # Update pipeline data with background results
+                self.pipeline_data.garment_type = garment_type
+                self.pipeline_data.gender = background_result.get('gender', 'Unknown')
+                self.pipeline_data.condition = background_result.get('condition', 'Unknown')
         
         st.markdown(f"**GARMENT:** Type: {garment_type}")
         
@@ -10866,152 +10878,65 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             else: return "XXXL"
     
     def render_action_panel(self):
-        """Action panel with 3 buttons nicely aligned at the top right"""
+        """Clean action panel with organized buttons"""
         logger.info(f"[PANEL] render_action_panel() called for step {self.current_step}")
         
-        # TOP RIGHT BUTTONS: 3 buttons evenly spaced at the top right
-        col_space, col_buttons = st.columns([2, 1])  # Push buttons to the right
+        # Clean button layout - centered and organized
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
         
-        with col_buttons:
-            if self.current_step == 0:
-                # Step 0: Start New, Reset, and Next buttons
-                col_start, col_reset, col_next = st.columns(3)
+        with col1:
+            if self.current_step > 0:
+                def go_back():
+                    if self.current_step > 0:
+                        old_step = self.current_step
+                        self.current_step -= 1
+                        logger.info(f"[BUTTON] ⬅️ Back: {old_step} → {self.current_step}")
                 
-                with col_start:
-                    def start_new():
-                        self.current_step = 0
-                        self.pipeline_data = PipelineData()
-                        # Clear captured images
-                        if 'captured_tag_image' in st.session_state:
-                            del st.session_state.captured_tag_image
-                        if 'captured_garment_image' in st.session_state:
-                            del st.session_state.captured_garment_image
-                        logger.info("[BUTTON] 🆕 Start New clicked - pipeline reset")
-                        st.rerun()
-                    
-                    st.button("🆕 Start", on_click=start_new, key="start_new_button", type="primary")
-                
-                with col_reset:
-                    def reset_pipeline():
-                        self.current_step = 0
-                        self.pipeline_data = PipelineData()
-                        logger.info("[BUTTON] 🔄 Reset clicked - pipeline reset")
-                        st.rerun()
-                    
-                    st.button("🔄 Reset", on_click=reset_pipeline, key="reset_button", type="secondary")
-                
-                with col_next:
-                    # Next button will be handled below
-                    pass
-            else:
-                # Steps 1+: Back, Reset, and Next buttons
-                col_back, col_reset, col_next = st.columns(3)
-                
-                with col_back:
-                    def go_back():
-                        if self.current_step > 0:
-                            old_step = self.current_step
-                            self.current_step -= 1
-                            logger.info(f"[BUTTON] ⬅️ Back: {old_step} → {self.current_step}")
-                            st.rerun()
-                    
-                    st.button("⬅️ Back", on_click=go_back, key="back_button", type="secondary")
-                
-                with col_reset:
-                    def reset_pipeline():
-                        self.current_step = 0
-                        self.pipeline_data = PipelineData()
-                        # Clear captured images
-                        if 'captured_tag_image' in st.session_state:
-                            del st.session_state.captured_tag_image
-                        if 'captured_garment_image' in st.session_state:
-                            del st.session_state.captured_garment_image
-                        logger.info("[BUTTON] 🔄 Reset clicked - pipeline reset")
-                        st.rerun()
-                    
-                    st.button("🔄 Reset", on_click=reset_pipeline, key="reset_button", type="secondary")
-                
-                with col_next:
-                    # Next button will be handled below
-                    pass
+                st.button("⬅️ Back", on_click=go_back, key="back_button", type="secondary")
         
-            # Add Next button to the appropriate column
+        with col2:
+            def reset_pipeline():
+                self.current_step = 0
+                self.pipeline_data = PipelineData()
+                # Clear captured images
+                if 'captured_tag_image' in st.session_state:
+                    del st.session_state.captured_tag_image
+                if 'captured_garment_image' in st.session_state:
+                    del st.session_state.captured_garment_image
+                logger.info("[BUTTON] 🔄 Reset clicked - pipeline reset")
+            
+            st.button("🔄 Reset", on_click=reset_pipeline, key="reset_button", type="secondary")
+        
+        with col3:
             if self.current_step == 0:
-                col_start, col_next = st.columns(2)
-                with col_next:
-                    def advance_step():
-                        """Callback to advance to next step with analysis"""
-                        old = self.current_step
-                        logger.info(f"[BUTTON] ✅ Next Step clicked for step {old}")
-                        
-                        # Execute the logic for the CURRENT step
-                        analysis_success = False
-                        
-                        if old == 0:  # Tag Analysis
-                            # Capture tag image for training data
-                            tag_frame = self.camera_manager.get_arducam_frame()
-                            if tag_frame is not None:
-                                st.session_state.captured_tag_image = tag_frame
-                                logger.info("[TRAINING] Tag image captured for training data")
-                            
-                            with st.spinner("🔍 Analyzing tag... This may take a moment."):
-                                result = self.handle_step_0_tag_analysis()
-                            
-                            # DEBUG: Log the full result
-                            logger.info(f"[DEBUG] Tag analysis result: {result}")
-                            
-                            if result and result.get('success'):
-                                st.success(f"✅ Tag analyzed: {result.get('message', 'OK')}")
-                                analysis_success = True
-                            else:
-                                error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
-                                st.error(f"❌ Tag analysis failed: {error_msg}")
-                                logger.error(f"[DEBUG] Analysis failed: {error_msg}")
-                                
-                                # TEMPORARY BYPASS: Allow advancement even if analysis fails
-                                st.warning("⚠️ TEMP: Allowing step advancement despite analysis failure")
-                                analysis_success = True
-                        
-                        elif old == 1:  # Garment Analysis
-                            # Capture garment image for training data
-                            garment_frame = self.camera_manager.get_garment_frame(preview=False)
-                            if garment_frame is not None:
-                                st.session_state.captured_garment_image = garment_frame
-                                logger.info("[TRAINING] Garment image captured for training data")
-                            
-                            with st.spinner("🔍 Analyzing garment... This may take a moment."):
-                                result = self.handle_step_1_garment_analysis()
-                            
-                            if result and result.get('success'):
-                                st.success(f"✅ Garment analyzed: {result.get('message', 'OK')}")
-                                analysis_success = True
-                            else:
-                                error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
-                                st.error(f"❌ Garment analysis failed: {error_msg}")
-                                logger.error(f"[DEBUG] Garment analysis failed: {error_msg}")
-                                
-                                # TEMPORARY BYPASS: Allow advancement even if analysis fails
-                                st.warning("⚠️ TEMP: Allowing step advancement despite analysis failure")
-                                analysis_success = True
-                        
-                        # Advance to next step if analysis succeeded or bypassed
-                        if analysis_success:
-                            self.current_step = old + 1
-                            logger.info(f"[BUTTON] ✅ Step advanced: {old} → {self.current_step}")
-                            st.rerun()
+                def start_new():
+                    self.current_step = 0
+                    self.pipeline_data = PipelineData()
+                    logger.info("[BUTTON] 🆕 Start New clicked - pipeline reset")
+                
+                st.button("🆕 Start", on_click=start_new, key="start_new_button", type="primary")
+        
+        with col4:
+            # Next Step button for all steps
+            if self.current_step < len(self.steps) - 1:
+                def advance_step():
+                    """Callback to execute current step and advance"""
+                    old = self.current_step
+                    logger.info(f"[BUTTON] Executing step {old}...")
                     
-                    st.button("➡️ Next Step", on_click=advance_step, key="next_step_button", type="primary")
-            else:
-                col_back, col_reset, col_next = st.columns(3)
-                with col_next:
-                    def advance_step():
-                        """Callback to advance to next step"""
-                        old = self.current_step
+                    # Execute current step first
+                    result = self._execute_current_step()
+                    analysis_success = result.get('success', False) if result else False
+                    
+                    if analysis_success:
                         self.current_step = old + 1
-                        logger.info(f"[BUTTON] ✅ Step advanced: {old} → {self.current_step}")
-                        st.rerun()
-                    
-                    st.button("➡️ Next Step", on_click=advance_step, key="next_step_button", type="primary")
+                        logger.info(f"[BUTTON] ✅ Step executed and advanced: {old} → {self.current_step}")
+                    else:
+                        error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
+                        logger.error(f"[BUTTON] ❌ Step {old} failed: {error_msg}")
+                        st.error(f"Step {old} failed: {error_msg}")
+                
+                st.button("➡️ Next", on_click=advance_step, key="next_step_button", type="primary")
 
         # Action panel complete - buttons are now at the top right
     
