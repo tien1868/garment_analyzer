@@ -700,6 +700,341 @@ def validate_garment_classification(garment_type: str, visible_features: list) -
     return True, "Classification valid"
 
 
+def validate_sweater_vs_jacket(garment_data: dict, material: str) -> dict:
+    """
+    Rule-based validation to distinguish sweaters from jackets
+    """
+    garment_type = garment_data.get('type', '').lower()
+    material_lower = material.lower()
+    
+    # Strong indicators it's a SWEATER not a jacket:
+    sweater_materials = ['wool', 'knit', 'cotton', 'cashmere', 'acrylic', 
+                         'polyester', 'fleece', 'jersey', 'cable knit', 'merino',
+                         'alpaca', 'angora', 'mohair', 'silk knit', 'modal']
+    
+    # Strong indicators it's a JACKET:
+    jacket_materials = ['leather', 'denim', 'nylon', 'polyester shell', 
+                        'canvas', 'waxed', 'suede', 'vinyl', 'cordura',
+                        'gore-tex', 'windbreaker', 'bomber', 'twill']
+    
+    # CRITICAL FIX: If material is knitwear but classified as jacket, override
+    if garment_type == 'jacket':
+        if any(mat in material_lower for mat in sweater_materials):
+            logger.warning(f"⚠️ OVERRIDE: Material '{material}' indicates SWEATER, not jacket")
+            garment_data['type'] = 'cardigan' if garment_data.get('has_front_opening') else 'sweater'
+            garment_data['correction_applied'] = True
+            garment_data['correction_reason'] = f"Material-based: {material}"
+    
+    # Check for visible features
+    visible_features = garment_data.get('visible_features', [])
+    knit_indicators = ['ribbed', 'cable knit', 'chunky knit', 'soft texture', 
+                       'stretchy', 'cozy', 'relaxed', 'draped', 'flowing']
+    
+    if garment_type == 'jacket':
+        if any(indicator in ' '.join(visible_features).lower() for indicator in knit_indicators):
+            logger.warning("⚠️ OVERRIDE: Texture indicates knitwear, changing to sweater")
+            garment_data['type'] = 'cardigan' if garment_data.get('has_front_opening') else 'sweater'
+            garment_data['correction_applied'] = True
+            garment_data['correction_reason'] = "Texture-based: soft/knitted appearance"
+    
+    return garment_data
+
+
+class KnitwearDetector:
+    """
+    Detects knitted/soft fabrics vs structured jackets
+    Fixes the jacket/sweater misclassification issue
+    """
+    
+    def __init__(self):
+        # Material keywords that STRONGLY indicate knitwear
+        self.knitwear_materials = [
+            'wool', 'knit', 'cotton', 'cashmere', 'acrylic', 'fleece',
+            'jersey', 'cable', 'ribbed', 'punto', 'merino', 'angora',
+            'mohair', 'alpaca', 'viscose', 'rayon', 'blend'
+        ]
+        
+        # Material keywords that indicate structured outerwear
+        self.jacket_materials = [
+            'leather', 'denim', 'jean', 'nylon', 'polyester shell',
+            'canvas', 'waxed', 'suede', 'vinyl', 'pu leather',
+            'faux leather', 'windbreaker', 'raincoat'
+        ]
+        
+        # Brand names known for knitwear
+        self.knitwear_brands = [
+            'A-KRIS', 'AKRIS', 'Punto', 'White + Warren', 'Vince',
+            'Theory', 'Equipment', 'Joie', 'Autumn Cashmere',
+            'Barefoot Dreams', 'InCashmere', 'Minnie Rose',
+            'Eileen Fisher', 'J.Crew', 'Banana Republic',
+            'Gap', 'Uniqlo', 'H&M', 'Zara'
+        ]
+        
+        # Visual keywords from garment analysis
+        self.knitwear_indicators = [
+            'cable knit', 'ribbed', 'knitted', 'soft', 'cozy', 'chunky',
+            'textured', 'woven', 'stretchy', 'draped', 'loose',
+            'relaxed fit', 'comfortable', 'casual', 'sweater',
+            'cardigan', 'pullover', 'turtleneck', 'crewneck',
+            'v-neck', 'boatneck', 'knitwear', 'merino',
+            'cashmere', 'wool blend', 'cotton knit', 'acrylic'
+        ]
+        
+        self.jacket_indicators = [
+            'structured', 'stiff', 'tailored', 'formal', 'blazer',
+            'lapel', 'collar', 'zipper', 'snaps', 'buckle',
+            'outerwear', 'coat', 'windproof', 'waterproof'
+        ]
+    
+    def fix_classification(
+        self,
+        garment_type: str,
+        brand: str,
+        material: str,
+        style: str = "",
+        visible_features: list = None,
+        garment_image: np.ndarray = None,
+        has_front_opening: bool = False
+    ) -> Dict:
+        """
+        Main method: Fix jacket/sweater misclassification
+        
+        Returns dict with:
+        - corrected_type: The correct garment type
+        - correction_applied: Boolean
+        - correction_reason: Why it was corrected
+        - confidence: Confidence in the correction
+        """
+        
+        if visible_features is None:
+            visible_features = []
+        
+        original_type = garment_type.lower()
+        corrections = []
+        confidence_score = 0.0
+        
+        # Only correct if currently classified as jacket
+        if original_type != 'jacket':
+            return {
+                'corrected_type': garment_type,
+                'correction_applied': False,
+                'correction_reason': 'Not classified as jacket',
+                'confidence': 1.0
+            }
+        
+        logger.info(f"[KNITWEAR] Checking jacket classification...")
+        logger.info(f"[KNITWEAR] Brand: {brand}, Material: {material}")
+        logger.info(f"[KNITWEAR] Style: {style}, Has opening: {has_front_opening}")
+        
+        # CHECK 1: Material-based detection (STRONGEST signal)
+        material_lower = material.lower()
+        
+        is_knitwear_material = any(
+            mat in material_lower for mat in self.knitwear_materials
+        )
+        is_jacket_material = any(
+            mat in material_lower for mat in self.jacket_materials
+        )
+        
+        if is_knitwear_material and not is_jacket_material:
+            corrections.append(f"Material '{material}' indicates knitwear")
+            confidence_score += 0.4
+            logger.warning(f"[KNITWEAR] ✅ Material check: KNITWEAR detected")
+        
+        # CHECK 2: Brand-based detection
+        brand_lower = brand.lower()
+        
+        if any(knit_brand.lower() in brand_lower for knit_brand in self.knitwear_brands):
+            corrections.append(f"Brand '{brand}' is known for knitwear")
+            confidence_score += 0.2
+            logger.warning(f"[KNITWEAR] ✅ Brand check: Knitwear brand detected")
+        
+        # CHECK 3: Style/visible features analysis
+        all_features_text = f"{style} {' '.join(visible_features)}".lower()
+        
+        knitwear_feature_count = sum(
+            1 for indicator in self.knitwear_indicators
+            if indicator in all_features_text
+        )
+        
+        jacket_feature_count = sum(
+            1 for indicator in self.jacket_indicators
+            if indicator in all_features_text
+        )
+        
+        if knitwear_feature_count > jacket_feature_count:
+            corrections.append(
+                f"Visual features suggest knitwear ({knitwear_feature_count} indicators)"
+            )
+            confidence_score += 0.2
+            logger.warning(f"[KNITWEAR] ✅ Feature check: {knitwear_feature_count} knitwear indicators")
+        
+        # CHECK 4: Visual texture analysis (if image provided)
+        if garment_image is not None:
+            texture_result = self._analyze_texture(garment_image)
+            
+            if texture_result['is_knitwear']:
+                corrections.append(
+                    f"Visual texture analysis: {texture_result['reason']}"
+                )
+                confidence_score += 0.2
+                logger.warning(f"[KNITWEAR] ✅ Texture check: Soft/knitted texture detected")
+        
+        # DECISION: Apply correction if confidence is high enough
+        if confidence_score >= 0.3:  # Lowered threshold to catch more cases
+            # Determine if cardigan or pullover based on front opening
+            correct_type = 'cardigan' if has_front_opening else 'sweater'
+
+            logger.warning("=" * 60)
+            logger.warning(f"[CORRECTION] JACKET → {correct_type.upper()}")
+            logger.warning(f"[CORRECTION] Confidence: {confidence_score:.2f}")
+            logger.warning(f"[CORRECTION] Reasons:")
+            for reason in corrections:
+                logger.warning(f"  • {reason}")
+            logger.warning("=" * 60)
+
+            return {
+                'corrected_type': correct_type,
+                'correction_applied': True,
+                'correction_reason': ' | '.join(corrections),
+                'confidence': confidence_score,
+                'original_type': 'jacket'
+            }
+        else:
+            logger.info(f"[KNITWEAR] Confidence too low ({confidence_score:.2f}), keeping as jacket")
+            # Still try to suggest the correction even with low confidence for problematic cases
+            if confidence_score > 0.1:
+                logger.warning(f"[KNITWEAR] ⚠️ SUGGESTED CORRECTION: Consider manual override to sweater/cardigan")
+                logger.warning(f"[KNITWEAR] Low confidence reasons: {corrections}")
+
+            # Even with low confidence, suggest the correction for manual override
+            suggested_type = 'cardigan' if has_front_opening else 'sweater'
+
+            return {
+                'corrected_type': garment_type,
+                'correction_applied': False,
+                'correction_reason': f'Low confidence ({confidence_score:.2f})',
+                'confidence': confidence_score,
+                'suggested_type': suggested_type
+            }
+    
+    def _analyze_texture(self, image: np.ndarray) -> Dict:
+        """
+        Analyze image texture to detect knitwear
+        
+        Knitwear characteristics:
+        - Soft, low-contrast texture
+        - Repetitive patterns (knit structure)
+        - Fewer sharp edges than structured jackets
+        """
+        try:
+            # Convert to grayscale
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image
+            
+            # Resize for faster processing
+            h, w = gray.shape
+            if h > 800 or w > 800:
+                scale = 800 / max(h, w)
+                gray = cv2.resize(gray, None, fx=scale, fy=scale)
+            
+            # Calculate texture metrics
+            
+            # 1. Edge density (knitwear has softer, fewer edges)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+            
+            # 2. Texture variance (knitwear has moderate, uniform variance)
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            texture_var = np.var(cv2.Laplacian(blur, cv2.CV_64F))
+            
+            # 3. Standard deviation (knitwear has lower std than structured fabrics)
+            std_dev = np.std(gray)
+            
+            # Thresholds (tuned for knitwear detection)
+            is_soft_fabric = edge_density < 0.08  # Low edge density
+            is_uniform_texture = 200 < texture_var < 1200  # Moderate variance
+            is_matte_finish = std_dev < 55  # Not too shiny/reflective
+            
+            is_knitwear = is_soft_fabric and (is_uniform_texture or is_matte_finish)
+            
+            reason = []
+            if is_soft_fabric:
+                reason.append("soft texture (low edges)")
+            if is_uniform_texture:
+                reason.append("uniform knit pattern")
+            if is_matte_finish:
+                reason.append("matte finish")
+            
+            logger.debug(f"[TEXTURE] Edge density: {edge_density:.4f}")
+            logger.debug(f"[TEXTURE] Texture variance: {texture_var:.1f}")
+            logger.debug(f"[TEXTURE] Std dev: {std_dev:.1f}")
+            
+            return {
+                'is_knitwear': is_knitwear,
+                'reason': ', '.join(reason) if reason else 'structured fabric',
+                'edge_density': edge_density,
+                'texture_variance': texture_var,
+                'std_dev': std_dev
+            }
+            
+        except Exception as e:
+            logger.error(f"[TEXTURE] Analysis failed: {e}")
+            return {
+                'is_knitwear': False,
+                'reason': 'analysis failed',
+                'edge_density': 0.0,
+                'texture_variance': 0.0,
+                'std_dev': 0.0
+            }
+
+
+def detect_knitwear_visually(image: np.ndarray) -> dict:
+    """
+    Computer vision check for knit texture patterns
+    """
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        
+        # Detect texture using Local Binary Patterns or Gabor filters
+        # Knitwear has distinctive repetitive patterns
+        
+        # Simple approach: Check for soft, uniform texture
+        # vs. sharp structured lines (jacket)
+        
+        # Calculate texture variance
+        texture_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        # Knitwear typically has lower edge definition than structured jackets
+        is_soft_fabric = texture_score < 800  # Adjust threshold
+        
+        # Check for repetitive patterns (knit texture)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges) / edges.size
+        
+        is_knitted = edge_density < 0.05  # Soft fabrics have fewer sharp edges
+        
+        return {
+            'is_soft_fabric': is_soft_fabric,
+            'is_knitted': is_knitted,
+            'texture_score': texture_score,
+            'edge_density': edge_density,
+            'likely_knitwear': is_soft_fabric and is_knitted
+        }
+    except Exception as e:
+        logger.error(f"[VISUAL-CHECK] Error in texture detection: {e}")
+        return {
+            'is_soft_fabric': False,
+            'is_knitted': False,
+            'texture_score': 0,
+            'edge_density': 0,
+            'likely_knitwear': False
+        }
+
+
 def validate_classification_strict(garment_type, features_dict):
     """
     Strict validation rules for garment classification
@@ -5329,24 +5664,103 @@ class OpenAIGarmentAnalyzer:
                 garment_image.save(buffer, format='JPEG', quality=95)
                 base64_image = base64.b64encode(buffer.getvalue()).decode()
             
-            prompt = """CRITICAL RULES - READ FIRST:
-1. A CARDIGAN **MUST** have buttons/zipper/open edges
-2. A PULLOVER has **NO** front opening (solid front)
-3. If uncertain, default to PULLOVER (it's more common)
+            prompt = """🔍 GARMENT CLASSIFICATION - CRITICAL FOCUS ON SWEATERS VS JACKETS
 
-**DECISION TREE:**
-- See buttons down center front? → CARDIGAN
-- See zipper down center front? → CARDIGAN  
-- See two separate fabric edges? → CARDIGAN
-- See NONE of the above? → PULLOVER
+            Analyze this garment image with SPECIAL ATTENTION to fabric type.
 
-You are an expert fashion analyst. Analyze this garment image.
+            ⚠️ COMMON MISTAKE TO AVOID:
+            DO NOT confuse SWEATERS/CARDIGANS with JACKETS!
 
-**CRITICAL: CARDIGAN vs PULLOVER DETECTION PROTOCOL**
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Follow this EXACT checklist:
+            🧶 SWEATER/CARDIGAN (Knitwear):
+            ✓ Soft, knitted or woven fabric
+            ✓ Visible knit texture (cable knit, ribbed, chunky)
+            ✓ Drapes softly, not structured
+            ✓ Made for comfort, worn indoors
+            ✓ Materials: wool, cotton knit, cashmere, acrylic
+            ✓ Usually no stiff collar or lapels
+            ✓ Stretchy, flexible fabric
 
-1. **CENTER FRONT INSPECTION** (MOST IMPORTANT):
+            Examples: pullover sweater, cardigan, turtleneck, crewneck
+
+            🧥 JACKET (Structured Outerwear):
+            ✓ Stiff, structured fabric holds its shape
+            ✓ Designed for outdoor wear/protection
+            ✓ Formal or utilitarian styling
+            ✓ Materials: denim, leather, nylon, canvas
+            ✓ Often has structured collar, lapels, or hood
+            ✓ Buttons/zippers are heavier duty
+            ✓ Not stretchy, more rigid
+
+            Examples: blazer, denim jacket, leather jacket, bomber
+
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            🎯 CLASSIFICATION DECISION TREE:
+
+            1. FIRST: Examine the fabric texture closely
+               • Can you see knit patterns? → SWEATER
+               • Is it smooth/structured fabric? → Could be JACKET
+
+            2. SECOND: Check how it drapes
+               • Soft drape, looks cozy? → SWEATER
+               • Holds rigid shape? → JACKET
+
+            3. THIRD: Consider the styling
+               • Casual comfort wear? → SWEATER
+               • Formal or outdoor protection? → JACKET
+
+            4. FOURTH: Look at details
+               • Soft ribbed cuffs/hem? → SWEATER
+               • Structured collar/lapels? → JACKET
+
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            For THIS image:
+            1. Describe the fabric texture in detail (knitted vs. woven vs. smooth)
+            2. Note if it looks soft and draped or stiff and structured
+            3. Identify any knit patterns (cable knit, ribbing, etc.)
+            4. Consider context - indoor comfort vs outdoor protection
+
+            ONLY classify as JACKET if you see:
+            - Structured, non-knitted fabric
+            - Formal styling OR outdoor/protective design
+            - Stiff collar or heavy-duty closures
+
+            If you see knitted texture or soft drape → It's a SWEATER or CARDIGAN!
+
+            **CARDIGAN vs PULLOVER DISTINCTION:**
+            - CARDIGAN: Has front opening (buttons/zipper/open edges)
+            - PULLOVER: No front opening (solid front)
+            - If uncertain, default to PULLOVER (more common)
+
+**CRITICAL: SWEATER vs JACKET DISTINCTION**
+
+Before classifying, determine if this is KNITWEAR or STRUCTURED GARMENT:
+
+**KNITWEAR INDICATORS (Sweater/Cardigan):**
+- Soft, flexible fabric that drapes naturally
+- Visible knit texture or ribbing
+- Stretchy, form-fitting material
+- Often has ribbed cuffs, collar, or hem
+- Fabric appears to "flow" or drape
+
+**STRUCTURED GARMENT INDICATORS (Jacket/Blazer):**
+- Stiff, structured fabric that holds shape
+- Lined or has internal structure
+- Sharp, defined edges and seams
+- Often has shoulder pads or structured shoulders
+- Fabric appears rigid and maintains form
+
+**CLASSIFICATION PROTOCOL:**
+
+1. **FABRIC TYPE CHECK** (MOST IMPORTANT):
+   - Is this KNITWEAR (soft, stretchy, drapes) or STRUCTURED (stiff, holds shape)?
+   - If KNITWEAR: Proceed to cardigan/pullover check
+   - If STRUCTURED: This is likely a JACKET/BLAZER
+
+2. **CENTER FRONT INSPECTION** (for knitwear):
    - Look at the CENTER VERTICAL LINE of the garment from neck to hem
    - Do you see ANY of these indicators:
      ✓ Buttons or button holes running vertically
@@ -5356,32 +5770,55 @@ Follow this EXACT checklist:
      ✓ Contrasting band/trim down center front
    
    → If YES to ANY: This is a CARDIGAN (has front opening)
-   → If NO to ALL: Proceed to step 2
+   → If NO to ALL: This is a PULLOVER/SWEATER
 
-2. **EDGE INSPECTION**:
+3. **EDGE INSPECTION** (for knitwear):
    - Look at the LEFT and RIGHT vertical edges
    - Are they:
      ✓ Finished edges (like a jacket front)
      ✓ Has ribbed bands going vertically (cardigan edge trim)
    
    → If YES: This is a CARDIGAN (open front style)
-   → If NO: Proceed to step 3
-
-3. **NECKLINE CHECK**:
-   - Look at where the neckline meets the body
-   - Is there:
-     ✓ A V-shaped opening going down center front
-     ✓ Two separate fabric edges meeting at neck
-   
-   → If YES: This is a CARDIGAN
-   → If NO: Proceed to step 4
+   → If NO: This is a PULLOVER/SWEATER
 
 4. **FINAL DETERMINATION**:
-   - If the garment is KNITWEAR and you found NONE of the above:
-     → It's a PULLOVER/SWEATER/TURTLENECK
-   - If you're uncertain:
-     → Default to PULLOVER (it's more common)
-     → Only call it CARDIGAN if you're 100% certain
+   - If KNITWEAR with front opening: CARDIGAN
+   - If KNITWEAR without front opening: PULLOVER/SWEATER
+   - If STRUCTURED with front opening: JACKET/BLAZER
+   - If STRUCTURED without front opening: PULLOVER (rare)
+
+**CRITICAL DISTINCTIONS:**
+
+**SWEATER vs JACKET:**
+- SWEATER: Knitted/woven fabric, soft texture, casual comfort wear, stretchy
+  - Types: pullover, cardigan, turtleneck, crewneck
+  - Materials: wool, cotton knit, cashmere, acrylic, fleece
+  - Key features: ribbed cuffs, soft drape, visible knit texture
+  
+- JACKET: Structured outerwear, stiff/firm fabric, designed for layering over clothes
+  - Types: blazer, denim jacket, leather jacket, bomber, windbreaker
+  - Materials: denim, leather, nylon, canvas, polyester shell
+  - Key features: structured shoulders, buttons/zippers, collar/lapels, pockets
+
+**CARDIGAN vs JACKET:**
+- CARDIGAN: Knitted sweater with front opening (buttons/zip)
+  - Soft, stretchy fabric
+  - Usually no collar (or soft shawl collar)
+  - Lightweight, meant to be worn indoors
+  
+- JACKET: Structured coat with front opening
+  - Stiff fabric with shape
+  - Often has structured collar/lapels
+  - Heavier, meant for outerwear
+
+**For THIS image:**
+1. Examine the fabric texture closely - is it knitted or woven vs. structured?
+2. Look at the drape - does it hang softly or hold its shape?
+3. Check the weight - does it look lightweight/casual or heavy/formal?
+4. Consider context - indoor comfort wear or outdoor protection?
+
+Classify as SWEATER/CARDIGAN if: knitted texture, soft drape, casual wear
+Classify as JACKET if: structured, stiff fabric, outerwear designed for protection
 
 **COMMON MISTAKES TO AVOID:**
 - ❌ Don't assume "no visible closures" = pullover
@@ -5650,24 +6087,103 @@ Return JSON:
                 garment_image.save(buffer, format='JPEG', quality=95)
                 base64_image = base64.b64encode(buffer.getvalue()).decode()
             
-            prompt = """CRITICAL RULES - READ FIRST:
-1. A CARDIGAN **MUST** have buttons/zipper/open edges
-2. A PULLOVER has **NO** front opening (solid front)
-3. If uncertain, default to PULLOVER (it's more common)
+            prompt = """🔍 GARMENT CLASSIFICATION - CRITICAL FOCUS ON SWEATERS VS JACKETS
 
-**DECISION TREE:**
-- See buttons down center front? → CARDIGAN
-- See zipper down center front? → CARDIGAN  
-- See two separate fabric edges? → CARDIGAN
-- See NONE of the above? → PULLOVER
+            Analyze this garment image with SPECIAL ATTENTION to fabric type.
 
-You are an expert fashion analyst. Analyze this garment image.
+            ⚠️ COMMON MISTAKE TO AVOID:
+            DO NOT confuse SWEATERS/CARDIGANS with JACKETS!
 
-**CRITICAL: CARDIGAN vs PULLOVER DETECTION PROTOCOL**
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Follow this EXACT checklist:
+            🧶 SWEATER/CARDIGAN (Knitwear):
+            ✓ Soft, knitted or woven fabric
+            ✓ Visible knit texture (cable knit, ribbed, chunky)
+            ✓ Drapes softly, not structured
+            ✓ Made for comfort, worn indoors
+            ✓ Materials: wool, cotton knit, cashmere, acrylic
+            ✓ Usually no stiff collar or lapels
+            ✓ Stretchy, flexible fabric
 
-1. **CENTER FRONT INSPECTION** (MOST IMPORTANT):
+            Examples: pullover sweater, cardigan, turtleneck, crewneck
+
+            🧥 JACKET (Structured Outerwear):
+            ✓ Stiff, structured fabric holds its shape
+            ✓ Designed for outdoor wear/protection
+            ✓ Formal or utilitarian styling
+            ✓ Materials: denim, leather, nylon, canvas
+            ✓ Often has structured collar, lapels, or hood
+            ✓ Buttons/zippers are heavier duty
+            ✓ Not stretchy, more rigid
+
+            Examples: blazer, denim jacket, leather jacket, bomber
+
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            🎯 CLASSIFICATION DECISION TREE:
+
+            1. FIRST: Examine the fabric texture closely
+               • Can you see knit patterns? → SWEATER
+               • Is it smooth/structured fabric? → Could be JACKET
+
+            2. SECOND: Check how it drapes
+               • Soft drape, looks cozy? → SWEATER
+               • Holds rigid shape? → JACKET
+
+            3. THIRD: Consider the styling
+               • Casual comfort wear? → SWEATER
+               • Formal or outdoor protection? → JACKET
+
+            4. FOURTH: Look at details
+               • Soft ribbed cuffs/hem? → SWEATER
+               • Structured collar/lapels? → JACKET
+
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            For THIS image:
+            1. Describe the fabric texture in detail (knitted vs. woven vs. smooth)
+            2. Note if it looks soft and draped or stiff and structured
+            3. Identify any knit patterns (cable knit, ribbing, etc.)
+            4. Consider context - indoor comfort vs outdoor protection
+
+            ONLY classify as JACKET if you see:
+            - Structured, non-knitted fabric
+            - Formal styling OR outdoor/protective design
+            - Stiff collar or heavy-duty closures
+
+            If you see knitted texture or soft drape → It's a SWEATER or CARDIGAN!
+
+            **CARDIGAN vs PULLOVER DISTINCTION:**
+            - CARDIGAN: Has front opening (buttons/zipper/open edges)
+            - PULLOVER: No front opening (solid front)
+            - If uncertain, default to PULLOVER (more common)
+
+**CRITICAL: SWEATER vs JACKET DISTINCTION**
+
+Before classifying, determine if this is KNITWEAR or STRUCTURED GARMENT:
+
+**KNITWEAR INDICATORS (Sweater/Cardigan):**
+- Soft, flexible fabric that drapes naturally
+- Visible knit texture or ribbing
+- Stretchy, form-fitting material
+- Often has ribbed cuffs, collar, or hem
+- Fabric appears to "flow" or drape
+
+**STRUCTURED GARMENT INDICATORS (Jacket/Blazer):**
+- Stiff, structured fabric that holds shape
+- Lined or has internal structure
+- Sharp, defined edges and seams
+- Often has shoulder pads or structured shoulders
+- Fabric appears rigid and maintains form
+
+**CLASSIFICATION PROTOCOL:**
+
+1. **FABRIC TYPE CHECK** (MOST IMPORTANT):
+   - Is this KNITWEAR (soft, stretchy, drapes) or STRUCTURED (stiff, holds shape)?
+   - If KNITWEAR: Proceed to cardigan/pullover check
+   - If STRUCTURED: This is likely a JACKET/BLAZER
+
+2. **CENTER FRONT INSPECTION** (for knitwear):
    - Look at the CENTER VERTICAL LINE of the garment from neck to hem
    - Do you see ANY of these indicators:
      ✓ Buttons or button holes running vertically
@@ -5677,32 +6193,55 @@ Follow this EXACT checklist:
      ✓ Contrasting band/trim down center front
    
    → If YES to ANY: This is a CARDIGAN (has front opening)
-   → If NO to ALL: Proceed to step 2
+   → If NO to ALL: This is a PULLOVER/SWEATER
 
-2. **EDGE INSPECTION**:
+3. **EDGE INSPECTION** (for knitwear):
    - Look at the LEFT and RIGHT vertical edges
    - Are they:
      ✓ Finished edges (like a jacket front)
      ✓ Has ribbed bands going vertically (cardigan edge trim)
    
    → If YES: This is a CARDIGAN (open front style)
-   → If NO: Proceed to step 3
-
-3. **NECKLINE CHECK**:
-   - Look at where the neckline meets the body
-   - Is there:
-     ✓ A V-shaped opening going down center front
-     ✓ Two separate fabric edges meeting at neck
-   
-   → If YES: This is a CARDIGAN
-   → If NO: Proceed to step 4
+   → If NO: This is a PULLOVER/SWEATER
 
 4. **FINAL DETERMINATION**:
-   - If the garment is KNITWEAR and you found NONE of the above:
-     → It's a PULLOVER/SWEATER/TURTLENECK
-   - If you're uncertain:
-     → Default to PULLOVER (it's more common)
-     → Only call it CARDIGAN if you're 100% certain
+   - If KNITWEAR with front opening: CARDIGAN
+   - If KNITWEAR without front opening: PULLOVER/SWEATER
+   - If STRUCTURED with front opening: JACKET/BLAZER
+   - If STRUCTURED without front opening: PULLOVER (rare)
+
+**CRITICAL DISTINCTIONS:**
+
+**SWEATER vs JACKET:**
+- SWEATER: Knitted/woven fabric, soft texture, casual comfort wear, stretchy
+  - Types: pullover, cardigan, turtleneck, crewneck
+  - Materials: wool, cotton knit, cashmere, acrylic, fleece
+  - Key features: ribbed cuffs, soft drape, visible knit texture
+  
+- JACKET: Structured outerwear, stiff/firm fabric, designed for layering over clothes
+  - Types: blazer, denim jacket, leather jacket, bomber, windbreaker
+  - Materials: denim, leather, nylon, canvas, polyester shell
+  - Key features: structured shoulders, buttons/zippers, collar/lapels, pockets
+
+**CARDIGAN vs JACKET:**
+- CARDIGAN: Knitted sweater with front opening (buttons/zip)
+  - Soft, stretchy fabric
+  - Usually no collar (or soft shawl collar)
+  - Lightweight, meant to be worn indoors
+  
+- JACKET: Structured coat with front opening
+  - Stiff fabric with shape
+  - Often has structured collar/lapels
+  - Heavier, meant for outerwear
+
+**For THIS image:**
+1. Examine the fabric texture closely - is it knitted or woven vs. structured?
+2. Look at the drape - does it hang softly or hold its shape?
+3. Check the weight - does it look lightweight/casual or heavy/formal?
+4. Consider context - indoor comfort wear or outdoor protection?
+
+Classify as SWEATER/CARDIGAN if: knitted texture, soft drape, casual wear
+Classify as JACKET if: structured, stiff fabric, outerwear designed for protection
 
 **COMMON MISTAKES TO AVOID:**
 - ❌ Don't assume "no visible closures" = pullover
@@ -7082,30 +7621,7 @@ def display_ebay_pricing_verification(pipeline_data):
     
     st.markdown("### 📦 eBay Pricing Verification")
     
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        if st.button("🔍 Search eBay for Similar Items", key="ebay_search"):
-            with st.spinner("Searching eBay..."):
-                verifier = FixedEBayPricingVerifier()
-                
-                result = verifier.search_ebay_and_extract_prices(
-                    brand=pipeline_data.brand,
-                    garment_type=pipeline_data.garment_type,
-                    size=pipeline_data.size,
-                    condition=pipeline_data.condition
-                )
-                
-                if result and result['success']:
-                    st.session_state.ebay_search_result = result
-                    st.success(f"✅ Found {result['count']} similar items on eBay")
-                else:
-                    st.error("❌ Could not search eBay. Please try again.")
-    
-    with col2:
-        if st.button("📊 Show Last Results", key="ebay_show_results"):
-            if 'ebay_search_result' in st.session_state:
-                st.session_state.show_ebay_results = True
+    # Removed top search button - keeping only the bottom "Browse All Similar Items" link
     
     # Display search results if available
     if st.session_state.get('ebay_search_result'):
@@ -7226,6 +7742,824 @@ def build_ebay_item_specifics_link(pipeline_data):
     
     url = base_url + "?" + "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
     return url
+
+# ============================================
+# ADVANCED GOOGLE LENS VISUAL SEARCH FRAMEWORK
+# ============================================
+
+@dataclass
+class PricePoint:
+    """Single price data point"""
+    price: float
+    currency: str
+    source: str
+    url: str
+    condition: str  # new, like-new, used, excellent
+    title: str
+    confidence: float
+    marketplace: str  # ebay, poshmark, mercari, retailer, etc.
+
+
+@dataclass
+class VisualMatch:
+    """Single visual match from Google Lens"""
+    title: str
+    source: str
+    link: str
+    thumbnail: str
+    position: int
+    similarity_score: float = 0.0
+    
+    # Extracted details
+    brand: Optional[str] = None
+    style_name: Optional[str] = None
+    pattern: Optional[str] = None
+    color: Optional[str] = None
+    size: Optional[str] = None
+    price: Optional[float] = None
+    condition: Optional[str] = None
+
+
+@dataclass
+class ExactMatchResult:
+    """Result of exact garment matching"""
+    is_exact_match: bool
+    confidence: float
+    style_name: str
+    full_product_name: str
+    
+    # Pricing data
+    prices: List[PricePoint] = field(default_factory=list)
+    price_low: float = 0.0
+    price_high: float = 0.0
+    price_median: float = 0.0
+    price_average: float = 0.0
+    
+    # Market intelligence
+    available_listings: int = 0
+    retail_price: Optional[float] = None
+    resale_ratio: Optional[float] = None  # resale/retail
+    demand_score: float = 0.0
+    
+    # Visual matches
+    visual_matches: List[VisualMatch] = field(default_factory=list)
+    shopping_results: List[Dict] = field(default_factory=list)
+    
+    # Metadata
+    search_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    method: str = "Google Lens Visual Search"
+
+
+class GoogleLensPriceFinder:
+    """
+    Advanced Google Lens integration for exact garment matching and pricing
+    
+    Perfect for:
+    - High-end designer items where exact style matters
+    - Pattern-specific pricing (e.g., floral vs. solid)
+    - Finding the specific model/collection name
+    - Accurate market pricing across platforms
+    """
+    
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv('SERPAPI_KEY')
+        self.base_url = "https://serpapi.com/search"
+        
+        # Known designer brands that benefit from exact matching
+        self.designer_brands = {
+            'Veronica Beard', 'Rag & Bone', 'Theory', 'Equipment', 'Vince',
+            'Rebecca Minkoff', 'Alice + Olivia', 'DVF', 'Diane von Furstenberg',
+            'Tory Burch', 'Kate Spade', 'Michael Kors', 'Coach',
+            'Gucci', 'Prada', 'Saint Laurent', 'Balenciaga', 'Givenchy',
+            'Burberry', 'Chanel', 'Dior', 'Valentino', 'Tom Ford'
+        }
+        
+        # Pattern keywords that affect pricing
+        self.pattern_keywords = {
+            'floral', 'stripe', 'striped', 'polka dot', 'leopard', 'animal print',
+            'plaid', 'checkered', 'geometric', 'paisley', 'abstract', 'solid',
+            'houndstooth', 'herringbone', 'tweed', 'jacquard', 'embroidered'
+        }
+        
+        # Style-specific keywords (especially important for blazers/jackets)
+        self.style_keywords = {
+            'dickey', 'miller', 'schoolboy', 'boyfriend', 'oversized',
+            'fitted', 'double-breasted', 'single-breasted', 'cropped',
+            'longline', 'cutaway', 'peak lapel', 'notch lapel', 'shawl collar'
+        }
+    
+    def find_exact_garment(
+        self,
+        garment_image: np.ndarray,
+        brand: str = None,
+        garment_type: str = None,
+        pattern: str = None,
+        color: str = None,
+        high_end_only: bool = False
+    ) -> ExactMatchResult:
+        """
+        Main method: Find exact garment match with accurate pricing
+        
+        Args:
+            garment_image: Full garment photo (not tag)
+            brand: Known brand (helps filter results)
+            garment_type: Known type (blazer, dress, etc.)
+            pattern: Known pattern if detected
+            color: Known color
+            high_end_only: If True, only search high-end marketplaces
+        
+        Returns:
+            ExactMatchResult with style name, prices, and market data
+        """
+        logger.info("[LENS] Starting exact garment search...")
+        
+        # Step 1: Google Lens visual search
+        lens_results = self._google_lens_search(garment_image)
+        
+        if not lens_results:
+            return self._create_empty_result("No visual matches found")
+        
+        # Step 2: Parse and enrich visual matches
+        visual_matches = self._parse_visual_matches(
+            lens_results.get('visual_matches', []),
+            brand=brand,
+            garment_type=garment_type
+        )
+        
+        # Step 3: Extract style name from matches
+        style_info = self._extract_style_name(
+            visual_matches,
+            brand=brand,
+            garment_type=garment_type,
+            pattern=pattern
+        )
+        
+        # Step 4: Parse shopping results for pricing
+        shopping_results = lens_results.get('shopping_results', [])
+        prices = self._extract_prices_from_shopping(
+            shopping_results,
+            brand=brand,
+            style_name=style_info['style_name']
+        )
+        
+        # Step 5: Search for additional pricing using exact style name
+        if style_info['style_name'] and brand:
+            additional_prices = self._search_exact_style_pricing(
+                brand=brand,
+                style_name=style_info['style_name'],
+                garment_type=garment_type
+            )
+            prices.extend(additional_prices)
+        
+        # Step 6: Calculate market intelligence
+        market_data = self._calculate_market_intelligence(prices)
+        
+        # Step 7: Determine match confidence
+        confidence = self._calculate_match_confidence(
+            visual_matches=visual_matches,
+            style_name=style_info['style_name'],
+            prices=prices
+        )
+        
+        # Step 8: Build result
+        result = ExactMatchResult(
+            is_exact_match=confidence > 0.7,
+            confidence=confidence,
+            style_name=style_info['style_name'],
+            full_product_name=style_info['full_name'],
+            prices=prices,
+            price_low=market_data['price_low'],
+            price_high=market_data['price_high'],
+            price_median=market_data['price_median'],
+            price_average=market_data['price_average'],
+            available_listings=len(prices),
+            retail_price=market_data['retail_price'],
+            resale_ratio=market_data['resale_ratio'],
+            demand_score=market_data['demand_score'],
+            visual_matches=visual_matches,
+            shopping_results=shopping_results
+        )
+        
+        logger.info(f"[LENS] Match found: {result.full_product_name} (confidence: {confidence:.2f})")
+        logger.info(f"[LENS] Price range: ${result.price_low:.2f} - ${result.price_high:.2f}")
+        
+        return result
+    
+    def _google_lens_search(self, image: np.ndarray) -> Dict:
+        """
+        Perform Google Lens visual search via SERP API
+        """
+        try:
+            # Encode image to base64
+            _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            img_base64 = base64.b64encode(buffer).decode()
+            
+            # CRITICAL: Use Google Lens engine for visual search
+            params = {
+                'api_key': self.api_key,
+                'engine': 'google_lens',
+                'url': f'data:image/jpeg;base64,{img_base64}',
+                'hl': 'en',  # English results
+                'no_cache': 'false'  # Use cache when possible
+            }
+            
+            logger.info("[LENS] Sending image to Google Lens API...")
+            response = requests.post(
+                self.base_url,
+                data=params,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Log what we got
+                visual_matches = len(data.get('visual_matches', []))
+                shopping_results = len(data.get('shopping_results', []))
+                
+                logger.info(f"[LENS] ✅ Got {visual_matches} visual matches, {shopping_results} shopping results")
+                
+                return data
+            else:
+                logger.error(f"[LENS] API error: {response.status_code}")
+                logger.error(f"[LENS] Response: {response.text}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"[LENS] Search failed: {e}")
+            return {}
+    
+    def _parse_visual_matches(
+        self,
+        matches: List[Dict],
+        brand: str = None,
+        garment_type: str = None
+    ) -> List[VisualMatch]:
+        """
+        Parse and enrich visual matches from Google Lens
+        """
+        parsed_matches = []
+        
+        for idx, match in enumerate(matches[:20]):  # Top 20 matches
+            title = match.get('title', '').lower()
+            source = match.get('source', '').lower()
+            link = match.get('link', '')
+            
+            # Skip irrelevant results
+            if self._is_irrelevant_result(title, source, garment_type):
+                continue
+            
+            # Calculate similarity score based on keyword matching
+            similarity = self._calculate_similarity_score(
+                title, source, brand, garment_type
+            )
+            
+            visual_match = VisualMatch(
+                title=match.get('title', ''),
+                source=match.get('source', ''),
+                link=link,
+                thumbnail=match.get('thumbnail', ''),
+                position=idx + 1,
+                similarity_score=similarity
+            )
+            
+            # Extract details
+            visual_match.brand = self._extract_brand(title)
+            visual_match.style_name = self._extract_style_keywords(title)
+            visual_match.pattern = self._extract_pattern(title)
+            visual_match.color = self._extract_color(title)
+            visual_match.price = self._extract_price_from_text(title)
+            visual_match.condition = self._extract_condition(title)
+            
+            parsed_matches.append(visual_match)
+        
+        # Sort by similarity score
+        parsed_matches.sort(key=lambda x: x.similarity_score, reverse=True)
+        
+        return parsed_matches
+    
+    def _extract_style_name(
+        self,
+        visual_matches: List[VisualMatch],
+        brand: str = None,
+        garment_type: str = None,
+        pattern: str = None
+    ) -> Dict[str, str]:
+        """
+        Extract the specific style/model name from visual matches
+        
+        Example: "Veronica Beard Dickey Blazer" from multiple results
+        """
+        # Collect all titles
+        titles = [m.title.lower() for m in visual_matches[:10]]  # Top 10
+        
+        # Find most common style keywords
+        style_candidates = []
+        
+        for title in titles:
+            # Extract potential style names (usually 1-3 words before garment type)
+            words = title.split()
+            
+            # Look for known style keywords
+            for keyword in self.style_keywords:
+                if keyword in title:
+                    style_candidates.append(keyword.title())
+            
+            # Look for capitalized words that might be style names
+            for i, word in enumerate(words):
+                if word.istitle() and word not in ['The', 'A', 'An', 'In']:
+                    # Check if it's between brand and garment type
+                    if brand and garment_type:
+                        brand_idx = title.find(brand.lower())
+                        type_idx = title.find(garment_type.lower())
+                        word_pos = title.find(word)
+                        
+                        if brand_idx >= 0 and type_idx >= 0:
+                            if brand_idx < word_pos < type_idx:
+                                style_candidates.append(word)
+        
+        # Find most common style name
+        if style_candidates:
+            style_counter = Counter(style_candidates)
+            most_common_style = style_counter.most_common(1)[0][0]
+        else:
+            most_common_style = "Classic"  # Default
+        
+        # Build full product name
+        parts = []
+        if brand:
+            parts.append(brand)
+        parts.append(most_common_style)
+        if garment_type:
+            parts.append(garment_type.title())
+        if pattern and pattern.lower() != 'none':
+            parts.append(f"({pattern})")
+        
+        full_name = " ".join(parts)
+        
+        return {
+            'style_name': most_common_style,
+            'full_name': full_name,
+            'confidence': style_counter[most_common_style] / len(titles) if style_candidates else 0.0
+        }
+    
+    def _extract_prices_from_shopping(
+        self,
+        shopping_results: List[Dict],
+        brand: str = None,
+        style_name: str = None
+    ) -> List[PricePoint]:
+        """
+        Extract structured pricing data from shopping results
+        """
+        prices = []
+        
+        for result in shopping_results:
+            try:
+                # Extract price
+                price_str = result.get('price', result.get('extracted_price', ''))
+                price = self._parse_price_string(price_str)
+                
+                if not price or price <= 0:
+                    continue
+                
+                # Extract details
+                title = result.get('title', '')
+                source = result.get('source', '')
+                link = result.get('link', '')
+                
+                # Filter by brand if known
+                if brand and brand.lower() not in title.lower():
+                    continue
+                
+                # Determine marketplace
+                marketplace = self._identify_marketplace(source, link)
+                
+                # Determine condition
+                condition = self._extract_condition(title)
+                if not condition:
+                    # Assume new if from retailer
+                    condition = 'new' if marketplace in ['retailer', 'brand_site'] else 'unknown'
+                
+                # Calculate confidence based on title match
+                confidence = 0.5
+                if brand and brand.lower() in title.lower():
+                    confidence += 0.2
+                if style_name and style_name.lower() in title.lower():
+                    confidence += 0.3
+                
+                price_point = PricePoint(
+                    price=price,
+                    currency='USD',
+                    source=source,
+                    url=link,
+                    condition=condition,
+                    title=title,
+                    confidence=confidence,
+                    marketplace=marketplace
+                )
+                
+                prices.append(price_point)
+                
+            except Exception as e:
+                logger.debug(f"[LENS] Error parsing shopping result: {e}")
+                continue
+        
+        return prices
+    
+    def _search_exact_style_pricing(
+        self,
+        brand: str,
+        style_name: str,
+        garment_type: str = None
+    ) -> List[PricePoint]:
+        """
+        Search for additional pricing using exact style name
+        
+        This finds more matches across different platforms
+        """
+        prices = []
+        
+        # Build search query
+        query_parts = [brand, style_name]
+        if garment_type:
+            query_parts.append(garment_type)
+        
+        search_query = " ".join(query_parts)
+        
+        try:
+            # Use Google Shopping search for pricing data
+            params = {
+                'api_key': self.api_key,
+                'engine': 'google_shopping',
+                'q': search_query,
+                'hl': 'en',
+                'location': 'United States',
+                'num': 40  # Get more results
+            }
+            
+            logger.info(f"[LENS] Searching exact style: '{search_query}'")
+            response = requests.get(self.base_url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                shopping_results = data.get('shopping_results', [])
+                
+                logger.info(f"[LENS] Found {len(shopping_results)} additional listings")
+                
+                # Parse prices
+                additional_prices = self._extract_prices_from_shopping(
+                    shopping_results,
+                    brand=brand,
+                    style_name=style_name
+                )
+                
+                prices.extend(additional_prices)
+        
+        except Exception as e:
+            logger.error(f"[LENS] Exact style search failed: {e}")
+        
+        return prices
+    
+    def _calculate_market_intelligence(self, prices: List[PricePoint]) -> Dict:
+        """
+        Calculate comprehensive market intelligence from price data
+        """
+        if not prices:
+            return {
+                'price_low': 0.0,
+                'price_high': 0.0,
+                'price_median': 0.0,
+                'price_average': 0.0,
+                'retail_price': None,
+                'resale_ratio': None,
+                'demand_score': 0.0
+            }
+        
+        # Sort prices
+        price_values = sorted([p.price for p in prices])
+        
+        # Basic stats
+        price_low = price_values[0]
+        price_high = price_values[-1]
+        price_median = statistics.median(price_values)
+        price_average = statistics.mean(price_values)
+        
+        # Find retail price (highest from retailer/brand)
+        retail_prices = [
+            p.price for p in prices 
+            if p.marketplace in ['retailer', 'brand_site'] and p.condition == 'new'
+        ]
+        retail_price = max(retail_prices) if retail_prices else None
+        
+        # Calculate resale ratio
+        resale_prices = [
+            p.price for p in prices 
+            if p.marketplace in ['ebay', 'poshmark', 'mercari', 'grailed', 'vestiaire']
+        ]
+        resale_ratio = None
+        if retail_price and resale_prices:
+            avg_resale = statistics.mean(resale_prices)
+            resale_ratio = avg_resale / retail_price
+        
+        # Demand score (based on listing count and price dispersion)
+        demand_score = min(len(prices) / 50.0, 1.0)  # More listings = higher demand
+        if price_high > 0:
+            price_range_ratio = (price_high - price_low) / price_high
+            if price_range_ratio < 0.3:  # Low variance = stable demand
+                demand_score += 0.2
+        
+        demand_score = min(demand_score, 1.0)
+        
+        return {
+            'price_low': price_low,
+            'price_high': price_high,
+            'price_median': price_median,
+            'price_average': price_average,
+            'retail_price': retail_price,
+            'resale_ratio': resale_ratio,
+            'demand_score': demand_score
+        }
+    
+    def _calculate_match_confidence(
+        self,
+        visual_matches: List[VisualMatch],
+        style_name: str,
+        prices: List[PricePoint]
+    ) -> float:
+        """
+        Calculate overall confidence in the exact match
+        """
+        confidence = 0.0
+        
+        # Visual match quality (40%)
+        if visual_matches:
+            avg_similarity = sum(m.similarity_score for m in visual_matches[:5]) / min(5, len(visual_matches))
+            confidence += 0.4 * avg_similarity
+        
+        # Style name consistency (30%)
+        if style_name and visual_matches:
+            matches_with_style = sum(
+                1 for m in visual_matches[:10] 
+                if style_name.lower() in m.title.lower()
+            )
+            style_consistency = matches_with_style / min(10, len(visual_matches))
+            confidence += 0.3 * style_consistency
+        
+        # Price data availability (30%)
+        if prices:
+            price_confidence = min(len(prices) / 20.0, 1.0)  # Max out at 20 prices
+            confidence += 0.3 * price_confidence
+        
+        return min(confidence, 1.0)
+    
+    # ==================== HELPER METHODS ====================
+    
+    def _is_irrelevant_result(self, title: str, source: str, garment_type: str = None) -> bool:
+        """Filter out irrelevant results"""
+        irrelevant_keywords = [
+            'pinterest', 'polyvore', 'wanelo', 'blog', 'tutorial',
+            'how to', 'pattern', 'sewing', 'diy', 'costume'
+        ]
+        
+        combined = f"{title} {source}".lower()
+        return any(keyword in combined for keyword in irrelevant_keywords)
+    
+    def _calculate_similarity_score(
+        self,
+        title: str,
+        source: str,
+        brand: str = None,
+        garment_type: str = None
+    ) -> float:
+        """Calculate how similar a result is to what we're looking for"""
+        score = 0.5  # Base score
+        
+        combined = f"{title} {source}".lower()
+        
+        # Brand match
+        if brand and brand.lower() in combined:
+            score += 0.3
+        
+        # Garment type match
+        if garment_type and garment_type.lower() in combined:
+            score += 0.2
+        
+        # Shopping platform (more relevant)
+        shopping_platforms = ['ebay', 'poshmark', 'mercari', 'grailed', 'vestiaire', 'therealreal']
+        if any(platform in combined for platform in shopping_platforms):
+            score += 0.1
+        
+        return min(score, 1.0)
+    
+    def _extract_brand(self, text: str) -> Optional[str]:
+        """Extract brand name from text"""
+        text_lower = text.lower()
+        
+        for brand in self.designer_brands:
+            if brand.lower() in text_lower:
+                return brand
+        
+        return None
+    
+    def _extract_style_keywords(self, text: str) -> Optional[str]:
+        """Extract style-specific keywords"""
+        text_lower = text.lower()
+        
+        found_keywords = []
+        for keyword in self.style_keywords:
+            if keyword in text_lower:
+                found_keywords.append(keyword.title())
+        
+        return ", ".join(found_keywords) if found_keywords else None
+    
+    def _extract_pattern(self, text: str) -> Optional[str]:
+        """Extract pattern information"""
+        text_lower = text.lower()
+        
+        for pattern in self.pattern_keywords:
+            if pattern in text_lower:
+                return pattern.title()
+        
+        return None
+    
+    def _extract_color(self, text: str) -> Optional[str]:
+        """Extract color from text"""
+        common_colors = [
+            'black', 'white', 'navy', 'blue', 'red', 'pink', 'green',
+            'yellow', 'orange', 'purple', 'brown', 'gray', 'grey',
+            'beige', 'cream', 'tan', 'burgundy', 'maroon', 'olive'
+        ]
+        
+        text_lower = text.lower()
+        
+        for color in common_colors:
+            if color in text_lower:
+                return color.title()
+        
+        return None
+    
+    def _extract_price_from_text(self, text: str) -> Optional[float]:
+        """Extract price from text"""
+        return self._parse_price_string(text)
+    
+    def _parse_price_string(self, price_str: str) -> Optional[float]:
+        """Parse price string to float"""
+        if not price_str:
+            return None
+        
+        try:
+            # Remove currency symbols and commas
+            cleaned = re.sub(r'[^\d.]', '', str(price_str))
+            
+            if cleaned:
+                price = float(cleaned)
+                # Sanity check
+                if 5 <= price <= 50000:  # Reasonable garment price range
+                    return price
+        except:
+            pass
+        
+        return None
+    
+    def _extract_condition(self, text: str) -> str:
+        """Extract condition from text"""
+        text_lower = text.lower()
+        
+        condition_map = {
+            'new with tags': 'new',
+            'nwt': 'new',
+            'new': 'new',
+            'like new': 'like-new',
+            'excellent': 'excellent',
+            'good': 'good',
+            'used': 'used',
+            'pre-owned': 'used',
+            'vintage': 'vintage'
+        }
+        
+        for keyword, condition in condition_map.items():
+            if keyword in text_lower:
+                return condition
+        
+        return 'unknown'
+    
+    def _identify_marketplace(self, source: str, url: str) -> str:
+        """Identify the marketplace/platform"""
+        combined = f"{source} {url}".lower()
+        
+        marketplace_map = {
+            'ebay': 'ebay',
+            'poshmark': 'poshmark',
+            'mercari': 'mercari',
+            'grailed': 'grailed',
+            'vestiaire': 'vestiaire',
+            'therealreal': 'therealreal',
+            'farfetch': 'retailer',
+            'nordstrom': 'retailer',
+            'saks': 'retailer',
+            'neiman': 'retailer',
+            'bloomingdale': 'retailer',
+            'shopbop': 'retailer',
+            'net-a-porter': 'retailer',
+            'matchesfashion': 'retailer'
+        }
+        
+        for keyword, marketplace in marketplace_map.items():
+            if keyword in combined:
+                return marketplace
+        
+        return 'other'
+    
+    def _create_empty_result(self, reason: str) -> ExactMatchResult:
+        """Create empty result when search fails"""
+        return ExactMatchResult(
+            is_exact_match=False,
+            confidence=0.0,
+            style_name="Unknown",
+            full_product_name="Unknown"
+        )
+
+
+def integrate_lens_pricing(
+    pipeline_data,
+    garment_image: np.ndarray,
+    api_key: str,
+    high_end_threshold: float = 100.0
+) -> dict:
+    """
+    Integration function to add to your pipeline
+    
+    Use this at the end of your pipeline for high-end items
+    
+    Args:
+        pipeline_data: Your PipelineData object
+        garment_image: Full garment image (not tag)
+        api_key: SERP API key
+        high_end_threshold: Only use Lens for items above this estimated price
+    
+    Returns:
+        Updated pricing and style information
+    """
+    # Only use for designer/high-end items
+    if not pipeline_data.is_designer and pipeline_data.price_estimate['mid'] < high_end_threshold:
+        logger.info("[LENS] Skipping - not high-end item")
+        return {
+            'used_lens': False,
+            'reason': 'Not high-end item'
+        }
+    
+    # Initialize finder
+    finder = GoogleLensPriceFinder(api_key=api_key)
+    
+    # Find exact match
+    result = finder.find_exact_garment(
+        garment_image=garment_image,
+        brand=pipeline_data.brand,
+        garment_type=pipeline_data.garment_type,
+        pattern=pipeline_data.pattern,
+        color=pipeline_data.style,  # Assuming style includes color
+        high_end_only=True
+    )
+    
+    # Update pipeline data with enhanced information
+    updates = {
+        'used_lens': True,
+        'lens_confidence': result.confidence,
+        'exact_match_found': result.is_exact_match
+    }
+    
+    if result.is_exact_match and result.confidence > 0.7:
+        # High confidence match - use Lens pricing
+        updates.update({
+            'enhanced_style_name': result.style_name,
+            'full_product_name': result.full_product_name,
+            'price_low': result.price_low,
+            'price_high': result.price_high,
+            'price_median': result.price_median,
+            'price_estimate': {
+                'low': result.price_low,
+                'mid': result.price_median,
+                'high': result.price_high
+            },
+            'available_listings': result.available_listings,
+            'retail_price': result.retail_price,
+            'resale_ratio': result.resale_ratio,
+            'demand_score': result.demand_score,
+            'pricing_method': 'Google Lens Visual Match',
+            'visual_matches_count': len(result.visual_matches)
+        })
+        
+        logger.info(f"[LENS] ✅ Enhanced pricing: ${result.price_low:.0f}-${result.price_high:.0f}")
+        logger.info(f"[LENS] Style: {result.full_product_name}")
+        
+    else:
+        # Low confidence - keep original estimates but note the attempt
+        updates['pricing_method'] = 'Standard (Lens inconclusive)'
+        logger.info(f"[LENS] ⚠️ Low confidence match ({result.confidence:.2f})")
+    
+    return updates
+
 
 # ============================================
 # EBAY SEARCH WITH CATEGORY FILTERING
@@ -8003,6 +9337,234 @@ class ActiveLearner:
         
         return focus_areas
 
+class CorrectionAnalyzer:
+    """Analyzes correction patterns to identify common issues"""
+    
+    def __init__(self):
+        self.correction_patterns = {}
+        self.common_errors = {}
+    
+    def analyze_corrections(self, corrections_data):
+        """Analyze all corrections to find patterns"""
+        patterns = {
+            'common_misclassifications': self._find_common_errors(corrections_data),
+            'lighting_issues': self._analyze_lighting_correlation(corrections_data),
+            'confidence_correlation': self._analyze_confidence(corrections_data),
+            'brand_specific_issues': self._analyze_brand_patterns(corrections_data)
+        }
+        return patterns
+    
+    def _find_common_errors(self, corrections):
+        """Find most common prediction errors"""
+        error_counts = {}
+        for correction in corrections:
+            original = correction.get('original_prediction', {})
+            corrected = correction.get('user_correction', {})
+            
+            for field in original:
+                if str(original[field]) != str(corrected.get(field, '')):
+                    error_key = f"{field}: {original[field]} → {corrected[field]}"
+                    error_counts[error_key] = error_counts.get(error_key, 0) + 1
+        
+        return dict(sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:10])
+    
+    def _analyze_lighting_correlation(self, corrections):
+        """Analyze correlation between lighting conditions and errors"""
+        lighting_errors = {}
+        for correction in corrections:
+            context = correction.get('context', {})
+            lighting = context.get('lighting_condition', 'unknown')
+            
+            if lighting not in lighting_errors:
+                lighting_errors[lighting] = {'total': 0, 'errors': 0}
+            
+            lighting_errors[lighting]['total'] += 1
+            if correction.get('has_correction', False):
+                lighting_errors[lighting]['errors'] += 1
+        
+        # Calculate error rates
+        for lighting in lighting_errors:
+            total = lighting_errors[lighting]['total']
+            errors = lighting_errors[lighting]['errors']
+            lighting_errors[lighting]['error_rate'] = errors / total if total > 0 else 0
+        
+        return lighting_errors
+    
+    def _analyze_confidence(self, corrections):
+        """Analyze correlation between confidence and accuracy"""
+        confidence_buckets = {}
+        for correction in corrections:
+            confidence = correction.get('confidence', 0.5)
+            bucket = int(confidence * 10) / 10  # Round to nearest 0.1
+            
+            if bucket not in confidence_buckets:
+                confidence_buckets[bucket] = {'total': 0, 'correct': 0}
+            
+            confidence_buckets[bucket]['total'] += 1
+            if not correction.get('has_correction', False):
+                confidence_buckets[bucket]['correct'] += 1
+        
+        # Calculate accuracy rates
+        for bucket in confidence_buckets:
+            total = confidence_buckets[bucket]['total']
+            correct = confidence_buckets[bucket]['correct']
+            confidence_buckets[bucket]['accuracy'] = correct / total if total > 0 else 0
+        
+        return confidence_buckets
+    
+    def _analyze_brand_patterns(self, corrections):
+        """Analyze brand-specific correction patterns"""
+        brand_errors = {}
+        for correction in corrections:
+            context = correction.get('context', {})
+            brand = context.get('brand', 'unknown')
+            
+            if brand not in brand_errors:
+                brand_errors[brand] = {'total': 0, 'errors': 0, 'common_errors': {}}
+            
+            brand_errors[brand]['total'] += 1
+            if correction.get('has_correction', False):
+                brand_errors[brand]['errors'] += 1
+                
+                # Track specific errors for this brand
+                original = correction.get('original_prediction', {})
+                corrected = correction.get('user_correction', {})
+                for field in original:
+                    if str(original[field]) != str(corrected.get(field, '')):
+                        error = f"{field}: {original[field]} → {corrected[field]}"
+                        brand_errors[brand]['common_errors'][error] = brand_errors[brand]['common_errors'].get(error, 0) + 1
+        
+        return brand_errors
+
+class PromptOptimizer:
+    """Optimizes prompts based on correction patterns"""
+    
+    def __init__(self):
+        self.prompt_templates = {
+            'brand_detection': "Identify the brand name from this clothing tag. Look for logos, text, and distinctive design elements.",
+            'size_detection': "Extract the size information from this clothing tag. Look for size labels, measurements, or size codes.",
+            'material_detection': "Identify the material composition from this clothing tag. Look for fabric content, care instructions, or material labels."
+        }
+        self.optimization_history = []
+    
+    def update_prompts_based_on_corrections(self, correction_patterns):
+        """Update prompts based on learned correction patterns"""
+        updates = {}
+        
+        # Analyze common errors and update prompts
+        common_errors = correction_patterns.get('common_misclassifications', {})
+        
+        for error, count in common_errors.items():
+            if 'brand' in error.lower():
+                updates['brand_detection'] = self._improve_brand_prompt(error, count)
+            elif 'size' in error.lower():
+                updates['size_detection'] = self._improve_size_prompt(error, count)
+            elif 'material' in error.lower():
+                updates['material_detection'] = self._improve_material_prompt(error, count)
+        
+        # Apply updates
+        for prompt_type, new_prompt in updates.items():
+            self.prompt_templates[prompt_type] = new_prompt
+            self.optimization_history.append({
+                'timestamp': time.time(),
+                'prompt_type': prompt_type,
+                'old_prompt': self.prompt_templates[prompt_type],
+                'new_prompt': new_prompt,
+                'trigger': f"Error pattern: {error} (count: {count})"
+            })
+        
+        return updates
+    
+    def _improve_brand_prompt(self, error, count):
+        """Improve brand detection prompt based on common errors"""
+        base_prompt = self.prompt_templates['brand_detection']
+        
+        if 'logo' in error.lower():
+            return base_prompt + " Pay special attention to logo placement and style. Some brands have distinctive logo patterns."
+        elif 'font' in error.lower():
+            return base_prompt + " Note the font style and typography - this can be a key brand identifier."
+        else:
+            return base_prompt + " Be extra careful with brand name spelling and formatting."
+    
+    def _improve_size_prompt(self, error, count):
+        """Improve size detection prompt based on common errors"""
+        base_prompt = self.prompt_templates['size_detection']
+        
+        if 'measurement' in error.lower():
+            return base_prompt + " Look for both size codes (S, M, L) and measurements (inches, cm)."
+        else:
+            return base_prompt + " Check for size labels in multiple formats and locations on the tag."
+    
+    def _improve_material_prompt(self, error, count):
+        """Improve material detection prompt based on common errors"""
+        base_prompt = self.prompt_templates['material_detection']
+        
+        return base_prompt + " Look for fabric composition percentages and care instructions that indicate material type."
+
+class AccuracyTracker:
+    """Tracks accuracy metrics over time"""
+    
+    def __init__(self):
+        self.accuracy_history = {
+            'brand': [],
+            'size': [],
+            'material': [],
+            'garment_type': [],
+            'overall': []
+        }
+        self.daily_metrics = {}
+    
+    def record_accuracy(self, component, accuracy, timestamp=None):
+        """Record accuracy for a component"""
+        if timestamp is None:
+            timestamp = time.time()
+        
+        if component in self.accuracy_history:
+            self.accuracy_history[component].append({
+                'timestamp': timestamp,
+                'accuracy': accuracy
+            })
+            
+            # Keep only last 1000 records
+            if len(self.accuracy_history[component]) > 1000:
+                self.accuracy_history[component] = self.accuracy_history[component][-1000:]
+    
+    def calculate_trends(self):
+        """Calculate accuracy trends over time"""
+        trends = {}
+        
+        for component, history in self.accuracy_history.items():
+            if len(history) < 2:
+                trends[component] = {'trend': 'insufficient_data', 'change': 0}
+                continue
+            
+            # Calculate trend over last 100 records
+            recent = history[-100:] if len(history) >= 100 else history
+            old_avg = sum([h['accuracy'] for h in recent[:len(recent)//2]]) / (len(recent)//2)
+            new_avg = sum([h['accuracy'] for h in recent[len(recent)//2:]]) / (len(recent) - len(recent)//2)
+            
+            change = new_avg - old_avg
+            if change > 0.05:
+                trend = 'improving'
+            elif change < -0.05:
+                trend = 'declining'
+            else:
+                trend = 'stable'
+            
+            trends[component] = {'trend': trend, 'change': change}
+        
+        return trends
+    
+    def get_current_accuracy(self):
+        """Get current accuracy for each component"""
+        current = {}
+        for component, history in self.accuracy_history.items():
+            if history:
+                current[component] = history[-1]['accuracy']
+            else:
+                current[component] = 0.0
+        return current
+
 class LearningOrchestrator:
     """Main orchestrator for all learning components"""
     
@@ -8016,7 +9578,12 @@ class LearningOrchestrator:
         self.learning_log = "logs/learning_events.jsonl"
         os.makedirs("logs", exist_ok=True)
         
-        logger.info("[LEARNING] Orchestrator initialized")
+        # Add missing feedback loop components
+        self.correction_analyzer = CorrectionAnalyzer()
+        self.prompt_optimizer = PromptOptimizer()
+        self.accuracy_tracker = AccuracyTracker()
+        
+        logger.info("[LEARNING] Orchestrator initialized with complete feedback loop")
     
     def process_prediction(self, predicted, actual, confidence, metadata=None):
         """Process a prediction and its correction"""
@@ -8116,9 +9683,9 @@ class LearningOrchestrator:
         }
     
     def daily_routine(self):
-        """Daily adaptation routine"""
+        """Enhanced daily adaptation routine with complete feedback loop"""
         
-        logger.info("[LEARNING] Running daily adaptation routine")
+        logger.info("[LEARNING] Running enhanced daily adaptation routine")
         
         # Decay exploration
         self.q_learning_agent.decay_epsilon()
@@ -8132,10 +9699,45 @@ class LearningOrchestrator:
             if recent_acc < older_acc - 0.1:  # 10% drop
                 logger.warning(f"[LEARNING] Accuracy drop detected for {component}: {older_acc:.1%} → {recent_acc:.1%}")
         
+        # NEW: Enhanced feedback loop analysis
+        recent_events = self.feedback_collector.get_recent_events(days=7)
+        if recent_events:
+            # Convert events to correction data format
+            corrections_data = []
+            for event in recent_events:
+                if event.event_type == 'user_correction':
+                    corrections_data.append({
+                        'original_prediction': event.predicted,
+                        'user_correction': event.actual,
+                        'confidence': event.confidence,
+                        'context': event.metadata or {},
+                        'has_correction': event.reward < 0  # Negative reward = correction needed
+                    })
+            
+            # Analyze correction patterns
+            if corrections_data:
+                patterns = self.correction_analyzer.analyze_corrections(corrections_data)
+                logger.info(f"[LEARNING] Found {len(patterns['common_misclassifications'])} common error patterns")
+                
+                # Update prompts based on patterns
+                prompt_updates = self.prompt_optimizer.update_prompts_based_on_corrections(patterns)
+                if prompt_updates:
+                    logger.info(f"[LEARNING] Updated {len(prompt_updates)} prompts based on corrections")
+                
+                # Track accuracy trends
+                for component, accuracy in recent_accuracy.items():
+                    self.accuracy_tracker.record_accuracy(component, accuracy)
+                
+                # Calculate and log trends
+                trends = self.accuracy_tracker.calculate_trends()
+                for component, trend_info in trends.items():
+                    if trend_info['trend'] != 'insufficient_data':
+                        logger.info(f"[LEARNING] {component} accuracy: {trend_info['trend']} ({trend_info['change']:+.3f})")
+        
         # Save all models
         self.q_learning_agent._save_q_table()
         
-        logger.info("[LEARNING] Daily adaptation complete")
+        logger.info("[LEARNING] Enhanced daily adaptation complete")
     
     def _log_learning_event(self, event, metadata):
         """Log learning event for analysis"""
@@ -8282,6 +9884,77 @@ def test_learning_system():
     
     return status
 
+
+def test_knitwear_detection():
+    """Test the knitwear detection system specifically"""
+    st.markdown("### 🧶 Knitwear Detection Test")
+    
+    try:
+        detector = KnitwearDetector()
+        
+        # Test cases
+        test_cases = [
+            {
+                'name': 'AKRIS Sweater (should be corrected)',
+                'garment_type': 'jacket',
+                'brand': 'A-KRIS- punto',
+                'material': 'wool blend',
+                'style': 'cable knit',
+                'has_front_opening': True,
+                'expected': 'cardigan'
+            },
+            {
+                'name': 'Leather Jacket (should stay jacket)',
+                'garment_type': 'jacket',
+                'brand': 'Unknown',
+                'material': 'leather',
+                'style': 'bomber',
+                'has_front_opening': True,
+                'expected': 'jacket'
+            },
+            {
+                'name': 'Cotton Sweater (should be corrected)',
+                'garment_type': 'jacket',
+                'brand': 'Theory',
+                'material': 'cotton knit',
+                'style': 'soft',
+                'has_front_opening': False,
+                'expected': 'sweater'
+            }
+        ]
+        
+        for i, test_case in enumerate(test_cases):
+            st.write(f"**Test {i+1}: {test_case['name']}**")
+            
+            result = detector.fix_classification(
+                garment_type=test_case['garment_type'],
+                brand=test_case['brand'],
+                material=test_case['material'],
+                style=test_case['style'],
+                has_front_opening=test_case['has_front_opening']
+            )
+            
+            if result['correction_applied']:
+                corrected_type = result['corrected_type']
+                if corrected_type == test_case['expected']:
+                    st.success(f"✅ PASS: Corrected to {corrected_type} (confidence: {result['confidence']:.2f})")
+                else:
+                    st.warning(f"⚠️ PARTIAL: Corrected to {corrected_type}, expected {test_case['expected']}")
+            else:
+                if test_case['expected'] == 'jacket':
+                    st.success(f"✅ PASS: Kept as jacket (no correction needed)")
+                else:
+                    st.error(f"❌ FAIL: Should have corrected to {test_case['expected']}")
+            
+            st.caption(f"Reason: {result['correction_reason']}")
+            st.markdown("---")
+        
+        st.success("🎉 Knitwear detection test completed!")
+        
+    except Exception as e:
+        st.error(f"❌ Knitwear detection test failed: {e}")
+        logger.error(f"Knitwear detection test error: {e}")
+
 # ============================================
 # STREAMLIT UI COMPONENTS FOR LEARNING
 # ============================================
@@ -8393,6 +10066,116 @@ def show_learning_dashboard():
     st.sidebar.markdown("---")
     if st.sidebar.button("🧪 Test Learning System"):
         test_learning_system()
+    
+    # Test button for knitwear detection
+    if st.sidebar.button("🧶 Test Knitwear Detection"):
+        test_knitwear_detection()
+
+def apply_knitwear_correction(pipeline_data, garment_image: np.ndarray = None) -> Dict:
+    """
+    Apply knitwear correction to pipeline data
+    
+    Usage:
+        # After your AI garment analysis:
+        correction_result = apply_knitwear_correction(pipeline_data, garment_frame)
+        
+        if correction_result['correction_applied']:
+            pipeline_data.garment_type = correction_result['corrected_type']
+            logger.info(f"✅ Corrected to: {correction_result['corrected_type']}")
+    
+    Returns:
+        Dict with correction results
+    """
+    
+    detector = KnitwearDetector()
+    
+    result = detector.fix_classification(
+        garment_type=pipeline_data.garment_type,
+        brand=pipeline_data.brand,
+        material=pipeline_data.material,
+        style=pipeline_data.style,
+        visible_features=getattr(pipeline_data, 'visible_features', []),
+        garment_image=garment_image,
+        has_front_opening=getattr(pipeline_data, 'has_front_opening', False)
+    )
+    
+    return result
+
+
+def save_sweater_jacket_correction(
+    pipeline_data,
+    correct_type: str,
+    correction_reason: str,
+    image_path: str = None
+):
+    """
+    Save this specific correction for training
+    """
+    import json
+    import os
+    from datetime import datetime
+    
+    correction = {
+        'timestamp': datetime.now().isoformat(),
+        'issue_type': 'sweater_jacket_misclassification',
+        'original_classification': 'jacket',
+        'correct_classification': correct_type,
+        'brand': pipeline_data.brand,
+        'material': pipeline_data.material,
+        'style': pipeline_data.style,
+        'correction_reason': correction_reason,
+        'confidence_was_high': True,  # AI was confident but wrong
+        'image_path': image_path,
+        'training_priority': 'HIGH'  # This is a critical error to fix
+    }
+    
+    os.makedirs('training_data/sweater_jacket_errors', exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'training_data/sweater_jacket_errors/correction_{timestamp}.json'
+    
+    with open(filename, 'w') as f:
+        json.dump(correction, f, indent=2)
+    
+    logger.info(f"💾 Saved correction for training: {filename}")
+    
+    # Check if we have enough examples to retrain
+    corrections_dir = 'training_data/sweater_jacket_errors'
+    correction_count = len([f for f in os.listdir(corrections_dir) if f.endswith('.json')])
+    
+    if correction_count >= 5:
+        logger.warning("⚠️ ALERT: 5+ sweater/jacket corrections collected!")
+        logger.warning("   → Consider updating the AI prompt or adding validation rules")
+
+
+def collect_sweater_jacket_correction(original_image, correct_type='sweater'):
+    """
+    Save this specific correction for training
+    """
+    correction = {
+        'timestamp': datetime.now().isoformat(),
+        'misclassification': 'jacket',
+        'correct_classification': correct_type,
+        'issue_type': 'sweater_vs_jacket_confusion',
+        'material_hint': 'knitted/soft fabric',
+        'visual_features': [
+            'soft texture',
+            'draped fabric',
+            'ribbed cuffs',
+            'casual wear'
+        ],
+        'prompt_improvement_needed': True,
+        'rule_to_add': 'Check material type before classifying as jacket'
+    }
+    
+    save_correction_for_training(correction)
+    
+    # Update prompt engineering based on this pattern
+    if get_correction_count('sweater_vs_jacket_confusion') > 3:
+        logger.warning("⚠️ PATTERN DETECTED: Multiple sweater/jacket confusions!")
+        logger.warning("   → Updating classification prompt with more examples")
+        # update_classification_prompt_with_examples()
+
 
 def analyze_garment_and_learn(tag_image, garment_image, pipeline_data):
     """
@@ -9912,6 +11695,48 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             pipeline_data.fit = data.get('fit', 'Regular')
             pipeline_data.style = data.get('style', 'Unknown')
             
+            # NEW: Apply comprehensive knitwear correction
+            if pipeline_data.garment_type.lower() == 'jacket':
+                logger.info(f"[KNITWEAR] Checking jacket classification for correction...")
+
+                # Apply comprehensive knitwear detection
+                correction_result = apply_knitwear_correction(pipeline_data, self.garment_image)
+
+                if correction_result['correction_applied']:
+                    old_type = pipeline_data.garment_type
+                    pipeline_data.garment_type = correction_result['corrected_type']
+
+                    logger.warning("=" * 60)
+                    logger.warning(f"🔄 CORRECTED: {old_type} → {pipeline_data.garment_type}")
+                    logger.warning(f"   Confidence: {correction_result['confidence']:.2f}")
+                    logger.warning(f"   Reason: {correction_result['correction_reason']}")
+                    logger.warning("=" * 60)
+
+                    # Show correction to user
+                    st.warning(f"🔧 **Auto-corrected:** {pipeline_data.garment_type.title()} (was: {old_type.title()})")
+                    st.caption(f"Reason: {correction_result['correction_reason']}")
+                    st.caption(f"Confidence: {correction_result['confidence']:.1%}")
+
+                    # Save correction for training
+                    save_sweater_jacket_correction(
+                        pipeline_data,
+                        correct_type=pipeline_data.garment_type,
+                        correction_reason=correction_result['correction_reason']
+                    )
+                else:
+                    logger.info(f"[KNITWEAR] No auto-correction applied - confidence: {correction_result['confidence']:.2f}")
+
+                    # Show suggestion for manual correction if confidence is above 0.1
+                    if correction_result['confidence'] > 0.1:
+                        st.info(f"🤔 **Suggestion:** Consider if this should be a {correction_result.get('suggested_type', 'sweater/cardigan')} instead of jacket")
+                        st.caption(f"Reason: {correction_result['correction_reason']}")
+
+                        # Add manual override button
+                        if st.button("✅ Confirm as Sweater/Cardigan", key="manual_sweater_correction"):
+                            pipeline_data.garment_type = correction_result.get('suggested_type', 'sweater')
+                            st.success(f"✅ Manually corrected to: {pipeline_data.garment_type}")
+                            st.rerun()
+            
             # Color & Material
             pipeline_data.primary_color = data.get('primary_color', 'Unknown')
             pipeline_data.pattern = data.get('pattern', 'None')
@@ -10276,16 +12101,17 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             st.markdown("#### 📊 Pipeline Progress")
             self.render_cool_step_pipeline()
         
-        # ========================================================================
-        # ====== 3. CAMERA FEED (Right under board) ======
-        # ========================================================================
-        self.render_camera_feeds()
+        # Camera feed removed - single feed in step content is sufficient
         
         # ========================================================================
         # ====== 4. MAIN CONTENT AREA (Centered Camera or Step Info) ======
         # ========================================================================
         # Render step header with navigation buttons at the top
         self._render_step_header()
+        
+        # Handle Google Lens analysis if requested
+        if st.session_state.get('google_lens_requested', False):
+            self._render_google_lens_analysis()
         
         # This section will render the content for the current step
         if self.current_step == 0:
@@ -10574,14 +12400,120 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         if 'armpit_points' not in st.session_state:
             st.session_state.armpit_points = []
         
-        # Get RealSense camera frame with error handling
+        # Get full camera frame WITHOUT ROI cropping for armpit measurement
         try:
-            frame = self.camera_manager.get_realsense_frame()
+            # Use the same camera as the main display but without ROI
+            frame = None
+            
+            # Check if user wants to switch camera view
+            camera_switched = st.session_state.get('armpit_camera_switched', False)
+            
+            if camera_switched:
+                # Try RealSense first if user switched
+                if hasattr(self.camera_manager, 'realsense_cap') and self.camera_manager.realsense_cap:
+                    ret, raw_frame = self.camera_manager.realsense_cap.read()
+                    if ret:
+                        frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+                        logger.info("[ARMPIT-MEASUREMENT] Using RealSense frame (user switched)")
+                # Clear the switch flag
+                st.session_state.armpit_camera_switched = False
+            else:
+                # Default: Use Logitech C930e camera for garment analysis (NOT ArduCam)
+                if hasattr(self.camera_manager, 'c930e') and self.camera_manager.c930e:
+                    # Get full resolution frame from Logitech (not preview)
+                    frame = self.camera_manager.c930e.get_frame(use_preview_res=False)
+                    if frame is not None:
+                        logger.info("[ARMPIT-MEASUREMENT] Using Logitech C930e full resolution frame (no ROI)")
+            
+            # Fallback: Try RealSense if Logitech not available
+            if frame is None and hasattr(self.camera_manager, 'realsense_cap') and self.camera_manager.realsense_cap:
+                ret, raw_frame = self.camera_manager.realsense_cap.read()
+                if ret:
+                    frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+                    logger.info("[ARMPIT-MEASUREMENT] Using raw RealSense frame (no ROI)")
+            
+            # DO NOT use ArduCam for armpit measurement - it's for tag capture only
+            
+            if frame is None:
+                logger.warning("[ARMPIT-MEASUREMENT] No camera frame available")
+                
         except Exception as e:
-            logger.error(f"[ARMPIT-MEASUREMENT] RealSense camera error: {e}")
+            logger.error(f"[ARMPIT-MEASUREMENT] Camera error: {e}")
             frame = None
         
         if frame is not None:
+            # Debug: Show frame dimensions
+            h, w = frame.shape[:2]
+            logger.info(f"[ARMPIT-MEASUREMENT] Frame dimensions: {w}x{h}")
+            st.success(f"📐 **Full Frame Available:** {w}x{h} pixels")
+            
+            # Check if garment is properly positioned for armpit measurement
+            st.info("🎯 **You should now see the ENTIRE garment in T-pose below (Logitech camera view).** Click the left armpit seam, then the right armpit seam.")
+            st.caption("💡 **T-pose means:** sleeves extended horizontally, garment laid flat, armpit seams visible")
+            st.caption("📷 **Using Logitech camera** for garment analysis (not ArduCam)")
+            
+            # Add guidance for better garment positioning
+            with st.expander("📋 **How to Position Garment for Armpit Measurement**", expanded=True):
+                st.markdown("""
+                **For accurate armpit seam measurement, position the garment in T-pose:**
+                
+                1. **Lay flat** - Spread the garment flat on the surface
+                2. **T-pose position** - Extend sleeves horizontally (like a T)
+                3. **Smooth sleeves** - Pull sleeves out to full length, not bunched up
+                4. **Make seams visible** - Ensure both armpit seams are clearly visible
+                5. **Stack properly** - If stacking multiple items, ensure current item is on top
+                
+                **Current issues I can see:**
+                - ❌ Sleeves are bunched up or not extended horizontally
+                - ❌ Other clothes underneath are blocking the view
+                - ❌ Armpit seams are not visible due to draping or stacking
+                
+                **What you should see instead:**
+                - ✅ Garment in T-pose with sleeves extended horizontally
+                - ✅ Both armpit seams clearly visible and accessible
+                - ✅ Current garment on top of the stack
+                """)
+            
+            # Add fallback option if user still can't see full garment
+            if st.button("🔄 Try Different Camera View", key="switch_camera_view"):
+                st.session_state.armpit_camera_switched = True
+                st.rerun()
+            
+            # Add manual measurement option
+            if st.button("📏 Use Manual Measurement Instead", key="manual_armpit_measurement"):
+                st.session_state.use_manual_armpit_measurement = True
+                st.rerun()
+            
+            # Check if user wants manual measurement
+            if st.session_state.get('use_manual_armpit_measurement', False):
+                st.markdown("#### 📏 Manual Armpit Measurement")
+                st.info("Since the armpit seams aren't visible, please measure manually:")
+                
+                manual_width = st.number_input(
+                    "Enter armpit-to-armpit width (inches):", 
+                    min_value=0.0, max_value=50.0, value=20.0, step=0.1,
+                    help="Measure from the left armpit seam to the right armpit seam"
+                )
+                
+                if st.button("✅ Use Manual Measurement", key="confirm_manual_armpit"):
+                    # Store manual measurement
+                    self.pipeline_data.armpit_measurement = {
+                        'width_inches': manual_width,
+                        'width_cm': manual_width * 2.54,
+                        'method': 'manual',
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    st.success(f"✅ Manual measurement recorded: {manual_width} inches ({manual_width * 2.54:.1f} cm)")
+                    st.session_state.use_manual_armpit_measurement = False
+                    st.rerun()
+                
+                if st.button("🔄 Try Click Measurement Again", key="retry_click_measurement"):
+                    st.session_state.use_manual_armpit_measurement = False
+                    st.rerun()
+                
+                return  # Skip the click detection below
+            
             # Use streamlit_image_coordinates for click detection
             from streamlit_image_coordinates import streamlit_image_coordinates
             
@@ -11872,6 +13804,246 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 # Fallback button removed - using main button in render_action_panel()
                 st.write("")  # Empty space for layout
             st.session_state.next_step_button_rendered = True
+    def _render_google_lens_analysis(self):
+        """Render advanced Google Lens analysis results for high-end item identification"""
+        st.markdown("---")
+        st.markdown("### 🔍 Advanced Google Lens Analysis (Exact Garment Matching)")
+        
+        if 'google_lens_frame' not in st.session_state:
+            st.error("❌ No frame captured for Google Lens analysis")
+            return
+        
+        # Display the captured frame
+        frame = st.session_state.google_lens_frame
+        st.image(frame, caption="Logitech Camera - Advanced Google Lens Analysis", width=400)
+        
+        # Use advanced Google Lens framework
+        with st.spinner("🔍 Advanced Google Lens analysis in progress..."):
+            try:
+                # Get current pipeline data for context
+                pipeline_data = self.pipeline_data
+                
+                # Initialize advanced Google Lens finder
+                lens_finder = GoogleLensPriceFinder(api_key=os.getenv('SERPAPI_KEY'))
+                
+                # Find exact garment match
+                result = lens_finder.find_exact_garment(
+                    garment_image=frame,
+                    brand=pipeline_data.brand if hasattr(pipeline_data, 'brand') else None,
+                    garment_type=pipeline_data.garment_type if hasattr(pipeline_data, 'garment_type') else None,
+                    pattern=pipeline_data.pattern if hasattr(pipeline_data, 'pattern') else None,
+                    color=pipeline_data.style if hasattr(pipeline_data, 'style') else None,
+                    high_end_only=True
+                )
+                
+                # Structure results for display
+                analysis_results = {
+                    'exact_matches': [],
+                    'similar_items': [],
+                    'style_analysis': {
+                        'brand': pipeline_data.brand if hasattr(pipeline_data, 'brand') else 'Unknown',
+                        'style_name': result.style_name,
+                        'full_product_name': result.full_product_name,
+                        'era': 'Unknown',
+                        'material': 'Unknown',
+                        'hardware': 'Unknown'
+                    },
+                    'market_intelligence': {
+                        'price_low': result.price_low,
+                        'price_high': result.price_high,
+                        'price_median': result.price_median,
+                        'retail_price': result.retail_price,
+                        'resale_ratio': result.resale_ratio,
+                        'demand_score': result.demand_score,
+                        'available_listings': result.available_listings
+                    }
+                }
+                
+                # Process visual matches into structured format
+                for i, match in enumerate(result.visual_matches[:5]):  # Top 5 matches
+                    title = match.title
+                    source = match.source
+                    link = match.link
+                    price = f"${match.price:.2f}" if match.price else 'Price N/A'
+                    confidence = match.similarity_score
+                    
+                    if i < 2:  # Top 2 are "exact matches"
+                        analysis_results['exact_matches'].append({
+                            'title': title,
+                            'price': price,
+                            'source': source,
+                            'confidence': confidence,
+                            'url': link,
+                            'brand': match.brand,
+                            'style_name': match.style_name,
+                            'pattern': match.pattern,
+                            'color': match.color,
+                            'condition': match.condition
+                        })
+                    else:  # Rest are "similar items"
+                        analysis_results['similar_items'].append({
+                            'title': title,
+                            'price': price,
+                            'source': source,
+                            'confidence': confidence,
+                            'brand': match.brand,
+                            'style_name': match.style_name,
+                            'pattern': match.pattern,
+                            'color': match.color
+                        })
+                
+                # Store the result for later use
+                st.session_state.advanced_lens_result = result
+                    
+            except Exception as e:
+                st.error(f"❌ Advanced Google Lens analysis failed: {e}")
+                logger.error(f"[ADVANCED-LENS] Error: {e}")
+                return
+        
+        # Display results
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🎯 Exact Matches")
+            if analysis_results['exact_matches']:
+                for i, match in enumerate(analysis_results['exact_matches']):
+                    with st.expander(f"Match {i+1}: {match['title']}"):
+                        st.write(f"**Price:** {match['price']}")
+                        st.write(f"**Source:** {match['source']}")
+                        st.write(f"**Confidence:** {match['confidence']:.1%}")
+                        if match.get('brand'):
+                            st.write(f"**Brand:** {match['brand']}")
+                        if match.get('style_name'):
+                            st.write(f"**Style:** {match['style_name']}")
+                        if match.get('pattern'):
+                            st.write(f"**Pattern:** {match['pattern']}")
+                        if match.get('color'):
+                            st.write(f"**Color:** {match['color']}")
+                        if match.get('condition'):
+                            st.write(f"**Condition:** {match['condition']}")
+                        if match['url'] != '#':
+                            st.write(f"[View Item]({match['url']})")
+            else:
+                st.info("No exact matches found")
+        
+        with col2:
+            st.subheader("📊 Style Analysis")
+            style = analysis_results['style_analysis']
+            st.write(f"**Brand:** {style['brand']}")
+            st.write(f"**Style Name:** {style['style_name']}")
+            st.write(f"**Full Product Name:** {style['full_product_name']}")
+            st.write(f"**Era:** {style['era']}")
+            st.write(f"**Material:** {style['material']}")
+            st.write(f"**Hardware:** {style['hardware']}")
+        
+        # Show similar items if available
+        if analysis_results['similar_items']:
+            st.subheader("🔍 Similar Items")
+            for i, item in enumerate(analysis_results['similar_items']):
+                st.write(f"**{i+1}.** {item['title']} - {item['price']} ({item['source']})")
+                if item.get('style_name'):
+                    st.caption(f"   Style: {item['style_name']}")
+        
+        # Advanced Market Intelligence
+        market = analysis_results['market_intelligence']
+        if market['price_low'] > 0:
+            st.subheader("💰 Advanced Market Intelligence")
+            
+            # Price range metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Low", f"${market['price_low']:,.0f}")
+            with col2:
+                st.metric("Median", f"${market['price_median']:,.0f}")
+            with col3:
+                st.metric("High", f"${market['price_high']:,.0f}")
+            with col4:
+                st.metric("Listings", f"{market['available_listings']}")
+            
+            # Market insights
+            if market['retail_price']:
+                st.write(f"**🏷️ Retail Price:** ${market['retail_price']:,.0f}")
+            
+            if market['resale_ratio']:
+                st.write(f"**📉 Resale Ratio:** {market['resale_ratio']:.1%} (resale vs retail)")
+            
+            if market['demand_score'] > 0:
+                demand_level = "High" if market['demand_score'] > 0.7 else "Medium" if market['demand_score'] > 0.4 else "Low"
+                st.write(f"**📈 Demand Score:** {demand_level} ({market['demand_score']:.1%})")
+            
+            # Confidence indicator
+            if 'advanced_lens_result' in st.session_state:
+                result = st.session_state.advanced_lens_result
+                confidence_level = "High" if result.confidence > 0.8 else "Medium" if result.confidence > 0.6 else "Low"
+                st.write(f"**🎯 Match Confidence:** {confidence_level} ({result.confidence:.1%})")
+        else:
+            st.info("💰 Market intelligence not available - no pricing data found")
+        
+        # Update pipeline data with advanced Google Lens results
+        if st.button("✅ Use Advanced Google Lens Results", type="primary"):
+            if 'advanced_lens_result' in st.session_state:
+                result = st.session_state.advanced_lens_result
+                style = analysis_results['style_analysis']
+                market = analysis_results['market_intelligence']
+                
+                # Update pipeline data with advanced results
+                if hasattr(self.pipeline_data, 'brand'):
+                    self.pipeline_data.brand = style['brand']
+                if hasattr(self.pipeline_data, 'garment_type'):
+                    self.pipeline_data.garment_type = style['style_name'] if style['style_name'] != 'Unknown' else 'Clothing'
+                if hasattr(self.pipeline_data, 'style'):
+                    self.pipeline_data.style = style['full_product_name']
+                if hasattr(self.pipeline_data, 'era'):
+                    self.pipeline_data.era = style['era'] if style['era'] != 'Unknown' else 'Unknown'
+                if hasattr(self.pipeline_data, 'material'):
+                    self.pipeline_data.material = style['material'] if style['material'] != 'Unknown' else 'Unknown'
+                
+                # Set advanced price estimate based on Google Lens results
+                if market['price_low'] > 0:
+                    self.pipeline_data.price_estimate = {
+                        'low': market['price_low'],
+                        'mid': market['price_median'],
+                        'high': market['price_high'],
+                        'source': 'Advanced Google Lens Visual Match',
+                        'confidence': result.confidence,
+                        'retail_price': market['retail_price'],
+                        'resale_ratio': market['resale_ratio'],
+                        'demand_score': market['demand_score'],
+                        'available_listings': market['available_listings']
+                    }
+                else:
+                    # Default price estimate if no prices found
+                    self.pipeline_data.price_estimate = {
+                        'low': 25,
+                        'mid': 50,
+                        'high': 100,
+                        'source': 'Advanced Google Lens (No Price Data)',
+                        'confidence': result.confidence
+                    }
+                
+                st.success("✅ Pipeline data updated with advanced Google Lens results!")
+                st.balloons()
+                
+                # Show what was updated
+                st.info(f"🎯 **Exact Match Found:** {style['full_product_name']}")
+                st.info(f"💰 **Price Range:** ${market['price_low']:,.0f} - ${market['price_high']:,.0f}")
+                if market['retail_price']:
+                    st.info(f"🏷️ **Retail Price:** ${market['retail_price']:,.0f}")
+                if market['resale_ratio']:
+                    st.info(f"📉 **Resale Ratio:** {market['resale_ratio']:.1%}")
+                
+                logger.info(f"[ADVANCED-LENS] Updated pipeline: {style['full_product_name']}, Confidence={result.confidence:.2f}")
+            else:
+                st.warning("⚠️ No advanced Google Lens results available")
+            
+            st.session_state.google_lens_requested = False  # Clear the request
+        
+        # Clear button
+        if st.button("❌ Clear Google Lens Results"):
+            st.session_state.google_lens_requested = False
+            if 'google_lens_frame' in st.session_state:
+                del st.session_state.google_lens_frame
+
     def _render_step_header(self):
         """Render the common header with progress bar, reset, and next step buttons"""
         # Show step progress bar, reset button, and Next Step button at the top
@@ -12722,8 +14894,8 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         """Clean action panel with organized buttons"""
         logger.info(f"[PANEL] render_action_panel() called for step {self.current_step}")
         
-        # Clean button layout - centered and organized
-        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        # Clean button layout - centered and organized with Google Lens
+        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
         
         with col1:
             if self.current_step > 0:
@@ -12758,6 +14930,31 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 st.button("🆕 Start", on_click=start_new, key="start_new_button", type="primary")
         
         with col4:
+            # Google Lens button for high-end item identification
+            def run_google_lens():
+                """Run Google Lens analysis using Logitech camera for high-end items"""
+                try:
+                    # Get frame from Logitech camera
+                    frame = self.camera_manager.c930e.get_frame()
+                    if frame is None:
+                        st.error("❌ Logitech camera not available for Google Lens")
+                        return
+                    
+                    # Store frame for Google Lens analysis
+                    st.session_state.google_lens_frame = frame
+                    st.session_state.google_lens_requested = True
+                    st.success("🔍 Google Lens analysis started!")
+                    logger.info("[GOOGLE-LENS] Analysis requested with Logitech camera")
+                    
+                except Exception as e:
+                    st.error(f"❌ Google Lens failed: {e}")
+                    logger.error(f"[GOOGLE-LENS] Error: {e}")
+            
+            st.button("🔍 Google Lens", on_click=run_google_lens, key="google_lens_button", 
+                     help="Use Logitech camera for high-end item identification and sold comps", 
+                     type="secondary")
+        
+        with col5:
             # Next Step button for all steps
             if self.current_step < len(self.steps) - 1:
                 def advance_step():
