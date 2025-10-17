@@ -457,14 +457,8 @@ logger.info("🚀 Starting Garment Analyzer Pipeline")
 # ============================================
 # CHECK OPTIONAL DEPENDENCIES (after logger exists)
 # ============================================
-try:
-    import pyrealsense2 as rs
-    REALSENSE_SDK_AVAILABLE = True
-    logger.info("✅ RealSense SDK available")
-except ImportError:
-    REALSENSE_SDK_AVAILABLE = False
-    logger.warning("⚠️ pyrealsense2 not installed - RealSense will use OpenCV fallback")
-    logger.warning("   Install with: pip install pyrealsense2")
+# RealSense SDK - DISABLED for faster startup
+REALSENSE_SDK_AVAILABLE = False
 
 # ==========================
 # RATE LIMITING UTILITIES
@@ -2370,12 +2364,12 @@ class OpenAIVisionCameraManager:
         # NEW: Logitech C930e for garment analysis (replaces RealSense)
         self.c930e = LogitechC930eManager()
         
-        # Keep existing RealSense variables for backward compatibility (will be deprecated)
+        # RealSense disabled for faster startup
         self.realsense_index = None
         self.realsense_cap = None
         self.realsense_pipeline = None
         self.realsense_config = None
-        self.realsense_sdk_available = False  # Disabled in favor of C930e
+        self.realsense_sdk_available = False
         self.rs = None
         
         self.roi_coords = self.load_roi_config()
@@ -2561,17 +2555,12 @@ class OpenAIVisionCameraManager:
                 continue
         
         # Assign cameras
-        if len(working_cameras) >= 2:
+        if len(working_cameras) >= 1:
             self.arducam_index = working_cameras[0]['index']
-            self.realsense_index = working_cameras[1]['index']
-            logger.info(f"Cameras assigned: ArduCam={self.arducam_index}, RealSense={self.realsense_index}")
-        elif len(working_cameras) == 1:
-            self.arducam_index = working_cameras[0]['index']
-            self.realsense_index = 1  # Try next index
-            logger.warning("Only one camera detected, second camera may not work")
+            logger.info(f"Camera assigned: ArduCam={self.arducam_index}")
         else:
             self.arducam_index = 0
-            self.realsense_index = 1
+            logger.warning("No working cameras found, using default index")
             logger.warning("No cameras auto-detected, using default indices")
     
     def _set_fourcc(self, cap, fourcc_str="MJPG"):
@@ -2636,8 +2625,8 @@ class OpenAIVisionCameraManager:
         else:
             logger.error("❌ C930e initialization failed")
         
-        # DEPRECATED: RealSense initialization (kept for backward compatibility)
-        if self.realsense_index is not None and self.realsense_index != self.arducam_index:
+        # RealSense initialization disabled for faster startup
+        if False:  # Disabled for faster startup
             if self.realsense_sdk_available:
                 try:
                     # Use RealSense SDK with AGGRESSIVE TRUE RGB forcing
@@ -2867,7 +2856,9 @@ class OpenAIVisionCameraManager:
             return False
     
     def _initialize_realsense_opencv_fallback(self):
-        """Initialize RealSense D415 with AGGRESSIVE RGB forcing (MJPG then YUYV fallback)"""
+        """RealSense fallback disabled for faster startup"""
+        logger.info("RealSense OpenCV fallback disabled for faster startup")
+        return
         try:
             backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
             self.realsense_cap = cv2.VideoCapture(self.realsense_index, backend)
@@ -3006,7 +2997,7 @@ class OpenAIVisionCameraManager:
             if camera_name == 'arducam':
                 test_frame = self.get_arducam_frame()
             else:
-                test_frame = self.get_realsense_frame()
+                test_frame = self.c930e.get_frame()  # Use C930e instead of RealSense
             
             if test_frame is not None:
                 logger.info(f"{camera_name} recovery successful!")
@@ -3427,43 +3418,18 @@ class OpenAIVisionCameraManager:
         return float(cv2.Laplacian(gray, cv2.CV_64F, ksize=3).var())
     
     def get_realsense_frame(self):
-        """Get COLOR frame from RealSense using SDK, with memory-safe caching."""
+        """RealSense disabled - use C930e instead for faster startup"""
         try:
-            # Check cache first
-            cached = self._get_from_cache('c930e')
-            if cached is not None:
-                return cached
+            # Use C930e instead of RealSense for garment analysis
+            frame = self.c930e.get_frame()
+            if frame is not None:
+                self._add_to_cache('c930e', frame, time.time())
+                return frame
             
-            # Try SDK method first (preferred)
-            if self.realsense_pipeline is not None and self.realsense_sdk_available:
-                try:
-                    # Wait for frames with timeout
-                    frames = self.realsense_pipeline.wait_for_frames(timeout_ms=1000)
-                    color_frame = frames.get_color_frame()
-                    if color_frame:
-                        frame_data = np.asanyarray(color_frame.get_data())
-                        # The SDK often returns BGR, so we convert to RGB
-                        rgb_frame = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
-                        # Cache the frame using our new memory-safe system
-                        self._add_to_cache('c930e', rgb_frame, time.time())
-                        return rgb_frame
-
-                except Exception as e:
-                    logger.warning(f"RealSense SDK read failed: {e}, trying OpenCV fallback")
-            
-            # Fallback to OpenCV if SDK fails or is not available
-            elif self.realsense_cap is not None and self.realsense_cap.isOpened():
-                ret, frame = self.realsense_cap.read()
-                if ret and frame is not None:
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # Cache the frame using our new memory-safe system
-                    self._add_to_cache('c930e', rgb_frame, time.time())
-                    return rgb_frame
-
             return None
-
+            
         except Exception as e:
-            logger.error(f"RealSense error: {e}")
+            logger.error(f"[C930e] Error getting frame: {e}")
             return None
     
     def get_garment_frame(self, preview=False):
@@ -5010,20 +4976,42 @@ Return ONLY this JSON format:
         return result
     
     def _assess_image_quality(self, image_np):
-        """Assess image quality for learning system"""
+        """Assess image quality for learning system with hierarchical bucketing"""
         try:
-            brightness = np.mean(image_np)
-            contrast = np.std(image_np)
-            
-            if brightness < 100:
-                return "dark"
-            elif brightness > 180:
-                return "bright"
-            elif contrast < 30:
-                return "low_contrast"
+            # Convert to grayscale for analysis
+            if len(image_np.shape) == 3:
+                gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
             else:
-                return "normal"
-        except:
+                gray = image_np
+            
+            brightness = np.mean(gray)
+            contrast = np.std(gray)
+            
+            # Hierarchical bucketing to prevent state explosion
+            if brightness < 60:
+                brightness_bucket = "very_dark"
+            elif brightness < 100:
+                brightness_bucket = "dark"
+            elif brightness < 140:
+                brightness_bucket = "normal"
+            elif brightness < 180:
+                brightness_bucket = "bright"
+            else:
+                brightness_bucket = "very_bright"
+            
+            # Contrast bucketing
+            if contrast < 20:
+                contrast_bucket = "low"
+            elif contrast < 40:
+                contrast_bucket = "medium"
+            else:
+                contrast_bucket = "high"
+            
+            # Return combined quality assessment
+            return f"{brightness_bucket}_{contrast_bucket}"
+            
+        except Exception as e:
+            logger.error(f"Error assessing image quality: {e}")
             return "unknown"
 
     def analyze_tag_with_openai_fallback(self, image_np):
@@ -6939,10 +6927,23 @@ class FixedEBayPricingVerifier:
         })
     
     def build_ebay_search_url(self, brand, garment_type, size, condition='Used'):
-        """Build a WORKING eBay search URL"""
-        # Build search keywords
-        search_terms = [brand, garment_type, size, condition]
-        search_query = ' '.join([t for t in search_terms if t and t != 'Unknown'])
+        """Build a WORKING eBay search URL with simplified query"""
+        # Build simplified search keywords (only essential info)
+        search_terms = []
+        
+        # Add brand if it's not generic
+        if brand and brand != 'Unknown' and brand.lower() not in ['unbranded', 'generic', 'no brand']:
+            search_terms.append(brand)
+        
+        # Add garment type
+        if garment_type and garment_type != 'Unknown':
+            search_terms.append(garment_type)
+        
+        # Add size only if it's a standard size
+        if size and size != 'Unknown' and size.upper() in ['XS', 'S', 'M', 'L', 'XL', 'XXL', '0', '2', '4', '6', '8', '10', '12', '14', '16', '18', '20']:
+            search_terms.append(f"Size {size}")
+        
+        search_query = ' '.join(search_terms)
         
         # Properly encode for eBay
         params = {
@@ -7260,9 +7261,22 @@ class EbaySearchFilter:
                           condition: str = "excellent", max_price: float = 200) -> Dict:
         """Build eBay search query with STRICT clothing category filter"""
         
-        # Build the query
-        query_parts = [brand, garment_type, "women's" if size not in ['S', 'M', 'L', 'XL', '32', '34', '36'] else 'men']
-        q = " ".join([p for p in query_parts if p and p != "Unknown"])
+        # Build simplified query (only essential info)
+        query_parts = []
+        
+        # Add brand if it's not generic
+        if brand and brand != 'Unknown' and brand.lower() not in ['unbranded', 'generic', 'no brand']:
+            query_parts.append(brand)
+        
+        # Add garment type
+        if garment_type and garment_type != 'Unknown':
+            query_parts.append(garment_type)
+        
+        # Add size only if it's a standard size
+        if size and size != 'Unknown' and size.upper() in ['XS', 'S', 'M', 'L', 'XL', 'XXL', '0', '2', '4', '6', '8', '10', '12', '14', '16', '18', '20']:
+            query_parts.append(f"Size {size}")
+        
+        q = " ".join(query_parts)
         
         # Condition mapping for eBay
         condition_map = {
@@ -7858,9 +7872,24 @@ class QLearningAgent:
         except Exception as e:
             logger.error(f"[Q-LEARNING] Error saving Q-table: {e}")
     
-    def get_state(self, image_quality, tag_type):
-        """Convert image characteristics to state"""
-        return f"{image_quality}_{tag_type}"
+    def get_state(self, image_quality, tag_type, ocr_confidence=None):
+        """Convert image characteristics to hierarchical state with bucketing"""
+        # Use hierarchical bucketing to prevent state explosion
+        if image_quality == "unknown":
+            return "unknown"
+        
+        # Build hierarchical state
+        state = f"{image_quality}_{tag_type}"
+        
+        # Add OCR confidence bucket if available
+        if ocr_confidence is not None:
+            if ocr_confidence < 0.3:
+                state += "_ocr_fail"
+            elif ocr_confidence < 0.7:
+                state += "_ocr_uncertain"
+            # High confidence = no suffix (default case)
+        
+        return state
     
     def select_action(self, state):
         """Select action using epsilon-greedy policy"""
@@ -7983,6 +8012,10 @@ class LearningOrchestrator:
         self.bandit = ThompsonSamplingBandit()
         self.active_learner = ActiveLearner()
         
+        # Log learning events for analysis
+        self.learning_log = "logs/learning_events.jsonl"
+        os.makedirs("logs", exist_ok=True)
+        
         logger.info("[LEARNING] Orchestrator initialized")
     
     def process_prediction(self, predicted, actual, confidence, metadata=None):
@@ -8018,6 +8051,9 @@ class LearningOrchestrator:
             
             # Update bandit
             self.bandit.update(metadata.get('method_used', 'ocr'), event.reward > 0)
+            
+            # Log learning event for analysis
+            self._log_learning_event(event, metadata)
     
     def process_price_validation(self, predicted_price, actual_price, brand, garment_type):
         """Process price validation from eBay"""
@@ -8100,6 +8136,91 @@ class LearningOrchestrator:
         self.q_learning_agent._save_q_table()
         
         logger.info("[LEARNING] Daily adaptation complete")
+    
+    def _log_learning_event(self, event, metadata):
+        """Log learning event for analysis"""
+        try:
+            learning_event = {
+                'timestamp': time.time(),
+                'event_type': 'prediction_recorded',
+                'component': event.component,
+                'correct': event.reward > 0,
+                'method_used': metadata.get('method_used', 'unknown') if metadata else 'unknown',
+                'state': metadata.get('image_quality', 'unknown') if metadata else 'unknown',
+                'confidence': event.confidence,
+                'accuracy': self._get_component_accuracy(event.component)
+            }
+            
+            with open(self.learning_log, 'a') as f:
+                json.dump(learning_event, f)
+                f.write('\n')
+        except Exception as e:
+            logger.error(f"Failed to log learning event: {e}")
+    
+    def _get_component_accuracy(self, component):
+        """Get current accuracy for a component"""
+        status = self.get_learning_status()
+        return status.get('accuracy_by_component', {}).get(component, 0.0)
+
+# ============================================
+# FEEDBACK PROCESSOR (BUSINESS LOGIC LAYER)
+# ============================================
+
+class FeedbackProcessor:
+    """Handles feedback processing logic (no UI dependencies)"""
+    
+    def __init__(self, orchestrator: LearningOrchestrator):
+        self.orchestrator = orchestrator
+    
+    def process_user_corrections(
+        self, 
+        original_predictions: dict, 
+        user_corrections: dict,
+        context: dict = None
+    ) -> dict:
+        """
+        Process user corrections and trigger learning.
+        
+        Returns:
+            dict with 'corrections_made', 'fields_corrected', 'new_accuracy'
+        """
+        corrections_made = 0
+        fields_corrected = []
+        
+        for field, corrected_value in user_corrections.items():
+            original = str(original_predictions[field])
+            corrected = str(corrected_value).strip()
+            
+            # Skip if no change
+            if corrected == original:
+                continue
+            
+            # Record the correction
+            self.orchestrator.process_prediction(
+                {field: original},
+                {field: corrected},
+                confidence=context.get(f'{field}_confidence', 0.5) if context else 0.5,
+                metadata={
+                    'image_quality': context.get('image_quality', 'unknown') if context else 'unknown',
+                    'method_used': context.get('detection_method', 'ocr') if context else 'ocr',
+                    'tag_type': context.get('tag_type', 'unknown') if context else 'unknown'
+                }
+            )
+            
+            corrections_made += 1
+            fields_corrected.append(field)
+            
+            logger.info(f"✏️ User corrected {field}: {original} → {corrected}")
+        
+        # Get updated stats
+        status = self.orchestrator.get_learning_status()
+        
+        return {
+            'corrections_made': corrections_made,
+            'fields_corrected': fields_corrected,
+            'new_accuracy': status.get('accuracy_by_component', {}),
+            'total_corrections': status.get('feedback_collected', 0)
+        }
 
 # ============================================
 # SIMPLE FEEDBACK LOGGING (IMMEDIATE INTEGRATION)
@@ -8165,14 +8286,18 @@ def test_learning_system():
 # STREAMLIT UI COMPONENTS FOR LEARNING
 # ============================================
 
-def show_correction_interface():
-    """Allow user to correct predictions and create feedback"""
+def show_correction_interface() -> dict:
+    """
+    Render correction UI and return user's corrections.
     
-    st.subheader("📝 Verify & Correct Predictions")
-    
+    Returns:
+        dict of corrections if submitted, None otherwise
+    """
     if 'current_predictions' not in st.session_state:
         st.info("Complete an analysis first to see predictions to correct")
-        return
+        return None
+    
+    st.subheader("📝 Verify & Correct Predictions")
     
     predictions = st.session_state.current_predictions
     
@@ -8205,52 +8330,11 @@ def show_correction_interface():
                     value=str(predictions[field]) if predictions[field] else ""
                 )
     
+    # Return corrections if submitted
     if st.button("📚 Submit Feedback", type="primary"):
-        # Check which predictions were wrong
-        corrections_made = False
-        
-        for field in predictions.keys():
-            if field == 'confidence':
-                continue
-                
-            predicted = str(predictions[field]) if predictions[field] else ""
-            actual = str(corrections[field]) if corrections[field] else ""
-            
-            if predicted != actual and actual.strip():
-                corrections_made = True
-                
-                # Get orchestrator from session state
-                if 'learning_orchestrator' in st.session_state:
-                    orchestrator = st.session_state.learning_orchestrator
-                    
-                    # Record user correction
-                    orchestrator.process_prediction(
-                        {field: predictions[field]},
-                        {field: corrections[field]},
-                        confidence=predictions.get('confidence', 0.5),
-                        metadata={
-                            'image_quality': st.session_state.get('image_quality', 'unknown'),
-                            'method_used': st.session_state.get('detection_method', 'ocr'),
-                            'tag_type': st.session_state.get('tag_type', 'unknown')
-                        }
-                    )
-                    
-                    st.success(f"✅ Learned: {field} should be '{actual}', not '{predicted}'")
-        
-        if corrections_made:
-            # Update pipeline data with corrections
-            if 'pipeline_manager' in st.session_state:
-                pm = st.session_state.pipeline_manager
-                for field, value in corrections.items():
-                    if hasattr(pm.pipeline_data, field):
-                        setattr(pm.pipeline_data, field, value)
-            
-            # Run daily routine to update models
-            if 'learning_orchestrator' in st.session_state:
-                st.session_state.learning_orchestrator.daily_routine()
-                st.success("🧠 Learning models updated!")
-        else:
-            st.info("No corrections made - all predictions were correct!")
+        return corrections
+    
+    return None
 
 def show_learning_dashboard():
     """Display system learning progress"""
@@ -9070,8 +9154,11 @@ def show_confirmation_dialog(title, message, options, key_prefix):
 class EnhancedPipelineManager:
     """Pipeline manager with minimal initialization for testing"""
     
-    def __init__(self):
+    def __init__(self, learning_orchestrator=None):
         print("Initializing Pipeline Manager...")
+        
+        # Store the learning orchestrator (dependency injection)
+        self.learning_orchestrator = learning_orchestrator
         
         # Consolidated steps (calibration removed)
         self.steps = [
@@ -9165,13 +9252,11 @@ class EnhancedPipelineManager:
             print(f"  - Enhanced learning dataset failed to initialize: {e}")
             self.learning_dataset = None
         
-        # Initialize feedback loop and reinforcement learning system
-        try:
-            self.learning_orchestrator = LearningOrchestrator()
-            print("  - Learning orchestrator (RL system) initialized")
-        except Exception as e:
-            print(f"  - Learning orchestrator failed to initialize: {e}")
-            self.learning_orchestrator = None
+        # Learning orchestrator is now injected via dependency injection
+        if self.learning_orchestrator:
+            print("  - Learning orchestrator (RL system) injected")
+        else:
+            print("  - Learning orchestrator not provided (will be initialized in session state)")
         
         # Initialize measurement dataset manager
         try:
@@ -10199,6 +10284,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         # ========================================================================
         # ====== 4. MAIN CONTENT AREA (Centered Camera or Step Info) ======
         # ========================================================================
+        # Render step header with navigation buttons at the top
+        self._render_step_header()
+        
         # This section will render the content for the current step
         if self.current_step == 0:
             self._render_step_0_compact()
@@ -10280,27 +10368,30 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         st.markdown("### 🏷️ Tag Analysis")
         st.info("Position your garment tag in the **GREEN BOX**, then click **'Next Step'** above.")
 
-        # Create a centered column for the camera view - more compact
-        col1, col_camera, col3 = st.columns([1, 3, 1])  # More compact middle column
-
-        with col_camera:
-            try:
-                frame = self.camera_manager.get_arducam_frame()
-                if frame is not None:
-                    # Draw the ROI overlay on the full frame
-                    frame_with_roi = self.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
-                    if frame_with_roi is not None:
+        # Camera feed flush and directly under the board
+        st.markdown("---")  # Separator line
+        
+        try:
+            frame = self.camera_manager.get_arducam_frame()
+            if frame is not None:
+                # Draw the ROI overlay on the full frame
+                frame_with_roi = self.camera_manager.draw_roi_overlay(frame.copy(), 'tag')
+                if frame_with_roi is not None:
+                    try:
                         st.image(frame_with_roi, caption="📸 Tag Camera - Position tag in Green Box", width='stretch')
-                        
-                        # Show current ROI coordinates - more compact
-                        roi_coords = self.camera_manager.roi_coords.get('tag', (0, 0, 0, 0))
-                        st.caption(f"ROI: ({roi_coords[0]}, {roi_coords[1]}) {roi_coords[2]}×{roi_coords[3]}")
-                    else:
-                        st.error("❌ No ROI overlay available")
+                    except Exception as e:
+                        logger.warning(f"Image display error: {e}")
+                        st.warning("Camera feed temporarily unavailable")
+                    
+                    # Show current ROI coordinates - more compact
+                    roi_coords = self.camera_manager.roi_coords.get('tag', (0, 0, 0, 0))
+                    st.caption(f"ROI: ({roi_coords[0]}, {roi_coords[1]}) {roi_coords[2]}×{roi_coords[3]}")
                 else:
-                    st.warning("⚠️ ArduCam camera not available")
-            except Exception as e:
-                st.error(f"❌ Camera error: {e}")
+                    st.error("❌ No ROI overlay available")
+            else:
+                st.warning("⚠️ ArduCam camera not available")
+        except Exception as e:
+            st.error(f"❌ Camera error: {e}")
 
         # Optional: Add camera controls or previews in an expander if needed - more compact
         with st.expander("🔍 AI Preview & Controls"):
@@ -10958,9 +11049,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             st.rerun()
         
         if st.sidebar.button("🔄 Reset Pipeline"):
-            self.current_step = 0
-            self.pipeline_data = PipelineData()
-            st.rerun()
+            # Set a flag to indicate reset is needed
+            st.session_state.pipeline_reset_requested = True
+            st.success("✅ Pipeline reset requested!")
         
         # Display Settings
         st.sidebar.markdown("---")
@@ -11009,8 +11100,8 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             else:
                 st.sidebar.error("❌ Learning system not initialized")
         
-        if st.sidebar.button("Test RealSense Color", key="test_realsense_color_btn"):
-            frame = self.camera_manager.get_realsense_frame()
+        if st.sidebar.button("Test C930e Color", key="test_c930e_color_btn"):
+            frame = self.camera_manager.c930e.get_frame()
             if frame is not None and len(frame.shape) == 3:
                 unique_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
                 if unique_colors > 5000:
@@ -11797,20 +11888,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             st.write(f"Step {st.session_state.pipeline_manager.current_step + 1} of {len(self.steps)}")
         with reset_col:
             if st.button("🔄 Reset", help="Start over with new garment", key="reset_pipeline"):
-                # Clear all pipeline data including images
-                st.session_state.pipeline_manager.pipeline_data = PipelineData()
-                st.session_state.pipeline_manager.current_step = 0
-                
-                # Clear retry flags and loop prevention
-                # Reset session state for fresh start
-                
-                # Clear any cached camera frames or images
-                if 'cached_tag_frame' in st.session_state:
-                    del st.session_state.cached_tag_frame
-                if 'cached_garment_frame' in st.session_state:
-                    del st.session_state.cached_garment_frame
-                if 'last_camera_frame' in st.session_state:
-                    del st.session_state.last_camera_frame
+                # Set flag to reset pipeline (prevents infinite loop)
+                st.session_state.pipeline_reset_requested = True
+                st.success("✅ Pipeline reset requested!")
                 
                 # Clear any UI state flags
                 if 'show_tag_preview' in st.session_state:
@@ -13178,8 +13258,56 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 st.session_state.pipeline_manager.pipeline_data
             )
         
-        # Show correction interface
-        show_correction_interface()
+        # Show correction interface (UI layer)
+        user_corrections = show_correction_interface()
+        
+        # Process corrections if submitted (business logic layer)
+        if user_corrections is not None:
+            feedback_processor = FeedbackProcessor(
+                st.session_state.learning_orchestrator
+            )
+            
+            context = {
+                'tag_image': st.session_state.get('last_tag_image'),
+                'detection_method': st.session_state.get('detection_method', 'ocr'),
+                'image_quality': st.session_state.get('image_quality', 'unknown'),
+                'tag_type': st.session_state.get('tag_type', 'printed'),
+                'brand_confidence': st.session_state.get('brand_confidence', 0.5),
+                'size_confidence': st.session_state.get('size_confidence', 0.5),
+            }
+            
+            result = feedback_processor.process_user_corrections(
+                original_predictions=st.session_state.current_predictions,
+                user_corrections=user_corrections,
+                context=context
+            )
+            
+            # Show results (back to UI layer)
+            if result['corrections_made'] > 0:
+                st.balloons()
+                st.success(f"🎓 Learned from **{result['corrections_made']}** correction(s)!")
+                
+                # Show which fields were corrected
+                for field in result['fields_corrected']:
+                    original = st.session_state.current_predictions[field]
+                    corrected = user_corrections[field]
+                    st.info(f"✏️ **{field}**: {original} → {corrected}")
+                
+                # Update pipeline data with corrections
+                if 'pipeline_manager' in st.session_state:
+                    pm = st.session_state.pipeline_manager
+                    for field, value in user_corrections.items():
+                        if hasattr(pm.pipeline_data, field):
+                            setattr(pm.pipeline_data, field, value)
+                
+                # Show updated accuracy
+                st.metric("Total Corrections", result['total_corrections'])
+                
+                # Run daily routine to update models
+                st.session_state.learning_orchestrator.daily_routine()
+                st.success("🧠 Learning models updated!")
+            else:
+                st.success("All predictions were correct! 🎯")
         
         # Smart eBay search with learning
         if st.session_state.pipeline_manager.pipeline_data.brand != "Unknown":
@@ -13192,15 +13320,18 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     condition=st.session_state.pipeline_manager.pipeline_data.condition
                 )
         
-        # Action buttons
-        col1, col2, col3 = st.columns(3)
+        # Prominent "Start New Item" button
+        st.markdown("---")
+        st.markdown("### 🚀 Ready for Next Item?")
+        
+        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
-            if st.button("Analyze New Item", type="primary"):
-                st.session_state.pipeline_manager.current_step = 0
-                st.session_state.pipeline_manager.pipeline_data = PipelineData()
-                st.rerun()
+            if st.button("🆕 Start New Item", type="primary", use_container_width=True):
+                # Set flag to reset pipeline
+                st.session_state.pipeline_reset_requested = True
+                st.success("✅ Starting new item analysis...")
         with col2:
-            if st.button("Export Results"):
+            if st.button("📊 Export Results", use_container_width=True):
                 # Create a simple export
                 results = {
                     'brand': st.session_state.pipeline_manager.pipeline_data.brand,
@@ -13819,6 +13950,17 @@ def main():
         initial_sidebar_state="collapsed"  # No sidebar needed - pipeline in main layout
     )
     
+    # Handle pipeline reset request
+    if st.session_state.get('pipeline_reset_requested', False):
+        # Clear the reset flag
+        st.session_state.pipeline_reset_requested = False
+        # Reset pipeline manager
+        if 'pipeline_manager' in st.session_state:
+            st.session_state.pipeline_manager.current_step = 0
+            st.session_state.pipeline_manager.pipeline_data = PipelineData()
+        st.success("✅ Pipeline reset successfully!")
+        st.rerun()
+    
     # CRITICAL: Prevent infinite loops
     if '_rerun_count' not in st.session_state:
         st.session_state._rerun_count = 0
@@ -13849,25 +13991,28 @@ def main():
         # Add learning dashboard
         show_learning_dashboard()
     
-    # INITIALIZE ALL SESSION STATE VARIABLES FIRST
-    if 'pipeline_manager' not in st.session_state:
-        st.session_state.pipeline_manager = EnhancedPipelineManager()
-    
-    # Initialize learning system components
+    # ============================================
+    # CRITICAL: Initialize learning system FIRST
+    # ============================================
     if 'learning_orchestrator' not in st.session_state:
-        if hasattr(st.session_state.pipeline_manager, 'learning_orchestrator'):
-            st.session_state.learning_orchestrator = st.session_state.pipeline_manager.learning_orchestrator
-        else:
-            st.session_state.learning_orchestrator = LearningOrchestrator()
+        st.session_state.learning_orchestrator = LearningOrchestrator()
+        logger.info("✅ Learning Orchestrator initialized")
     
+    # Initialize other learning components
     if 'learning_dataset' not in st.session_state:
-        if hasattr(st.session_state.pipeline_manager, 'learning_dataset'):
-            st.session_state.learning_dataset = st.session_state.pipeline_manager.learning_dataset
-        else:
-            st.session_state.learning_dataset = GarmentLearningDataset()
+        st.session_state.learning_dataset = GarmentLearningDataset()
+        logger.info("✅ Learning Dataset initialized")
     
     if 'ebay_filter' not in st.session_state:
         st.session_state.ebay_filter = EbaySearchFilter()
+        logger.info("✅ eBay Filter initialized")
+    
+    # Pass orchestrator to all dependent components (Dependency Injection)
+    if 'pipeline_manager' not in st.session_state:
+        st.session_state.pipeline_manager = EnhancedPipelineManager(
+            learning_orchestrator=st.session_state.learning_orchestrator
+        )
+        logger.info("✅ Pipeline Manager initialized with learning orchestrator")
     
     if 'live_preview_enabled' not in st.session_state:
         st.session_state.live_preview_enabled = True
