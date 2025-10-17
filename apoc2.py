@@ -16,6 +16,24 @@ MAX_FRAME_SKIP = 5          # Maximum frames to skip for buffer clearing
 FRAME_CACHE_DURATION_SEC = 0.5  # Cache frames for 500ms
 FRAME_SKIP_COUNT = 2            # Skip frames for performance
 
+# Production-safe path configuration
+import pathlib
+from pathlib import Path
+
+# Get the directory where this script is located
+SCRIPT_DIR = Path(__file__).parent.absolute()
+
+# Production-safe paths
+CACHE_DIR = SCRIPT_DIR / "cache"
+TRAINING_DATA_DIR = SCRIPT_DIR / "training_data"
+LOG_FILE = SCRIPT_DIR / "garment_analyzer.log"
+
+# Ensure directories exist
+CACHE_DIR.mkdir(exist_ok=True)
+TRAINING_DATA_DIR.mkdir(exist_ok=True)
+TRAINING_DATA_DIR.mkdir(exist_ok=True)  # corrections subdirectory
+(TRAINING_DATA_DIR / "corrections").mkdir(exist_ok=True)
+
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 import cv2
@@ -84,7 +102,7 @@ def _cache_key_with_specifics(brand: str, garment_type: str, size: str = None,
 def _get_cached_result(cache_key: str) -> dict:
     """Get cached eBay result"""
     try:
-        cache_file = f"cache/{cache_key}.json"
+        cache_file = CACHE_DIR / f"{cache_key}.json"
         if os.path.exists(cache_file):
             # Check if cache is still valid (24 hours)
             cache_time = os.path.getmtime(cache_file)
@@ -99,7 +117,7 @@ def _cache_result(cache_key: str, result: dict):
     """Cache eBay result"""
     try:
         os.makedirs("cache", exist_ok=True)
-        cache_file = f"cache/{cache_key}.json"
+        cache_file = CACHE_DIR / f"{cache_key}.json"
         with open(cache_file, 'w') as f:
             json.dump(result, f, indent=2)
     except Exception as e:
@@ -490,7 +508,7 @@ def _cache_key_with_specifics(brand, garment_type, size, gender, item_specifics=
 
 def _get_cached_result(cache_key):
     """Get cached API result if exists and not expired"""
-    cache_file = f"cache/{cache_key}.json"
+    cache_file = CACHE_DIR / f"{cache_key}.json"
     if os.path.exists(cache_file):
         try:
             with open(cache_file, 'r') as f:
@@ -3879,10 +3897,12 @@ class OpenAIVisionCameraManager:
                             handle_clicked = "center"
                     
                     if handle_clicked:
-                        st.session_state.dragging = True
-                        st.session_state.drag_handle = handle_clicked
-                        st.session_state.drag_start_coords = (click_x, click_y, x, y, w, h)
-                        st.rerun()
+                        # FIXED: Prevent double-click by checking if we're already dragging this handle
+                        if not st.session_state.get('dragging', False) or st.session_state.get('drag_handle') != handle_clicked:
+                            st.session_state.dragging = True
+                            st.session_state.drag_handle = handle_clicked
+                            st.session_state.drag_start_coords = (click_x, click_y, x, y, w, h)
+                            # FIXED: Don't call st.rerun() - let Streamlit handle state naturally
                 
                 else:
                     # Update ROI based on drag
@@ -8967,12 +8987,23 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 # Debug: Show current state
                 st.caption(f"🔍 Debug: {len(points)} points, clicked_point: {clicked_point}")
                 
-                # Handle click
+                # Handle click - FIXED: Prevent double-click registration
                 if clicked_point is not None:
                     x, y = clicked_point["x"], clicked_point["y"]
                     logger.info(f"[ARMPIT-CLICK] Point clicked at ({x}, {y})")
                     
-                    if len(points) < 2:
+                    # Check if this is a new click (not already processed)
+                    new_click = True
+                    if len(points) > 0:
+                        # Check if this click is too close to existing points (within 10 pixels)
+                        for existing_x, existing_y in points:
+                            distance = ((x - existing_x) ** 2 + (y - existing_y) ** 2) ** 0.5
+                            if distance < 10:
+                                new_click = False
+                                logger.info(f"[ARMPIT-CLICK] Ignoring duplicate click at ({x}, {y}) - too close to existing point")
+                                break
+                    
+                    if new_click and len(points) < 2:
                         points.append((x, y))
                         st.session_state.armpit_points = points
                         
@@ -8980,7 +9011,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                             st.success(f"✅ Point 1 added at ({x}, {y}). Click to add point 2.")
                         elif len(points) == 2:
                             st.success(f"✅ Point 2 added at ({x}, {y}). Measurement complete!")
-                        st.rerun()
+                        # FIXED: Don't call st.rerun() - let Streamlit handle the state naturally
+                    elif not new_click:
+                        st.info("👆 Click detected but ignored (too close to existing point)")
                     else:
                         st.warning("⚠️ Maximum 2 points reached. Clear points to measure again.")
                 else:
