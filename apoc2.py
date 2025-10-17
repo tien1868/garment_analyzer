@@ -61,6 +61,7 @@ from data_collection_and_correction_system import (
 
 # eBay API imports for sold comps research
 import requests
+import random
 from datetime import datetime, timedelta
 import statistics
 from functools import wraps
@@ -7690,6 +7691,626 @@ def integrate_learning_system(pipeline_data, learning_dataset: GarmentLearningDa
         success=True  # Set based on user confirmation
     )
 
+# ============================================
+# FEEDBACK LOOPS & REINFORCEMENT LEARNING
+# ============================================
+
+class FeedbackEvent:
+    """Represents a single feedback event for learning"""
+    
+    def __init__(self, event_type, component, predicted, actual, confidence, 
+                 reward=None, metadata=None, timestamp=None):
+        self.event_type = event_type  # 'user_correction', 'price_validation', 'ebay_match'
+        self.component = component    # 'brand', 'size', 'material', 'price'
+        self.predicted = predicted
+        self.actual = actual
+        self.confidence = confidence
+        self.reward = reward or (1.0 if predicted == actual else -1.0)
+        self.metadata = metadata or {}
+        self.timestamp = timestamp or datetime.now().isoformat()
+    
+    def to_dict(self):
+        return {
+            'event_type': self.event_type,
+            'component': self.component,
+            'predicted': self.predicted,
+            'actual': self.actual,
+            'confidence': self.confidence,
+            'reward': self.reward,
+            'metadata': self.metadata,
+            'timestamp': self.timestamp
+        }
+
+class FeedbackCollector:
+    """Collects and stores all feedback events"""
+    
+    def __init__(self, feedback_file='feedback_log.jsonl'):
+        self.feedback_file = Path(feedback_file)
+        self.feedback_file.parent.mkdir(exist_ok=True)
+        self.events = []
+        self._load_existing_feedback()
+    
+    def _load_existing_feedback(self):
+        """Load existing feedback from file"""
+        if self.feedback_file.exists():
+            try:
+                with open(self.feedback_file, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            event_data = json.loads(line)
+                            self.events.append(FeedbackEvent(**event_data))
+                logger.info(f"[FEEDBACK] Loaded {len(self.events)} existing feedback events")
+            except Exception as e:
+                logger.error(f"[FEEDBACK] Error loading feedback: {e}")
+    
+    def record_event(self, event: FeedbackEvent):
+        """Record a new feedback event"""
+        self.events.append(event)
+        
+        # Save to file immediately
+        try:
+            with open(self.feedback_file, 'a') as f:
+                f.write(json.dumps(event.to_dict()) + '\n')
+        except Exception as e:
+            logger.error(f"[FEEDBACK] Error saving event: {e}")
+    
+    def get_accuracy_by_component(self, days_back=30):
+        """Calculate accuracy for each component over time"""
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        
+        accuracy = defaultdict(lambda: {'correct': 0, 'total': 0})
+        
+        for event in self.events:
+            if datetime.fromisoformat(event.timestamp) > cutoff_date:
+                accuracy[event.component]['total'] += 1
+                if event.reward > 0:
+                    accuracy[event.component]['correct'] += 1
+        
+        # Convert to percentages
+        result = {}
+        for component, stats in accuracy.items():
+            if stats['total'] > 0:
+                result[component] = stats['correct'] / stats['total']
+            else:
+                result[component] = 0.0
+        
+        return result
+    
+    def get_uncertain_predictions(self, confidence_threshold=0.7):
+        """Get predictions that were uncertain but correct/incorrect"""
+        uncertain = []
+        for event in self.events:
+            if event.confidence < confidence_threshold:
+                uncertain.append(event)
+        return uncertain
+
+class QLearningAgent:
+    """Q-Learning agent for detection method selection"""
+    
+    def __init__(self, q_table_file='q_table_methods.json'):
+        self.q_table_file = Path(q_table_file)
+        self.q_table = defaultdict(lambda: defaultdict(float))
+        self.learning_rate = 0.1
+        self.discount_factor = 0.9
+        self.epsilon = 0.1  # Exploration rate
+        self._load_q_table()
+    
+    def _load_q_table(self):
+        """Load Q-table from file"""
+        if self.q_table_file.exists():
+            try:
+                with open(self.q_table_file, 'r') as f:
+                    data = json.load(f)
+                    for state, actions in data.items():
+                        for action, value in actions.items():
+                            self.q_table[state][action] = value
+                logger.info(f"[Q-LEARNING] Loaded Q-table with {len(self.q_table)} states")
+            except Exception as e:
+                logger.error(f"[Q-LEARNING] Error loading Q-table: {e}")
+    
+    def _save_q_table(self):
+        """Save Q-table to file"""
+        try:
+            data = {state: dict(actions) for state, actions in self.q_table.items()}
+            with open(self.q_table_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"[Q-LEARNING] Error saving Q-table: {e}")
+    
+    def get_state(self, image_quality, tag_type):
+        """Convert image characteristics to state"""
+        return f"{image_quality}_{tag_type}"
+    
+    def select_action(self, state):
+        """Select action using epsilon-greedy policy"""
+        if random.random() < self.epsilon:
+            # Explore: random action
+            actions = ['ocr', 'api_vision', 'serp', 'ensemble']
+            return random.choice(actions)
+        else:
+            # Exploit: best known action
+            if state in self.q_table and self.q_table[state]:
+                return max(self.q_table[state], key=self.q_table[state].get)
+            else:
+                return 'ocr'  # Default fallback
+    
+    def update_q_value(self, state, action, reward, next_state=None):
+        """Update Q-value using Q-learning formula"""
+        current_q = self.q_table[state][action]
+        
+        if next_state and next_state in self.q_table:
+            max_next_q = max(self.q_table[next_state].values()) if self.q_table[next_state] else 0
+        else:
+            max_next_q = 0
+        
+        # Q-learning update
+        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
+        self.q_table[state][action] = new_q
+        
+        # Save periodically
+        if len(self.q_table) % 10 == 0:
+            self._save_q_table()
+    
+    def decay_epsilon(self, decay_rate=0.99):
+        """Reduce exploration over time"""
+        self.epsilon = max(0.01, self.epsilon * decay_rate)
+
+class ThompsonSamplingBandit:
+    """Thompson Sampling for multi-armed bandit (detection methods)"""
+    
+    def __init__(self, arms=None):
+        self.arms = arms or ['ocr', 'api_vision', 'serp', 'ensemble']
+        self.alpha = defaultdict(lambda: 1)  # Success count
+        self.beta = defaultdict(lambda: 1)   # Failure count
+    
+    def select_arm(self):
+        """Select arm using Thompson Sampling"""
+        samples = {}
+        for arm in self.arms:
+            # Sample from Beta distribution
+            samples[arm] = np.random.beta(self.alpha[arm], self.beta[arm])
+        
+        return max(samples, key=samples.get)
+    
+    def update(self, arm, success):
+        """Update arm statistics"""
+        if success:
+            self.alpha[arm] += 1
+        else:
+            self.beta[arm] += 1
+    
+    def get_arm_probabilities(self):
+        """Get current probability estimates for each arm"""
+        probs = {}
+        for arm in self.arms:
+            total = self.alpha[arm] + self.beta[arm]
+            probs[arm] = self.alpha[arm] / total if total > 0 else 0.5
+        return probs
+
+class ActiveLearner:
+    """Identifies uncertain predictions for user feedback"""
+    
+    def __init__(self, uncertainty_threshold=0.7):
+        self.uncertainty_threshold = uncertainty_threshold
+        self.uncertain_samples = []
+    
+    def identify_uncertain_prediction(self, component, confidence, prediction, metadata=None):
+        """Identify if prediction is uncertain and worth asking user about"""
+        
+        if confidence < self.uncertainty_threshold:
+            self.uncertain_samples.append({
+                'component': component,
+                'confidence': confidence,
+                'prediction': prediction,
+                'metadata': metadata or {},
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            return f"Low confidence ({confidence:.1%}) on {component}: '{prediction}'"
+        
+        return None
+    
+    def get_focus_areas(self):
+        """Get components that need more feedback"""
+        if not self.uncertain_samples:
+            return {}
+        
+        # Count uncertain predictions by component
+        component_counts = defaultdict(int)
+        component_confidences = defaultdict(list)
+        
+        for sample in self.uncertain_samples[-100:]:  # Last 100 samples
+            component_counts[sample['component']] += 1
+            component_confidences[sample['component']].append(sample['confidence'])
+        
+        # Calculate average confidence per component
+        focus_areas = {}
+        for component, confidences in component_confidences.items():
+            focus_areas[component] = {
+                'total': component_counts[component],
+                'avg_confidence': np.mean(confidences)
+            }
+        
+        return focus_areas
+
+class LearningOrchestrator:
+    """Main orchestrator for all learning components"""
+    
+    def __init__(self):
+        self.feedback_collector = FeedbackCollector()
+        self.q_learning_agent = QLearningAgent()
+        self.bandit = ThompsonSamplingBandit()
+        self.active_learner = ActiveLearner()
+        
+        logger.info("[LEARNING] Orchestrator initialized")
+    
+    def process_prediction(self, predicted, actual, confidence, metadata=None):
+        """Process a prediction and its correction"""
+        
+        for component, pred_value in predicted.items():
+            actual_value = actual.get(component, pred_value)
+            
+            # Create feedback event
+            event = FeedbackEvent(
+                event_type='user_correction',
+                component=component,
+                predicted=pred_value,
+                actual=actual_value,
+                confidence=confidence,
+                metadata=metadata or {}
+            )
+            
+            # Record feedback
+            self.feedback_collector.record_event(event)
+            
+            # Update Q-learning if we have state info
+            if metadata and 'image_quality' in metadata and 'method_used' in metadata:
+                state = self.q_learning_agent.get_state(
+                    metadata['image_quality'], 
+                    metadata.get('tag_type', 'unknown')
+                )
+                self.q_learning_agent.update_q_value(
+                    state, 
+                    metadata['method_used'], 
+                    event.reward
+                )
+            
+            # Update bandit
+            self.bandit.update(metadata.get('method_used', 'ocr'), event.reward > 0)
+    
+    def process_price_validation(self, predicted_price, actual_price, brand, garment_type):
+        """Process price validation from eBay"""
+        
+        error_ratio = abs(actual_price - predicted_price) / max(actual_price, 1)
+        reward = 1.0 if error_ratio < 0.2 else -1.0  # 20% error threshold
+        
+        event = FeedbackEvent(
+            event_type='price_validation',
+            component='price',
+            predicted=predicted_price,
+            actual=actual_price,
+            confidence=0.8,  # Assume moderate confidence
+            reward=reward,
+            metadata={'brand': brand, 'garment_type': garment_type, 'error_ratio': error_ratio}
+        )
+        
+        self.feedback_collector.record_event(event)
+    
+    def get_learning_status(self):
+        """Get current learning system status"""
+        
+        accuracy = self.feedback_collector.get_accuracy_by_component()
+        uncertain = len(self.feedback_collector.get_uncertain_predictions())
+        arm_probs = self.bandit.get_arm_probabilities()
+        focus_areas = self.active_learner.get_focus_areas()
+        
+        return {
+            'feedback_collected': len(self.feedback_collector.events),
+            'accuracy_by_component': accuracy,
+            'uncertain_predictions': uncertain,
+            'epsilon': self.q_learning_agent.epsilon,
+            'bandit_arms': arm_probs,
+            'focus_areas': focus_areas,
+            'performance_trends': self._get_performance_trends()
+        }
+    
+    def _get_performance_trends(self):
+        """Get performance trends over time"""
+        # Simple trend calculation - could be more sophisticated
+        recent_accuracy = self.feedback_collector.get_accuracy_by_component(days_back=7)
+        older_accuracy = self.feedback_collector.get_accuracy_by_component(days_back=14)
+        
+        trends = {}
+        for component in recent_accuracy:
+            if component in older_accuracy:
+                trends[component] = recent_accuracy[component] - older_accuracy[component]
+        
+        return trends
+    
+    def get_recommendations(self):
+        """Get learning recommendations"""
+        
+        status = self.get_learning_status()
+        
+        return {
+            'focus_areas': status['focus_areas'],
+            'performance_trends': status['performance_trends'],
+            'best_methods': status['bandit_arms']
+        }
+    
+    def daily_routine(self):
+        """Daily adaptation routine"""
+        
+        logger.info("[LEARNING] Running daily adaptation routine")
+        
+        # Decay exploration
+        self.q_learning_agent.decay_epsilon()
+        
+        # Check for distribution shifts
+        recent_accuracy = self.feedback_collector.get_accuracy_by_component(days_back=7)
+        older_accuracy = self.feedback_collector.get_accuracy_by_component(days_back=14)
+        
+        for component, recent_acc in recent_accuracy.items():
+            older_acc = older_accuracy.get(component, recent_acc)
+            if recent_acc < older_acc - 0.1:  # 10% drop
+                logger.warning(f"[LEARNING] Accuracy drop detected for {component}: {older_acc:.1%} → {recent_acc:.1%}")
+        
+        # Save all models
+        self.q_learning_agent._save_q_table()
+        
+        logger.info("[LEARNING] Daily adaptation complete")
+
+# ============================================
+# STREAMLIT UI COMPONENTS FOR LEARNING
+# ============================================
+
+def show_correction_interface():
+    """Allow user to correct predictions and create feedback"""
+    
+    st.subheader("📝 Verify & Correct Predictions")
+    
+    if 'current_predictions' not in st.session_state:
+        st.info("Complete an analysis first to see predictions to correct")
+        return
+    
+    predictions = st.session_state.current_predictions
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**🤖 System Prediction**")
+        for field, value in predictions.items():
+            if field != 'confidence':
+                st.write(f"• **{field.title()}:** {value}")
+    
+    with col2:
+        st.write("**✏️ Your Corrections**")
+        corrections = {}
+        
+        for field in predictions.keys():
+            if field == 'confidence':
+                continue
+            elif field == 'price':
+                corrections[field] = st.number_input(
+                    f"Correct {field}", 
+                    value=float(predictions[field]) if predictions[field] else 25.0,
+                    min_value=0.0,
+                    max_value=1000.0,
+                    step=0.5
+                )
+            else:
+                corrections[field] = st.text_input(
+                    f"Correct {field}", 
+                    value=str(predictions[field]) if predictions[field] else ""
+                )
+    
+    if st.button("📚 Submit Feedback", type="primary"):
+        # Check which predictions were wrong
+        corrections_made = False
+        
+        for field in predictions.keys():
+            if field == 'confidence':
+                continue
+                
+            predicted = str(predictions[field]) if predictions[field] else ""
+            actual = str(corrections[field]) if corrections[field] else ""
+            
+            if predicted != actual and actual.strip():
+                corrections_made = True
+                
+                # Get orchestrator from session state
+                if 'learning_orchestrator' in st.session_state:
+                    orchestrator = st.session_state.learning_orchestrator
+                    
+                    # Record user correction
+                    orchestrator.process_prediction(
+                        {field: predictions[field]},
+                        {field: corrections[field]},
+                        confidence=predictions.get('confidence', 0.5),
+                        metadata={
+                            'image_quality': st.session_state.get('image_quality', 'unknown'),
+                            'method_used': st.session_state.get('detection_method', 'ocr'),
+                            'tag_type': st.session_state.get('tag_type', 'unknown')
+                        }
+                    )
+                    
+                    st.success(f"✅ Learned: {field} should be '{actual}', not '{predicted}'")
+        
+        if corrections_made:
+            # Update pipeline data with corrections
+            if 'pipeline_manager' in st.session_state:
+                pm = st.session_state.pipeline_manager
+                for field, value in corrections.items():
+                    if hasattr(pm.pipeline_data, field):
+                        setattr(pm.pipeline_data, field, value)
+            
+            # Run daily routine to update models
+            if 'learning_orchestrator' in st.session_state:
+                st.session_state.learning_orchestrator.daily_routine()
+                st.success("🧠 Learning models updated!")
+        else:
+            st.info("No corrections made - all predictions were correct!")
+
+def show_learning_dashboard():
+    """Display system learning progress"""
+    
+    st.sidebar.header("📊 Learning Dashboard")
+    
+    # Get learning status
+    if 'learning_orchestrator' not in st.session_state:
+        st.sidebar.info("Learning system not initialized")
+        return
+    
+    orchestrator = st.session_state.learning_orchestrator
+    status = orchestrator.get_learning_status()
+    
+    # Main metrics
+    col1, col2, col3, col4 = st.sidebar.columns(4)
+    
+    with col1:
+        st.metric("Feedback", status['feedback_collected'])
+    with col2:
+        accuracy = status['accuracy_by_component'].get('brand', 0)
+        st.metric("Brand Accuracy", f"{accuracy:.1%}")
+    with col3:
+        uncertain = status['uncertain_predictions']
+        st.metric("Uncertain", uncertain)
+    with col4:
+        st.metric("Learning Rate", f"{1-status['epsilon']:.1%}")
+    
+    # Accuracy by component
+    st.sidebar.subheader("🎯 Accuracy by Component")
+    for component, accuracy in status['accuracy_by_component'].items():
+        if accuracy > 0:
+            st.sidebar.progress(min(accuracy, 1.0), f"{component}: {accuracy:.1%}")
+    
+    # RL Performance
+    st.sidebar.subheader("🔧 Detection Method Performance")
+    for method, prob in status['bandit_arms'].items():
+        st.sidebar.write(f"  {method}: {prob:.1%}")
+    
+    # Get recommendations
+    recommendations = orchestrator.get_recommendations()
+    
+    st.sidebar.subheader("🎯 Focus Areas")
+    for component, stats in recommendations['focus_areas'].items():
+        if stats['total'] > 0:
+            st.sidebar.warning(f"{component}: avg confidence {stats['avg_confidence']:.2f}")
+    
+    st.sidebar.subheader("📈 Recent Trends")
+    for component, trend in recommendations['performance_trends'].items():
+        if trend:
+            latest = trend
+            trend_emoji = "📈" if latest > 0 else "📉" if latest < 0 else "➡️"
+            st.sidebar.write(f"{trend_emoji} {component}: {latest:+.1%}")
+
+def analyze_garment_and_learn(tag_image, garment_image, pipeline_data):
+    """
+    Your normal analysis pipeline + learning integration
+    """
+    
+    # Store predictions for later correction
+    predictions = {
+        'brand': pipeline_data.brand,
+        'size': pipeline_data.size,
+        'material': pipeline_data.material,
+        'garment_type': pipeline_data.garment_type,
+        'condition': pipeline_data.condition,
+        'price': pipeline_data.price_estimate.get('mid', 25) if pipeline_data.price_estimate else 25,
+        'confidence': pipeline_data.confidence
+    }
+    
+    # Store in session for later correction
+    st.session_state.current_predictions = predictions
+    
+    # Store image metadata for learning
+    if tag_image is not None:
+        # Simple image quality assessment
+        if hasattr(tag_image, 'shape'):
+            h, w = tag_image.shape[:2]
+            if h * w > 100000:  # High resolution
+                image_quality = 'clear'
+            elif h * w > 25000:  # Medium resolution
+                image_quality = 'medium'
+            else:
+                image_quality = 'faded'
+        else:
+            image_quality = 'unknown'
+        
+        st.session_state.image_quality = image_quality
+        st.session_state.detection_method = 'ocr'  # Default method used
+        st.session_state.tag_type = 'printed'  # Default tag type
+    
+    # PROACTIVE: Ask about uncertain predictions
+    if 'learning_orchestrator' in st.session_state:
+        orchestrator = st.session_state.learning_orchestrator
+        
+        for component, confidence in [('brand', pipeline_data.confidence)]:
+            if confidence < 0.75:
+                uncertain_msg = orchestrator.active_learner.identify_uncertain_prediction(
+                    component, confidence, predictions[component],
+                    {'image_quality': st.session_state.get('image_quality', 'unknown'), 
+                     'method': st.session_state.get('detection_method', 'ocr')}
+                )
+                
+                if uncertain_msg:
+                    st.warning(f"⚠️ {uncertain_msg}")
+
+def smart_ebay_search_with_learning(brand, garment_type, size, condition):
+    """
+    Search eBay and validate predictions with learning
+    """
+    
+    st.info("🔍 Searching eBay with category filter...")
+    
+    # Search with category restriction
+    if 'ebay_filter' in st.session_state:
+        ebay_filter = st.session_state.ebay_filter
+        results = ebay_filter.search_ebay(
+            brand=brand,
+            garment_type=garment_type,
+            size=size,
+            condition=condition
+        )
+        
+        st.success(f"Found {len(results)} clothing items")
+        
+        # Get price from best match
+        if results and 'learning_orchestrator' in st.session_state:
+            best_match = results[0]
+            actual_price = float(best_match.get('price', {}).get('value', 0))
+            
+            # Record price validation
+            predicted_price = st.session_state.current_predictions.get('price', 25)
+            orchestrator = st.session_state.learning_orchestrator
+            
+            orchestrator.process_price_validation(
+                predicted_price, actual_price, brand, garment_type
+            )
+            
+            # Show comparison
+            error_pct = abs(actual_price - predicted_price) / max(actual_price, 1) * 100
+            delta_color = "normal" if error_pct < 20 else "inverse"
+            
+            st.metric("Predicted Price", f"${predicted_price:.2f}", 
+                     delta=f"vs ${actual_price:.2f} ({error_pct:.0f}% error)",
+                     delta_color=delta_color)
+            
+            # Record in learning dataset
+            if 'learning_dataset' in st.session_state:
+                learning_dataset = st.session_state.learning_dataset
+                learning_dataset.record_price_data(
+                    brand=brand,
+                    garment_type=garment_type,
+                    size=size,
+                    material=st.session_state.current_predictions.get('material', 'unknown'),
+                    condition=condition,
+                    price=actual_price,
+                    gender=st.session_state.current_predictions.get('gender', 'Unisex')
+                )
+    else:
+        st.warning("eBay filter not initialized")
+
 # ==========================
 # GOOGLE LENS INTEGRATION
 # ==========================
@@ -8437,6 +9058,14 @@ class EnhancedPipelineManager:
         except Exception as e:
             print(f"  - Enhanced learning dataset failed to initialize: {e}")
             self.learning_dataset = None
+        
+        # Initialize feedback loop and reinforcement learning system
+        try:
+            self.learning_orchestrator = LearningOrchestrator()
+            print("  - Learning orchestrator (RL system) initialized")
+        except Exception as e:
+            print(f"  - Learning orchestrator failed to initialize: {e}")
+            self.learning_orchestrator = None
         
         # Initialize measurement dataset manager
         try:
@@ -12398,6 +13027,30 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             )
             st.write(f"[Research similar items on eBay]({search_url})")
         
+        # Learning system integration
+        st.markdown("---")
+        
+        # Capture predictions for learning
+        analyze_garment_and_learn(
+            st.session_state.pipeline_manager.pipeline_data.tag_image,
+            st.session_state.pipeline_manager.pipeline_data.garment_image,
+            st.session_state.pipeline_manager.pipeline_data
+        )
+        
+        # Show correction interface
+        show_correction_interface()
+        
+        # Smart eBay search with learning
+        if st.session_state.pipeline_manager.pipeline_data.brand != "Unknown":
+            st.subheader("🔍 Smart eBay Search with Learning")
+            if st.button("🔍 Find Similar on eBay (with Learning)"):
+                smart_ebay_search_with_learning(
+                    brand=st.session_state.pipeline_manager.pipeline_data.brand,
+                    garment_type=st.session_state.pipeline_manager.pipeline_data.garment_type,
+                    size=st.session_state.pipeline_manager.pipeline_data.size,
+                    condition=st.session_state.pipeline_manager.pipeline_data.condition
+                )
+        
         # Action buttons
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -13051,10 +13704,29 @@ def main():
     # SAMPLE COUNT WIDGET in sidebar
     with st.sidebar:
         render_sample_count_widget()
+        
+        # Add learning dashboard
+        show_learning_dashboard()
     
     # INITIALIZE ALL SESSION STATE VARIABLES FIRST
     if 'pipeline_manager' not in st.session_state:
         st.session_state.pipeline_manager = EnhancedPipelineManager()
+    
+    # Initialize learning system components
+    if 'learning_orchestrator' not in st.session_state:
+        if hasattr(st.session_state.pipeline_manager, 'learning_orchestrator'):
+            st.session_state.learning_orchestrator = st.session_state.pipeline_manager.learning_orchestrator
+        else:
+            st.session_state.learning_orchestrator = LearningOrchestrator()
+    
+    if 'learning_dataset' not in st.session_state:
+        if hasattr(st.session_state.pipeline_manager, 'learning_dataset'):
+            st.session_state.learning_dataset = st.session_state.pipeline_manager.learning_dataset
+        else:
+            st.session_state.learning_dataset = GarmentLearningDataset()
+    
+    if 'ebay_filter' not in st.session_state:
+        st.session_state.ebay_filter = EbaySearchFilter()
     
     if 'live_preview_enabled' not in st.session_state:
         st.session_state.live_preview_enabled = True
