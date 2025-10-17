@@ -2372,10 +2372,17 @@ class OpenAIVisionCameraManager:
         self.camera_failures = {'arducam': 0, 'c930e': 0}
         self.max_failures = 3
         self.last_frame_time = {'arducam': 0, 'c930e': 0}
-        self.frame_cache = {'arducam': None, 'c930e': None}
+        # Memory-safe frame cache with size tracking
+        self._frame_cache = {
+            'arducam': {'frame': None, 'time': 0, 'size': 0},
+            'c930e': {'frame': None, 'time': 0, 'size': 0}
+        }
         self.cache_duration = 0.5  # Cache frames for 500ms - refresh less often
         self.skip_frames = 2  # Only process every 3rd frame for better performance
         self._cache_cleanup_counter = 0
+        self._cache_max_age = 0.5  # seconds
+        self._cache_max_size_mb = 50  # max cache size
+        self._current_cache_size = 0  # track total cache size
         
         # 12MP ARDUCAM ENHANCEMENTS
         self.preferred_res = [(4056, 3040), (4000, 3000), (3840, 2160), (2592, 1944), (1920, 1080)]
@@ -2420,20 +2427,60 @@ class OpenAIVisionCameraManager:
             
             # Clear expired cache entries
             for camera_type in ['arducam', 'c930e']:
-                if (camera_type in self.frame_cache and 
-                    camera_type in self.last_frame_time and
-                    current_time - self.last_frame_time[camera_type] > self.cache_duration * 2):
-                    self.frame_cache[camera_type] = None
-                    logger.debug(f"[CACHE] Cleared expired cache for {camera_type}")
+                cached = self._frame_cache.get(camera_type, {})
+                if cached.get('frame') is not None:
+                    age = current_time - cached.get('time', 0)
+                    if age > self.cache_duration * 2:
+                        self._frame_cache[camera_type] = {'frame': None, 'time': 0, 'size': 0}
+                        self._current_cache_size -= cached.get('size', 0)
+                        logger.debug(f"[CACHE] Cleared expired cache for {camera_type}")
             
             # Force garbage collection if cache is large
             total_cache_size = sum(
-                1 for cache in self.frame_cache.values() if cache is not None
+                1 for cache in self._frame_cache.values() if cache.get('frame') is not None
             )
             if total_cache_size > 0:
                 import gc
                 gc.collect()
                 logger.debug(f"[CACHE] Garbage collection triggered, {total_cache_size} cached frames")
+    
+    def _add_to_cache(self, key, frame, timestamp):
+        """Helper to safely add frame to cache with size tracking"""
+        if frame is None:
+            return
+        
+        # Calculate frame size
+        frame_size = frame.nbytes
+        
+        # If single frame exceeds max, don't cache
+        if frame_size > self._cache_max_size_mb * 1024 * 1024:
+            logger.warning(f"Frame too large to cache: {frame_size / 1024 / 1024:.1f} MB")
+            return
+        
+        # Remove old frame from cache
+        old_entry = self._frame_cache.get(key, {})
+        old_size = old_entry.get('size', 0)
+        self._current_cache_size -= old_size
+        
+        # Add new frame
+        self._frame_cache[key] = {
+            'frame': frame.copy(),
+            'time': timestamp,
+            'size': frame_size
+        }
+        self._current_cache_size += frame_size
+    
+    def _get_from_cache(self, key):
+        """Helper to safely get frame from cache with age check"""
+        cached = self._frame_cache.get(key, {})
+        if cached.get('frame') is None:
+            return None
+        
+        age = time.time() - cached.get('time', 0)
+        if age > self._cache_max_age:
+            return None
+        
+        return cached['frame'].copy()
     
     def suppress_cv2_warnings(self):
         """Suppress OpenCV warning messages"""
