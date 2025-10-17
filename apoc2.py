@@ -4959,13 +4959,31 @@ Return ONLY this JSON format:
     def analyze_tag(self, image_np: np.ndarray):
         """
         PRIMARY TAG ANALYSIS METHOD - Consolidated entry point for all tag analysis.
+        NOW WITH LEARNING SYSTEM INTEGRATION
         """
-        logger.info("[TAG-ANALYSIS] Starting tag analysis...")
+        logger.info("[TAG-ANALYSIS] Starting tag analysis with learning system...")
+        
+        # Initialize learning orchestrator if not exists
+        if 'learning_orchestrator' not in st.session_state:
+            st.session_state.learning_orchestrator = LearningOrchestrator()
+        
+        orchestrator = st.session_state.learning_orchestrator
+        
+        # Use Q-learning to choose detection method based on image quality
+        image_state = orchestrator.q_learning_agent.get_state(
+            self._assess_image_quality(image_np), 
+            'printed'  # Default tag type
+        )
+        detection_method = orchestrator.q_learning_agent.select_action(image_state)
+        
+        logger.info(f"[LEARNING] Using {detection_method} for image state: {image_state}")
         
         # Try with original image first
         if self._vertex_ai_configured:
             result = self.analyze_tag_with_gemini_sync(image_np)
             if result.get('success') and result.get('brand'):
+                result['method_used'] = detection_method
+                result['image_state'] = image_state
                 return result
             
             # If failed, try with preprocessing
@@ -4975,6 +4993,8 @@ Return ONLY this JSON format:
                 result = self.analyze_tag_with_gemini_sync(preprocessed)
                 if result.get('success'):
                     result['method'] = result.get('method', 'AI') + ' (preprocessed)'
+                    result['method_used'] = detection_method
+                    result['image_state'] = image_state
                     return result
             
             # Final fallback to auto-retry system
@@ -4983,7 +5003,28 @@ Return ONLY this JSON format:
             logger.warning("[TAG-ANALYSIS] Vertex AI not available, using OpenAI fallback")
             result = self.analyze_tag_with_openai_fallback(image_np)
         
+        # Add learning metadata to result
+        result['method_used'] = detection_method
+        result['image_state'] = image_state
+        
         return result
+    
+    def _assess_image_quality(self, image_np):
+        """Assess image quality for learning system"""
+        try:
+            brightness = np.mean(image_np)
+            contrast = np.std(image_np)
+            
+            if brightness < 100:
+                return "dark"
+            elif brightness > 180:
+                return "bright"
+            elif contrast < 30:
+                return "low_contrast"
+            else:
+                return "normal"
+        except:
+            return "unknown"
 
     def analyze_tag_with_openai_fallback(self, image_np):
         """Fallback to OpenAI Vision if Vertex AI isn't available"""
@@ -8061,6 +8102,66 @@ class LearningOrchestrator:
         logger.info("[LEARNING] Daily adaptation complete")
 
 # ============================================
+# SIMPLE FEEDBACK LOGGING (IMMEDIATE INTEGRATION)
+# ============================================
+
+def log_prediction_for_learning(component, predicted, actual, confidence, context=None):
+    """Simple function to log predictions for learning - can be called immediately"""
+    
+    # Initialize learning orchestrator if not exists
+    if 'learning_orchestrator' not in st.session_state:
+        st.session_state.learning_orchestrator = LearningOrchestrator()
+    
+    orchestrator = st.session_state.learning_orchestrator
+    
+    # Record the prediction
+    orchestrator.process_prediction(
+        {component: predicted},
+        {component: actual},
+        confidence=confidence,
+        metadata=context or {}
+    )
+    
+    logger.info(f"[LEARNING] Logged prediction: {component} = '{predicted}' → '{actual}' (confidence: {confidence:.2f})")
+
+def log_price_validation_for_learning(predicted_price, actual_price, brand, garment_type):
+    """Log price validation for learning"""
+    
+    if 'learning_orchestrator' not in st.session_state:
+        st.session_state.learning_orchestrator = LearningOrchestrator()
+    
+    orchestrator = st.session_state.learning_orchestrator
+    
+    orchestrator.process_price_validation(predicted_price, actual_price, brand, garment_type)
+    
+    error_pct = abs(actual_price - predicted_price) / max(actual_price, 1) * 100
+    logger.info(f"[LEARNING] Logged price validation: ${predicted_price:.2f} → ${actual_price:.2f} ({error_pct:.1f}% error)")
+
+def test_learning_system():
+    """Test function to verify learning system is working"""
+    
+    # Initialize learning orchestrator
+    if 'learning_orchestrator' not in st.session_state:
+        st.session_state.learning_orchestrator = LearningOrchestrator()
+    
+    orchestrator = st.session_state.learning_orchestrator
+    
+    # Test feedback collection
+    log_prediction_for_learning('brand', 'GUCCI', 'PRADA', 0.6, {'test': True})
+    log_prediction_for_learning('size', 'M', 'L', 0.8, {'test': True})
+    
+    # Test price validation
+    log_price_validation_for_learning(50.0, 45.0, 'PRADA', 'sweater')
+    
+    # Get learning status
+    status = orchestrator.get_learning_status()
+    
+    st.success("✅ Learning system test completed!")
+    st.json(status)
+    
+    return status
+
+# ============================================
 # STREAMLIT UI COMPONENTS FOR LEARNING
 # ============================================
 
@@ -8203,6 +8304,11 @@ def show_learning_dashboard():
             latest = trend
             trend_emoji = "📈" if latest > 0 else "📉" if latest < 0 else "➡️"
             st.sidebar.write(f"{trend_emoji} {component}: {latest:+.1%}")
+    
+    # Test button for learning system
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🧪 Test Learning System"):
+        test_learning_system()
 
 def analyze_garment_and_learn(tag_image, garment_image, pipeline_data):
     """
@@ -12867,6 +12973,36 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     self.pipeline_data.brand = result.get('brand')
                     self.pipeline_data.size = result.get('size')
                     st.success(f"✅ Brand: {self.pipeline_data.brand}")
+                    
+                    # INTEGRATE LEARNING SYSTEM - Store predictions for correction
+                    if 'learning_orchestrator' in st.session_state:
+                        orchestrator = st.session_state.learning_orchestrator
+                        
+                        # Store predictions for later correction
+                        st.session_state.current_predictions = {
+                            'brand': self.pipeline_data.brand,
+                            'size': self.pipeline_data.size,
+                            'material': getattr(self.pipeline_data, 'material', 'Unknown'),
+                            'garment_type': getattr(self.pipeline_data, 'garment_type', 'Unknown'),
+                            'condition': getattr(self.pipeline_data, 'condition', 'Good'),
+                            'confidence': result.get('confidence', 0.8)
+                        }
+                        
+                        # Store image metadata for learning
+                        st.session_state.image_quality = result.get('image_state', 'unknown')
+                        st.session_state.detection_method = result.get('method_used', 'ocr')
+                        st.session_state.last_tag_image = tag_roi
+                        
+                        # Check for uncertain predictions
+                        if result.get('confidence', 0.8) < 0.75:
+                            uncertain_msg = orchestrator.active_learner.identify_uncertain_prediction(
+                                'brand', result.get('confidence', 0.8), self.pipeline_data.brand,
+                                {'image_quality': result.get('image_state', 'unknown'), 
+                                 'method': result.get('method_used', 'ocr')}
+                            )
+                            if uncertain_msg:
+                                st.warning(f"⚠️ {uncertain_msg}")
+                    
                     self.current_step += 1
                 else:
                     st.error(f"❌ Analysis failed: {result.get('error')}")
@@ -13031,11 +13167,16 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         st.markdown("---")
         
         # Capture predictions for learning
-        analyze_garment_and_learn(
-            st.session_state.pipeline_manager.pipeline_data.tag_image,
-            st.session_state.pipeline_manager.pipeline_data.garment_image,
-            st.session_state.pipeline_manager.pipeline_data
-        )
+        if 'current_predictions' in st.session_state:
+            # Predictions already captured during analysis
+            pass
+        else:
+            # Fallback: capture predictions now
+            analyze_garment_and_learn(
+                st.session_state.pipeline_manager.pipeline_data.tag_image,
+                st.session_state.pipeline_manager.pipeline_data.garment_image,
+                st.session_state.pipeline_manager.pipeline_data
+            )
         
         # Show correction interface
         show_correction_interface()
