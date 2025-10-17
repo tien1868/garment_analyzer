@@ -12,6 +12,10 @@ CACHE_CLEANUP_INTERVAL = 100 # Clean cache every N frames
 DEFAULT_TIMEOUT = 30        # Default timeout for API calls
 MAX_FRAME_SKIP = 5          # Maximum frames to skip for buffer clearing
 
+# Cache settings
+FRAME_CACHE_DURATION_SEC = 0.5  # Cache frames for 500ms
+FRAME_SKIP_COUNT = 2            # Skip frames for performance
+
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 import cv2
@@ -2377,10 +2381,10 @@ class OpenAIVisionCameraManager:
             'arducam': {'frame': None, 'time': 0, 'size': 0},
             'c930e': {'frame': None, 'time': 0, 'size': 0}
         }
-        self.cache_duration = 0.5  # Cache frames for 500ms - refresh less often
-        self.skip_frames = 2  # Only process every 3rd frame for better performance
+        self.cache_duration = FRAME_CACHE_DURATION_SEC  # Cache frames for 500ms - refresh less often
+        self.skip_frames = FRAME_SKIP_COUNT  # Only process every 3rd frame for better performance
         self._cache_cleanup_counter = 0
-        self._cache_max_age = 0.5  # seconds
+        self._cache_max_age = FRAME_CACHE_DURATION_SEC  # seconds
         self._cache_max_size_mb = 50  # max cache size
         self._current_cache_size = 0  # track total cache size
         
@@ -3193,6 +3197,11 @@ class OpenAIVisionCameraManager:
                 if self.arducam_cap is None or not self.arducam_cap.isOpened():
                     return None
             
+            # Check cache first
+            cached = self._get_from_cache('arducam')
+            if cached is not None:
+                return cached
+            
             # Grab multiple frames to clear buffer, then retrieve the latest
             for _ in range(self.skip_frames):
                 self.arducam_cap.grab()
@@ -3200,13 +3209,9 @@ class OpenAIVisionCameraManager:
             
             if ret and frame is not None:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Update the cache using the new thread-safe method
-                if 'pipeline_manager' in st.session_state:
-                    st.session_state.pipeline_manager.camera_cache.update_tag_frame(rgb_frame)
-            
-            # ALWAYS return the frame from the stable cache
-            if 'pipeline_manager' in st.session_state:
-                return st.session_state.pipeline_manager.camera_cache.get_tag_frame()
+                # Cache the frame using our new memory-safe system
+                self._add_to_cache('arducam', rgb_frame, time.time())
+                return rgb_frame
             else:
                 return None
 
@@ -3366,8 +3371,13 @@ class OpenAIVisionCameraManager:
         return float(cv2.Laplacian(gray, cv2.CV_64F, ksize=3).var())
     
     def get_realsense_frame(self):
-        """Get COLOR frame from RealSense using SDK, with thread-safe caching."""
+        """Get COLOR frame from RealSense using SDK, with memory-safe caching."""
         try:
+            # Check cache first
+            cached = self._get_from_cache('c930e')
+            if cached is not None:
+                return cached
+            
             # Try SDK method first (preferred)
             if self.realsense_pipeline is not None and self.realsense_sdk_available:
                 try:
@@ -3378,8 +3388,9 @@ class OpenAIVisionCameraManager:
                         frame_data = np.asanyarray(color_frame.get_data())
                         # The SDK often returns BGR, so we convert to RGB
                         rgb_frame = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
-                        if 'pipeline_manager' in st.session_state:
-                            st.session_state.pipeline_manager.camera_cache.update_garment_frame(rgb_frame)
+                        # Cache the frame using our new memory-safe system
+                        self._add_to_cache('c930e', rgb_frame, time.time())
+                        return rgb_frame
 
                 except Exception as e:
                     logger.warning(f"RealSense SDK read failed: {e}, trying OpenCV fallback")
@@ -3389,22 +3400,15 @@ class OpenAIVisionCameraManager:
                 ret, frame = self.realsense_cap.read()
                 if ret and frame is not None:
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    if 'pipeline_manager' in st.session_state:
-                        st.session_state.pipeline_manager.camera_cache.update_garment_frame(rgb_frame)
+                    # Cache the frame using our new memory-safe system
+                    self._add_to_cache('c930e', rgb_frame, time.time())
+                    return rgb_frame
 
-            # ALWAYS return the frame from the stable cache
-            if 'pipeline_manager' in st.session_state:
-                return st.session_state.pipeline_manager.camera_cache.get_garment_frame()
-            else:
-                return None
+            return None
 
         except Exception as e:
             logger.error(f"RealSense error: {e}")
-            # Return last good frame on error
-            if 'pipeline_manager' in st.session_state:
-                return st.session_state.pipeline_manager.camera_cache.get_garment_frame()
-            else:
-                return None
+            return None
     
     def get_garment_frame(self, preview=False):
         """
