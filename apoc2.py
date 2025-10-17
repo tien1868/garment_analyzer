@@ -4,6 +4,14 @@ With Fixed Elgato Light Control, Better OCR, and Consolidated Steps
 INDENTATION FIXED VERSION
 """
 
+# Constants to replace magic numbers
+MIN_COLOR_THRESHOLD = 1000  # Minimum unique colors for true RGB detection
+MIN_TAG_WIDTH_PX = 100      # Minimum acceptable tag width in pixels
+MAX_CACHE_DURATION = 2.0    # Maximum cache duration in seconds
+CACHE_CLEANUP_INTERVAL = 100 # Clean cache every N frames
+DEFAULT_TIMEOUT = 30        # Default timeout for API calls
+MAX_FRAME_SKIP = 5          # Maximum frames to skip for buffer clearing
+
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 import cv2
@@ -18,6 +26,7 @@ import io
 import asyncio
 import openai
 from openai import AsyncOpenAI
+from typing import Optional, Tuple, Dict, Any
 
 # Import data collection system
 from data_collection_and_correction_system import (
@@ -276,7 +285,8 @@ class eBayCompsFinder:
                             start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
                             end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
                             days_to_sell = (end - start).days
-                        except:
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Date parsing failed: {e}")
                             pass
                     
                     # FIX 3: VALID EBAY URLs - Use viewItemURL from API response
@@ -2365,6 +2375,7 @@ class OpenAIVisionCameraManager:
         self.frame_cache = {'arducam': None, 'c930e': None}
         self.cache_duration = 0.5  # Cache frames for 500ms - refresh less often
         self.skip_frames = 2  # Only process every 3rd frame for better performance
+        self._cache_cleanup_counter = 0
         
         # 12MP ARDUCAM ENHANCEMENTS
         self.preferred_res = [(4056, 3040), (4000, 3000), (3840, 2160), (2592, 1944), (1920, 1080)]
@@ -2379,6 +2390,50 @@ class OpenAIVisionCameraManager:
         self.find_cameras()  # Auto-detect working cameras
         self.initialize_cameras()  # Initialize once at startup
         logger.info("Updated Camera Manager initialized (ArduCam + C930e)")
+    
+    def _validate_roi_coordinates(self, x: int, y: int, w: int, h: int, frame_shape: tuple) -> tuple:
+        """Validate and clamp ROI coordinates to frame bounds"""
+        if not isinstance(frame_shape, (tuple, list)) or len(frame_shape) < 2:
+            raise ValueError(f"Invalid frame_shape: {frame_shape}")
+        
+        h_frame, w_frame = frame_shape[:2]
+        
+        # Validate input types
+        if not all(isinstance(val, (int, float)) for val in [x, y, w, h]):
+            raise TypeError(f"ROI coordinates must be numeric: ({x}, {y}, {w}, {h})")
+        
+        # Clamp coordinates to frame bounds
+        x = max(0, min(int(x), w_frame - 1))
+        y = max(0, min(int(y), h_frame - 1))
+        w = max(1, min(int(w), w_frame - x))
+        h = max(1, min(int(h), h_frame - y))
+        
+        return (x, y, w, h)
+    
+    def cleanup_cache(self):
+        """Clean up frame cache to prevent memory leaks"""
+        self._cache_cleanup_counter += 1
+        
+        # Clean cache every 100 frames (about every 10 seconds at 10fps)
+        if self._cache_cleanup_counter % CACHE_CLEANUP_INTERVAL == 0:
+            current_time = time.time()
+            
+            # Clear expired cache entries
+            for camera_type in ['arducam', 'c930e']:
+                if (camera_type in self.frame_cache and 
+                    camera_type in self.last_frame_time and
+                    current_time - self.last_frame_time[camera_type] > self.cache_duration * 2):
+                    self.frame_cache[camera_type] = None
+                    logger.debug(f"[CACHE] Cleared expired cache for {camera_type}")
+            
+            # Force garbage collection if cache is large
+            total_cache_size = sum(
+                1 for cache in self.frame_cache.values() if cache is not None
+            )
+            if total_cache_size > 0:
+                import gc
+                gc.collect()
+                logger.debug(f"[CACHE] Garbage collection triggered, {total_cache_size} cached frames")
     
     def suppress_cv2_warnings(self):
         """Suppress OpenCV warning messages"""
@@ -3075,9 +3130,16 @@ class OpenAIVisionCameraManager:
             logger.error(f"Auto-adjustment failed for {camera_name}: {e}")
             return False
     
-    def get_arducam_frame(self):
-        """Get frame from ArduCam, using the thread-safe cache."""
+    def get_arducam_frame(self) -> Optional[np.ndarray]:
+        """Get frame from ArduCam, using the thread-safe cache.
+        
+        Returns:
+            np.ndarray: RGB frame or None if capture failed
+        """
         try:
+            # Clean up cache periodically to prevent memory leaks
+            self.cleanup_cache()
+            
             # Check if we need to reinitialize
             if self.arducam_cap is None or not self.arducam_cap.isOpened():
                 self.initialize_cameras()
@@ -3573,11 +3635,12 @@ class OpenAIVisionCameraManager:
             h = int(h * scale_y)
             logger.info(f"[ROI] Scaled coords: ({x}, {y}, {w}, {h})")
         
-        # Ensure coordinates are within bounds
-        x = max(0, min(x, w_frame - 1))
-        y = max(0, min(y, h_frame - 1))
-        w = max(1, min(w, w_frame - x))  # Ensure w is at least 1
-        h = max(1, min(h, h_frame - y))  # Ensure h is at least 1
+        # Validate and clamp coordinates to frame bounds
+        try:
+            x, y, w, h = self._validate_roi_coordinates(x, y, w, h, frame_copy.shape)
+        except (ValueError, TypeError) as e:
+            logger.error(f"[ROI] Invalid coordinates: {e}")
+            return frame_copy
         
         logger.info(f"[ROI] Final coords: ({x}, {y}, {w}, {h})")
         
@@ -10003,6 +10066,57 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 if real_frame is not None:
                     frame_with_roi = st.session_state.pipeline_manager.camera_manager.draw_roi_overlay(real_frame.copy(), 'work')
                     st.image(frame_with_roi, caption="Garment Camera", width=500)
+                    
+                    # DEBUG: Show ROI information
+                    with st.expander("🔍 ROI Debug Info"):
+                        roi_coords = st.session_state.pipeline_manager.camera_manager.roi_coords.get('work', (0, 0, 0, 0))
+                        original_res = st.session_state.pipeline_manager.camera_manager.original_resolution
+                        frame_h, frame_w = real_frame.shape[:2]
+                        
+                        st.write(f"**Current Frame Resolution:** {frame_w}x{frame_h}")
+                        st.write(f"**ROI Calibrated For:** {original_res[0]}x{original_res[1]}")
+                        st.write(f"**Work ROI Coordinates:** {roi_coords}")
+                        st.write(f"**ROI Config File:** roi_config.json")
+                        
+                        if frame_w != original_res[0] or frame_h != original_res[1]:
+                            scale_x = frame_w / original_res[0]
+                            scale_y = frame_h / original_res[1]
+                            scaled_x = int(roi_coords[0] * scale_x)
+                            scaled_y = int(roi_coords[1] * scale_y)
+                            scaled_w = int(roi_coords[2] * scale_x)
+                            scaled_h = int(roi_coords[3] * scale_y)
+                            st.write(f"**Scaled ROI:** ({scaled_x}, {scaled_y}, {scaled_w}, {scaled_h})")
+                            st.warning(f"⚠️ Resolution mismatch! ROI scaled by {scale_x:.2f}x{scale_y:.2f}")
+                        else:
+                            st.success("✅ Resolution matches - no scaling needed")
+                        
+                        # ROI recalibration option
+                        st.markdown("---")
+                        st.markdown("**🔧 ROI Management**")
+                        if st.button("🔄 Recalibrate Work ROI", help="Set new work ROI coordinates"):
+                            st.info("💡 To recalibrate the work ROI:")
+                            st.write("1. Run `python roi2.py` in a separate terminal")
+                            st.write("2. Set the work ROI to cover your garment area")
+                            st.write("3. Save the configuration")
+                            st.write("4. Refresh this page")
+                        
+                        # Manual ROI override
+                        if st.checkbox("Override ROI Manually"):
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                new_x = st.number_input("X", value=roi_coords[0], key="override_x")
+                            with col2:
+                                new_y = st.number_input("Y", value=roi_coords[1], key="override_y")
+                            with col3:
+                                new_w = st.number_input("Width", value=roi_coords[2], key="override_w")
+                            with col4:
+                                new_h = st.number_input("Height", value=roi_coords[3], key="override_h")
+                            
+                            if st.button("Apply Override"):
+                                # Update ROI coordinates
+                                st.session_state.pipeline_manager.camera_manager.roi_coords['work'] = (new_x, new_y, new_w, new_h)
+                                st.success("✅ ROI coordinates updated!")
+                                st.rerun()
                 else:
                     st.warning("C930e not accessible")
             except Exception as e:
