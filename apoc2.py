@@ -408,7 +408,7 @@ import google.generativeai as genai
 import sounddevice as sd
 from scipy.io.wavfile import write
 import sqlite3
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
@@ -6788,7 +6788,7 @@ class EBayPricingAPI:
 
     def _analyze_specifics_distribution(self, items_with_specifics):
         """Analyze distribution of item specifics across results"""
-        from collections import Counter
+        from collections import Counter, defaultdict
         
         analysis = {}
         
@@ -6929,8 +6929,37 @@ class FixedEBayPricingVerifier:
         return condition_map.get(condition, '7000')  # Default to used
     
     def search_ebay_and_extract_prices(self, brand, garment_type, size, condition='Used'):
-        """Search eBay and extract actual listing prices"""
+        """Search eBay and extract actual listing prices with category filtering"""
         try:
+            # Try the new category-filtered search first
+            ebay_filter = EbaySearchFilter()
+            filtered_items = ebay_filter.search_ebay(brand, garment_type, size, condition)
+            
+            if filtered_items:
+                # Extract prices from filtered items
+                prices = []
+                for item in filtered_items:
+                    price_info = item.get('price', {})
+                    if price_info:
+                        price_value = price_info.get('value', 0)
+                        if price_value > 0:
+                            prices.append(float(price_value))
+                
+                if prices:
+                    # Build search URL for display
+                    url, query = self.build_ebay_search_url(brand, garment_type, size, condition)
+                    
+                    return {
+                        'success': True,
+                        'search_url': url,
+                        'query': query,
+                        'prices': sorted(prices),
+                        'count': len(prices),
+                        'method': 'category_filtered'
+                    }
+            
+            # Fallback to original HTML scraping method
+            logger.info("[eBay] Category filtering returned no results, trying HTML scraping...")
             url, query = self.build_ebay_search_url(brand, garment_type, size, condition)
             
             # Fetch the page
@@ -6951,7 +6980,8 @@ class FixedEBayPricingVerifier:
                 'search_url': url,
                 'query': query,
                 'prices': prices,
-                'count': len(prices)
+                'count': len(prices),
+                'method': 'html_scraping'
             }
             
         except Exception as e:
@@ -7097,6 +7127,23 @@ def display_ebay_pricing_verification(pipeline_data):
         
         if 'source' in estimate:
             st.caption(f"Source: {estimate['source']}")
+    
+    # Show learning system statistics if available
+    if 'pipeline_manager' in st.session_state and hasattr(st.session_state.pipeline_manager, 'learning_dataset') and st.session_state.pipeline_manager.learning_dataset:
+        try:
+            stats = st.session_state.pipeline_manager.learning_dataset.get_statistics()
+            with st.expander("🧠 Learning System Statistics"):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Brands Learned", stats['total_brands'])
+                with col2:
+                    st.metric("Price Records", stats['total_price_records'])
+                with col3:
+                    st.metric("Tag Images", stats['total_tag_images'])
+                with col4:
+                    st.metric("Materials Tracked", stats['materials_tracked'])
+        except Exception as e:
+            logger.error(f"Error displaying learning stats: {e}")
 
 # ============================================
 # FIXED: Build eBay Item Specifics URLs
@@ -7136,6 +7183,512 @@ def build_ebay_item_specifics_link(pipeline_data):
     
     url = base_url + "?" + "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
     return url
+
+# ============================================
+# EBAY SEARCH WITH CATEGORY FILTERING
+# ============================================
+class EbaySearchFilter:
+    """eBay search with strict category filtering to clothing only"""
+    
+    # eBay Category IDs for clothing
+    CLOTHING_CATEGORIES = {
+        '15687': 'Women\'s Clothing',
+        '15688': 'Men\'s Clothing',
+        '15689': 'Unisex Adult Clothing',
+        '1059': 'Vintage & Retro Clothing',
+        '159699': 'Contemporary Designer Clothing',
+        '63860': 'Plus Size Clothing',
+        '93427': 'Petite Clothing',
+        '11450': 'Activewear & Athletic Clothing',
+        '186070': 'Loungewear',
+        '185263': 'Outerwear',
+        '185262': 'Tops & Blouses',
+        '185264': 'Dresses',
+        '185265': 'Bottoms',
+        '185261': 'Sweaters',
+        '185266': 'Coats & Jackets',
+    }
+    
+    def __init__(self, ebay_api_key=None):
+        self.api_key = ebay_api_key or os.getenv('EBAY_API_KEY')
+        self.base_url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+        self.session = None
+        
+    def build_search_query(self, brand: str, garment_type: str, size: str, 
+                          condition: str = "excellent", max_price: float = 200) -> Dict:
+        """Build eBay search query with STRICT clothing category filter"""
+        
+        # Build the query
+        query_parts = [brand, garment_type, "women's" if size not in ['S', 'M', 'L', 'XL', '32', '34', '36'] else 'men']
+        q = " ".join([p for p in query_parts if p and p != "Unknown"])
+        
+        # Condition mapping for eBay
+        condition_map = {
+            'new': 'New',
+            'excellent': 'Used: Excellent',
+            'good': 'Used: Good',
+            'fair': 'Used: Fair'
+        }
+        
+        # CRITICAL: Filter by category and condition
+        filters = [
+            # Restrict to clothing categories ONLY
+            f"categoryIds:{','.join(self.CLOTHING_CATEGORIES.keys())}",
+            
+            # Filter by condition
+            f"condition:{condition_map.get(condition, 'Used: Excellent')}",
+            
+            # Filter by price
+            f"price:[0..{max_price}]",
+            
+            # CRITICAL: Exclude accessories and non-clothing
+            "-categoryIds:15687",  # Actually include main clothing
+            
+            # Filter for items with photos (better quality)
+            "itemLocationCountry:US",
+        ]
+        
+        return {
+            'q': q,
+            'limit': 20,
+            'offset': 0,
+            'filter': filters,
+            'sort': '-price'
+        }
+    
+    def search_ebay(self, brand: str, garment_type: str, size: str, 
+                   condition: str = "excellent") -> List[Dict]:
+        """
+        Search eBay with proper category filtering
+        
+        Args:
+            brand: Brand name
+            garment_type: Sweater, shirt, dress, etc
+            size: Size (S, M, L, etc)
+            condition: new, excellent, good, fair
+            
+        Returns:
+            List of matching items with filters applied
+        """
+        import requests
+        
+        if not self.api_key:
+            logger.error("eBay API key not configured")
+            return []
+        
+        try:
+            query = self.build_search_query(brand, garment_type, size, condition)
+            
+            headers = {
+                'Authorization': f'Bearer {self.api_key}',
+                'Accept': 'application/json'
+            }
+            
+            # Build filter string
+            filter_str = ' '.join(query['filter'])
+            
+            params = {
+                'q': query['q'],
+                'limit': query['limit'],
+                'filter': filter_str,
+                'sort': query['sort']
+            }
+            
+            logger.info(f"[eBay] Searching: {query['q']}")
+            logger.info(f"[eBay] Category filter: {len(self.CLOTHING_CATEGORIES)} clothing categories")
+            logger.info(f"[eBay] Condition: {query['filter'][1]}")
+            
+            response = requests.get(self.base_url, headers=headers, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get('itemSummaries', [])
+                
+                # Additional client-side filtering for clothing only
+                filtered_items = [item for item in items if self._is_clothing_item(item)]
+                
+                logger.info(f"[eBay] Found {len(items)} items, {len(filtered_items)} after clothing filter")
+                return filtered_items
+            else:
+                logger.error(f"[eBay] Search failed: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"[eBay] Search error: {e}")
+            return []
+    
+    def _is_clothing_item(self, item: Dict) -> bool:
+        """Verify item is actually clothing (not accessories, shoes, etc)"""
+        
+        excluded_keywords = [
+            'shoe', 'boot', 'sock', 'accessories', 'jewelry', 'belt',
+            'hat', 'scarf', 'glove', 'watch', 'bag', 'purse', 'handbag',
+            'tag', 'label', 'pattern', 'fabric sample'
+        ]
+        
+        title = item.get('title', '').lower()
+        
+        # Reject if contains excluded keywords
+        if any(keyword in title for keyword in excluded_keywords):
+            logger.debug(f"[eBay] Filtered out non-clothing: {item.get('title')}")
+            return False
+        
+        # Verify it's in clothing category
+        categories = item.get('categories', [])
+        if categories:
+            cat_id = categories[0]
+            if cat_id not in self.CLOTHING_CATEGORIES:
+                logger.debug(f"[eBay] Category {cat_id} not in clothing: {item.get('title')}")
+                return False
+        
+        return True
+
+# ============================================
+# LEARNING DATASET SYSTEM
+# ============================================
+class GarmentLearningDataset:
+    """
+    Persistent dataset for learning brand patterns, pricing, and detection confidence
+    Builds a knowledge base that improves with every analysis
+    """
+    
+    def __init__(self, dataset_path='garment_learning_data'):
+        self.dataset_path = Path(dataset_path)
+        self.dataset_path.mkdir(exist_ok=True)
+        
+        self.brand_tags_dir = self.dataset_path / 'brand_tags'
+        self.brand_tags_dir.mkdir(exist_ok=True)
+        
+        self.price_history_file = self.dataset_path / 'price_history.json'
+        self.brand_stats_file = self.dataset_path / 'brand_stats.json'
+        self.detection_confidence_file = self.dataset_path / 'detection_confidence.json'
+        self.material_price_file = self.dataset_path / 'material_price_correlations.json'
+        
+        self.brand_stats = self._load_json(self.brand_stats_file)
+        self.price_history = self._load_json(self.price_history_file)
+        self.detection_confidence = self._load_json(self.detection_confidence_file)
+        self.material_price = self._load_json(self.material_price_file)
+        
+        logger.info(f"[LEARNING] Loaded dataset: {len(self.brand_stats)} brands, {len(self.price_history)} price records")
+    
+    def _load_json(self, filepath: Path) -> Dict:
+        """Load JSON safely"""
+        if filepath.exists():
+            try:
+                with open(filepath, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def _save_json(self, filepath: Path, data: Dict):
+        """Save JSON safely"""
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save {filepath}: {e}")
+    
+    def add_brand_tag_image(self, brand: str, tag_image: np.ndarray, 
+                           detection_method: str = "ocr") -> bool:
+        """
+        Store brand tag image for future brand detection training
+        
+        Args:
+            brand: Brand name
+            tag_image: Cropped tag image (numpy array)
+            detection_method: How brand was detected (ocr, api, manual)
+            
+        Returns:
+            True if saved successfully
+        """
+        
+        if tag_image is None or tag_image.size == 0:
+            logger.warning("[LEARNING] Empty tag image")
+            return False
+        
+        try:
+            brand_dir = self.brand_tags_dir / brand.lower().replace(" ", "_")
+            brand_dir.mkdir(exist_ok=True)
+            
+            # Filename with timestamp and detection method
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = brand_dir / f"{detection_method}_{timestamp}.jpg"
+            
+            # Save image
+            success = cv2.imwrite(str(filename), cv2.cvtColor(tag_image, cv2.COLOR_RGB2BGR))
+            
+            if success:
+                logger.info(f"[LEARNING] Saved {brand} tag image: {filename}")
+                
+                # Update brand stats
+                if brand not in self.brand_stats:
+                    self.brand_stats[brand] = {
+                        'tag_images': 0,
+                        'total_detections': 0,
+                        'detection_methods': defaultdict(int),
+                        'first_seen': timestamp,
+                        'last_updated': timestamp
+                    }
+                
+                self.brand_stats[brand]['tag_images'] += 1
+                self.brand_stats[brand]['detection_methods'][detection_method] += 1
+                self.brand_stats[brand]['last_updated'] = timestamp
+                
+                self._save_json(self.brand_stats_file, self.brand_stats)
+                return True
+            
+        except Exception as e:
+            logger.error(f"[LEARNING] Error saving tag image: {e}")
+        
+        return False
+    
+    def record_price_data(self, brand: str, garment_type: str, size: str,
+                         material: str, condition: str, price: float, 
+                         size_us: str = None, gender: str = "Unisex") -> bool:
+        """
+        Record pricing data for brand/garment/condition correlation
+        
+        Args:
+            brand: Brand name
+            garment_type: sweater, shirt, dress, etc
+            size: Original size
+            material: cotton, cashmere, wool, etc
+            condition: excellent, good, fair
+            price: Selling price
+            size_us: Converted US size
+            gender: gender category
+            
+        Returns:
+            True if recorded
+        """
+        
+        try:
+            timestamp = datetime.now().isoformat()
+            key = f"{brand}_{garment_type}_{condition}_{material}".lower()
+            
+            if key not in self.price_history:
+                self.price_history[key] = []
+            
+            record = {
+                'timestamp': timestamp,
+                'brand': brand,
+                'garment_type': garment_type,
+                'size': size,
+                'size_us': size_us,
+                'gender': gender,
+                'material': material,
+                'condition': condition,
+                'price': price
+            }
+            
+            self.price_history[key].append(record)
+            
+            # Keep only last 1000 records per key to manage file size
+            if len(self.price_history[key]) > 1000:
+                self.price_history[key] = self.price_history[key][-1000:]
+            
+            # Material-price correlation
+            self._update_material_price_correlation(material, price, brand)
+            
+            self._save_json(self.price_history_file, self.price_history)
+            logger.info(f"[LEARNING] Recorded price: {brand} {garment_type} ({condition}) = ${price}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"[LEARNING] Error recording price: {e}")
+            return False
+    
+    def _update_material_price_correlation(self, material: str, price: float, brand: str):
+        """Track how different materials correlate with price"""
+        
+        if material not in self.material_price:
+            self.material_price[material] = {
+                'total_price': 0,
+                'count': 0,
+                'brands': defaultdict(int),
+                'price_range': {'min': price, 'max': price}
+            }
+        
+        mat_data = self.material_price[material]
+        mat_data['total_price'] += price
+        mat_data['count'] += 1
+        mat_data['brands'][brand] += 1
+        mat_data['price_range']['min'] = min(mat_data['price_range']['min'], price)
+        mat_data['price_range']['max'] = max(mat_data['price_range']['max'], price)
+        
+        self._save_json(self.material_price_file, self.material_price)
+    
+    def record_brand_detection(self, brand: str, confidence: float, 
+                              method: str, success: bool):
+        """
+        Record brand detection confidence for improving future detections
+        
+        Args:
+            brand: Brand name
+            confidence: Confidence score (0-1)
+            method: 'ocr', 'api_vision', 'serp', 'manual'
+            success: Whether detection was correct
+        """
+        
+        try:
+            if brand not in self.detection_confidence:
+                self.detection_confidence[brand] = {
+                    'ocr': {'total': 0, 'correct': 0, 'confidences': []},
+                    'api_vision': {'total': 0, 'correct': 0, 'confidences': []},
+                    'serp': {'total': 0, 'correct': 0, 'confidences': []},
+                    'manual': {'total': 0, 'correct': 0, 'confidences': []}
+                }
+            
+            brand_conf = self.detection_confidence[brand][method]
+            brand_conf['total'] += 1
+            if success:
+                brand_conf['correct'] += 1
+            brand_conf['confidences'].append({
+                'value': confidence,
+                'timestamp': datetime.now().isoformat(),
+                'success': success
+            })
+            
+            # Keep only last 500 confidence records per method
+            if len(brand_conf['confidences']) > 500:
+                brand_conf['confidences'] = brand_conf['confidences'][-500:]
+            
+            self._save_json(self.detection_confidence_file, self.detection_confidence)
+            
+        except Exception as e:
+            logger.error(f"[LEARNING] Error recording detection confidence: {e}")
+    
+    def get_price_estimate(self, brand: str, garment_type: str, 
+                          condition: str, material: str = None) -> Dict:
+        """
+        Get price estimate from learned data
+        
+        Returns:
+            {'low': x, 'mid': y, 'high': z, 'sample_size': n, 'confidence': score}
+        """
+        
+        key = f"{brand}_{garment_type}_{condition}_{material}".lower() if material else \
+              f"{brand}_{garment_type}_{condition}".lower()
+        
+        if key not in self.price_history:
+            return {'low': 10, 'mid': 25, 'high': 50, 'sample_size': 0, 'confidence': 0.0}
+        
+        prices = [r['price'] for r in self.price_history[key]]
+        
+        if not prices:
+            return {'low': 10, 'mid': 25, 'high': 50, 'sample_size': 0, 'confidence': 0.0}
+        
+        prices_sorted = sorted(prices)
+        n = len(prices)
+        
+        result = {
+            'low': float(prices_sorted[int(n * 0.25)]),  # 25th percentile
+            'mid': float(np.median(prices)),              # median
+            'high': float(prices_sorted[int(n * 0.75)]),  # 75th percentile
+            'mean': float(np.mean(prices)),
+            'sample_size': n,
+            'confidence': min(1.0, n / 20.0)  # Higher confidence with more data
+        }
+        
+        logger.info(f"[LEARNING] Price estimate for {brand} {garment_type}: ${result['mid']:.2f} (n={n})")
+        return result
+    
+    def get_brand_tier(self, brand: str) -> str:
+        """Predict brand tier based on price history"""
+        
+        # Get all prices for this brand
+        brand_prices = []
+        for key, records in self.price_history.items():
+            if brand.lower() in key:
+                brand_prices.extend([r['price'] for r in records])
+        
+        if not brand_prices:
+            return "unknown"
+        
+        avg_price = np.mean(brand_prices)
+        
+        if avg_price > 100:
+            return "designer"
+        elif avg_price > 50:
+            return "mid-tier"
+        else:
+            return "fast-fashion"
+    
+    def get_best_detection_method(self, brand: str) -> str:
+        """Recommend best detection method for a brand"""
+        
+        if brand not in self.detection_confidence:
+            return "ocr"  # Default
+        
+        brand_conf = self.detection_confidence[brand]
+        
+        best_method = "ocr"
+        best_accuracy = 0.0
+        
+        for method, stats in brand_conf.items():
+            if stats['total'] > 0:
+                accuracy = stats['correct'] / stats['total']
+                if accuracy > best_accuracy:
+                    best_accuracy = accuracy
+                    best_method = method
+        
+        return best_method
+    
+    def get_statistics(self) -> Dict:
+        """Get overall dataset statistics"""
+        
+        total_prices = sum(len(records) for records in self.price_history.values())
+        total_tags = sum(stats['tag_images'] for stats in self.brand_stats.values())
+        
+        return {
+            'total_brands': len(self.brand_stats),
+            'total_price_records': total_prices,
+            'total_tag_images': total_tags,
+            'materials_tracked': len(self.material_price),
+            'timestamp': datetime.now().isoformat()
+        }
+
+# ============================================
+# INTEGRATION WITH MAIN PIPELINE
+# ============================================
+def integrate_learning_system(pipeline_data, learning_dataset: GarmentLearningDataset):
+    """
+    Integrate learning after analysis is complete
+    
+    Call this after you've completed an analysis
+    """
+    
+    # Record brand tag image
+    if pipeline_data.tag_image is not None:
+        learning_dataset.add_brand_tag_image(
+            pipeline_data.brand,
+            pipeline_data.tag_image,
+            detection_method="ocr"  # or "api", "manual"
+        )
+    
+    # Record price data if available
+    if pipeline_data.price_estimate:
+        mid_price = pipeline_data.price_estimate.get('mid', 25)
+        learning_dataset.record_price_data(
+            brand=pipeline_data.brand,
+            garment_type=pipeline_data.garment_type,
+            size=pipeline_data.size,
+            material=pipeline_data.material,
+            condition=pipeline_data.condition,
+            price=mid_price,
+            size_us=pipeline_data.raw_size,
+            gender=pipeline_data.gender
+        )
+    
+    # Record brand detection confidence
+    learning_dataset.record_brand_detection(
+        brand=pipeline_data.brand,
+        confidence=pipeline_data.confidence,
+        method="ocr",
+        success=True  # Set based on user confirmation
+    )
 
 # ==========================
 # GOOGLE LENS INTEGRATION
@@ -7876,6 +8429,14 @@ class EnhancedPipelineManager:
         except Exception as e:
             print(f"  - Learning system failed to initialize: {e}")
             self.dataset_manager = None
+        
+        # Initialize enhanced learning dataset system
+        try:
+            self.learning_dataset = GarmentLearningDataset()
+            print("  - Enhanced learning dataset initialized")
+        except Exception as e:
+            print(f"  - Enhanced learning dataset failed to initialize: {e}")
+            self.learning_dataset = None
         
         # Initialize measurement dataset manager
         try:
@@ -9393,6 +9954,16 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         st.markdown("---")
         if st.button("💾 Save to Training Dataset", type="primary", key="save_training_data"):
             save_analysis_with_corrections(self.pipeline_data)
+            
+            # Integrate with enhanced learning system
+            if hasattr(self, 'learning_dataset') and self.learning_dataset:
+                try:
+                    integrate_learning_system(self.pipeline_data, self.learning_dataset)
+                    st.success("🧠 Learning system updated with new data!")
+                except Exception as e:
+                    logger.error(f"Learning system integration failed: {e}")
+                    st.warning("⚠️ Learning system update failed")
+            
             st.balloons()
 
     def _render_final_review_compact(self):
