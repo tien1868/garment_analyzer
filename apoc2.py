@@ -56,7 +56,6 @@ from data_collection_and_correction_system import (
     render_correction_panel,
     render_sample_count_widget,
     save_analysis_with_corrections,
-    verify_ebay_pricing,
     render_confidence_scores
 )
 
@@ -416,7 +415,7 @@ from enum import Enum
 from functools import wraps
 from threading import Thread
 from typing import Optional, Dict, List, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 import base64
 import concurrent.futures
 import difflib
@@ -2380,14 +2379,32 @@ class OpenAIVisionCameraManager:
         
         self.roi_coords = self.load_roi_config()
         
+        # ✅ NEW: Extract and store per-camera resolutions
+        self.roi_info = {
+            'tag_resolution': self.roi_coords.get('tag_resolution', (1280, 720)),
+            'work_resolution': self.roi_coords.get('work_resolution', (1280, 720))
+        }
+        
+        # Convert roi_coords to the format expected by apply_roi()
+        self.roi_coords = {
+            'tag': self.roi_coords.get('tag', (183, 171, 211, 159)),
+            'work': self.roi_coords.get('work', (38, 33, 592, 435))
+        }
+        
+        self.original_resolution = self.roi_info['tag_resolution']  # Default to tag resolution
+        
         # FORCE default ROI if loading failed
         if not self.roi_coords or 'tag' not in self.roi_coords:
             logger.warning("⚠️ ROI not loaded properly, using defaults")
             self.roi_coords = {
-                'tag': (200, 200, 400, 300),
-                'work': (50, 50, 700, 500)
+                'tag': (183, 171, 211, 159),
+                'work': (38, 33, 592, 435)
             }
-            self.original_resolution = (1280, 720)
+            self.roi_info = {
+                'tag_resolution': (640, 480),
+                'work_resolution': (640, 480)
+            }
+            self.original_resolution = (640, 480)
         
         self.arducam_settings = self.load_arducam_settings()
         self.camera_status = {'arducam': False, 'c930e': False}
@@ -3070,55 +3087,75 @@ class OpenAIVisionCameraManager:
         return results
     
     def load_roi_config(self):
-        """Load ROI coordinates from saved configuration file - prioritize roi_config.json from roi2.py"""
+        """
+        Load ROI coordinates from saved configuration file.
+        Handles both old and new config formats for backward compatibility.
+        """
         try:
-            # PRIORITY 1: Use roi_config.json from roi2.py tool (most recent)
-            if os.path.exists('roi_config.json'):
-                with open('roi_config.json', 'r') as f:
-                    config = json.load(f)
-                    roi_coords = config.get('roi_coords', {})
-                    result = {
-                        'tag': tuple(roi_coords.get('tag', [183, 171, 211, 159])),
-                        'work': tuple(roi_coords.get('work', [38, 33, 592, 435]))
-                    }
-                    self.original_resolution = tuple(config.get('original_resolution', [640, 480]))
-                    logger.info(f"✅ Loaded ROI config from roi2.py: tag={result['tag']}, work={result['work']} at {self.original_resolution}")
-                    return result
+            if not os.path.exists('roi_config.json'):
+                logger.warning("⚠️ roi_config.json not found - using default ROI")
+                return self._get_default_roi_config()
             
-            # FALLBACK: Try ArduCam-specific calibration (older format)
-            if os.path.exists('arducam_calibration.json'):
-                with open('arducam_calibration.json', 'r') as f:
-                    arducam_data = json.load(f)
-                    arducam_roi = arducam_data.get('roi_coords', [])
-                    
-                    if len(arducam_roi) == 4:
-                        # ArduCam ROI format: [x, y, width, height]
-                        x, y, w, h = arducam_roi
-                        # Convert to our format: [x, y, width, height] for both tag and work
-                        result = {
-                            'tag': (x, y, w, h),  # Use ArduCam ROI for tag
-                            'work': (x, y, w, h)   # Use same ROI for work area
-                        }
-                        self.original_resolution = tuple(arducam_data.get('resolution', [640, 480]))
-                        logger.info(f"✅ Loaded ArduCam ROI: {arducam_roi} at resolution {self.original_resolution}")
-                        return result
+            with open('roi_config.json', 'r') as f:
+                config = json.load(f)
             
-            # DEFAULT FALLBACK
-            self.original_resolution = (640, 480)
-            default_result = {
-                'tag': (183, 171, 211, 159),
-                'work': (38, 33, 592, 435)
+            logger.info("✅ Loaded roi_config.json")
+            
+            # Extract ROI coordinates
+            roi_coords = config.get('roi_coords', {})
+            tag_roi = roi_coords.get('tag')
+            work_roi = roi_coords.get('work')
+            
+            # ✅ FIXED: Load per-camera resolutions (NEW FORMAT)
+            camera_resolutions = config.get('camera_resolutions', {})
+            tag_resolution = camera_resolutions.get('tag')
+            work_resolution = camera_resolutions.get('work')
+            
+            # Backward compatibility: fallback to old "resolutions" format
+            if not tag_resolution or not work_resolution:
+                logger.info("⚠️ Using old config format, attempting backward compatibility...")
+                old_resolutions = config.get('resolutions', {})
+                tag_resolution = tag_resolution or old_resolutions.get('tag')
+                work_resolution = work_resolution or old_resolutions.get('work')
+            
+            # Last fallback: use single "original_resolution" for both
+            if not tag_resolution or not work_resolution:
+                original_res = config.get('original_resolution', [1280, 720])
+                tag_resolution = tag_resolution or original_res
+                work_resolution = work_resolution or original_res
+            
+            # Store the primary resolution (typically tag/ArduCam)
+            self.original_resolution = tuple(tag_resolution)
+            
+            # Build result with proper format
+            result = {
+                'tag': tuple(tag_roi) if tag_roi else None,
+                'work': tuple(work_roi) if work_roi else None,
+                'tag_resolution': tuple(tag_resolution),
+                'work_resolution': tuple(work_resolution)
             }
-            logger.warning("⚠️ Using default ROI coordinates - no calibration files found")
-            return default_result
+            
+            logger.info(f"📍 ROI Config loaded:")
+            if tag_roi:
+                logger.info(f"   Tag ROI: x={tag_roi[0]}, y={tag_roi[1]}, w={tag_roi[2]}, h={tag_roi[3]} @ {tag_resolution}")
+            if work_roi:
+                logger.info(f"   Work ROI: x={work_roi[0]}, y={work_roi[1]}, w={work_roi[2]}, h={work_roi[3]} @ {work_resolution}")
+            
+            return result
             
         except Exception as e:
-            logger.error(f"Error loading ROI config: {e}")
-            self.original_resolution = (640, 480)
-            return {
-                'tag': (183, 171, 211, 159),
-                'work': (38, 33, 592, 435)
-            }
+            logger.error(f"❌ Error loading ROI config: {e}")
+            logger.warning("⚠️ Using default ROI configuration")
+            return self._get_default_roi_config()
+
+    def _get_default_roi_config(self):
+        """Return default ROI coordinates when config file is missing or invalid"""
+        return {
+            'tag': (183, 171, 211, 159),
+            'work': (38, 33, 592, 435),
+            'tag_resolution': (640, 480),
+            'work_resolution': (640, 480)
+        }
     
     def load_arducam_settings(self):
         """Load ArduCam-specific settings from calibration file"""
@@ -3525,113 +3562,72 @@ class OpenAIVisionCameraManager:
             return roi_frame
     
     def apply_roi(self, frame, roi_type, zoom_factor=1.0):
-        """Apply ROI with optional digital zoom for small tags
+        """Apply ROI with optional digital zoom - UPDATED FOR PER-CAMERA RESOLUTION"""
         
-        Args:
-            frame: Input frame
-            roi_type: 'tag' or 'work'
-            zoom_factor: 1.0 = normal, 2.0 = 2x zoom into center of ROI
-        """
-        # Pure function - no state checks or modifications
-            
-        if roi_type in self.roi_coords and frame is not None:
-            x, y, w, h = self.roi_coords[roi_type]
+        if frame is None or roi_type not in self.roi_coords:
+            return None
+        
+        try:
             h_frame, w_frame = frame.shape[:2]
+            x, y, w, h = self.roi_coords[roi_type]
             
-            original_width, original_height = self.original_resolution
-            if w_frame != original_width or h_frame != original_height:
-                scale_x = w_frame / original_width
-                scale_y = h_frame / original_height
+            # ✅ FIX: Use per-camera resolution instead of assuming original_resolution
+            if roi_type == 'tag':
+                expected_width, expected_height = self.roi_info.get('tag_resolution', self.original_resolution)
+            else:  # roi_type == 'work'
+                expected_width, expected_height = self.roi_info.get('work_resolution', self.original_resolution)
+            
+            # Scale ROI if frame size differs from expected calibration
+            if w_frame != expected_width or h_frame != expected_height:
+                scale_x = w_frame / expected_width
+                scale_y = h_frame / expected_height
+                
                 x = int(x * scale_x)
                 y = int(y * scale_y)
                 w = int(w * scale_x)
                 h = int(h * scale_y)
-            
-            # DIGITAL ZOOM: Crop tighter and upscale more
-            if zoom_factor > 1.0 and roi_type == 'tag':
-                # Zoom into center of ROI
-                zoom_w = int(w / zoom_factor)
-                zoom_h = int(h / zoom_factor)
-                zoom_x = x + (w - zoom_w) // 2
-                zoom_y = y + (h - zoom_h) // 2
                 
-                # Update ROI to zoomed region
-                x, y, w, h = zoom_x, zoom_y, zoom_w, zoom_h
-                logger.info(f"[ZOOM] Digital zoom {zoom_factor}x applied to tag ROI")
+                logger.debug(f"[ROI-SCALE] {roi_type} scaled by ({scale_x:.2f}, {scale_y:.2f})")
             
-            # Add padding for small tags (if not already zoomed)
-            elif roi_type == 'tag' and (w < 250 or h < 250):
-                padding = 0.2
-                x = max(0, int(x - w * padding))
-                y = max(0, int(y - h * padding))
-                w = min(int(w * (1 + 2*padding)), w_frame - x)
-                h = min(int(h * (1 + 2*padding)), h_frame - y)
-            
+            # Safety bounds check
             x = max(0, min(x, w_frame - 1))
             y = max(0, min(y, h_frame - 1))
-            w = min(w, w_frame - x)
-            h = min(h, h_frame - y)
+            w = max(1, min(w, w_frame - x))
+            h = max(1, min(h, h_frame - y))
             
-            if w > 0 and h > 0:
-                try:
-                    cropped = frame[y:y+h, x:x+w]
-                    
-                    # Validate the cropped image
-                    if cropped is None or cropped.size == 0:
-                        logger.warning(f"[ROI] Empty crop result for {roi_type}")
-                        return None
-                    
-                    # Check for invalid values (NaN, infinity)
-                    if np.any(np.isnan(cropped)) or np.any(np.isinf(cropped)):
-                        logger.warning(f"[ROI] Invalid values (NaN/inf) in crop for {roi_type}")
-                        return None
-                    
-                    # Ensure data type is valid for image display
-                    if cropped.dtype not in [np.uint8, np.float32, np.float64]:
-                        logger.warning(f"[ROI] Invalid dtype {cropped.dtype} for {roi_type}, converting to uint8")
-                        if cropped.dtype == np.float32 or cropped.dtype == np.float64:
-                            # Assume values are in range [0,1] and convert to [0,255]
-                            cropped = (cropped * 255).astype(np.uint8)
-                        else:
-                            cropped = cropped.astype(np.uint8)
-                    
-                    # Ensure values are in valid range
-                    if cropped.dtype == np.uint8:
-                        # Already in correct range [0,255]
-                        pass
-                    elif cropped.max() <= 1.0:
-                        # Values in [0,1] range, convert to [0,255]
-                        cropped = (cropped * 255).astype(np.uint8)
-                    elif cropped.max() > 255:
-                        # Values exceed 255, normalize
-                        cropped = (cropped / cropped.max() * 255).astype(np.uint8)
-                    
-                    # SMART UPSCALING: More aggressive for zoomed tags
-                    target_size = 800 if zoom_factor > 1.0 else 600
-                    if cropped.shape[0] < target_size or cropped.shape[1] < target_size:
-                        scale = max(target_size/cropped.shape[0], target_size/cropped.shape[1])
-                        new_w = int(cropped.shape[1] * scale)
-                        new_h = int(cropped.shape[0] * scale)
-                        # Use LANCZOS4 for high-quality upscaling (best for text)
-                        cropped = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-                        
-                        # SMART LOOP PREVENTION: Only track automatic upscales, not user zoom changes
-                        # Log the upscaling operation (no state mutation)
-                        logger.info(f"[UPSCALE] Tag upscaled to {new_w}x{new_h} (target: {target_size})")
-                    
-                    # Final validation before return
-                    if cropped is None or cropped.size == 0:
-                        logger.warning(f"[ROI] Final validation failed for {roi_type}")
-                        return None
-                    
-                    logger.debug(f"[ROI] Successfully cropped {roi_type}: {cropped.shape}, dtype: {cropped.dtype}, range: [{cropped.min()}, {cropped.max()}]")
-                    return cropped
-                    
-                except Exception as e:
-                    logger.error(f"[ROI] Error processing crop for {roi_type}: {e}")
-                    return None
+            # Apply digital zoom if requested
+            if zoom_factor > 1.0 and roi_type == 'tag':
+                zoom_w = max(1, int(w / zoom_factor))
+                zoom_h = max(1, int(h / zoom_factor))
+                zoom_x = x + max(0, (w - zoom_w) // 2)
+                zoom_y = y + max(0, (h - zoom_h) // 2)
+                x, y, w, h = zoom_x, zoom_y, zoom_w, zoom_h
+                logger.info(f"[ZOOM] Digital zoom {zoom_factor}x applied")
             
-        return None
+            # Crop the ROI
+            cropped = frame[y:y+h, x:x+w]
+            
+            # Validate crop
+            if cropped is None or cropped.size == 0:
+                logger.warning(f"[ROI] Empty crop for {roi_type}")
+                return None
+            
+            # Upscale for better OCR if needed
+            if roi_type == 'tag':
+                target_size = 800 if zoom_factor > 1.0 else 600
+                if cropped.shape[1] < target_size:
+                    scale = target_size / cropped.shape[1]
+                    new_w = int(cropped.shape[1] * scale)
+                    new_h = int(cropped.shape[0] * scale)
+                    cropped = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+                    logger.info(f"[UPSCALE] Tag upscaled to {new_w}x{new_h}")
+            
+            logger.debug(f"[ROI-FINAL] {roi_type}: {cropped.shape}")
+            return cropped
+            
+        except Exception as e:
+            logger.error(f"[ROI-ERROR] {roi_type}: {e}")
+            return None
     
     def apply_roi_pure(self, frame, roi_type, zoom_factor=1.0):
         """
@@ -6884,7 +6880,263 @@ class EBayPricingAPI:
         search_url = f"{self.base_url}?{query_string}"
         
         return search_url
+
+# ============================================
+# FIXED eBay PRICING VERIFICATION
+# ============================================
+
+class FixedEBayPricingVerifier:
+    """Generate working eBay search links and extract real pricing data"""
     
+    def __init__(self, api_key=None):
+        self.api_key = api_key or os.getenv('SERPAPI_KEY')
+        self.base_search_url = "https://www.ebay.com/sch/i.html"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def build_ebay_search_url(self, brand, garment_type, size, condition='Used'):
+        """Build a WORKING eBay search URL"""
+        # Build search keywords
+        search_terms = [brand, garment_type, size, condition]
+        search_query = ' '.join([t for t in search_terms if t and t != 'Unknown'])
+        
+        # Properly encode for eBay
+        params = {
+            '_nkw': search_query,  # Keywords
+            'LH_ItemCondition': self._get_ebay_condition_filter(condition),
+            'LH_Complete': 1,  # Only completed listings
+            'LH_Sold': 1,  # Only sold items (for real pricing)
+            'sort': 4  # Sort by ending soonest (or you can use 10 for price + shipping lowest)
+        }
+        
+        # Build URL with parameters
+        url = self.base_search_url + "?" + "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
+        return url, search_query
+    
+    def _get_ebay_condition_filter(self, condition):
+        """Map condition to eBay filter code"""
+        condition_map = {
+            'New': '3000',
+            'Like New': '3000',
+            'Good': '7000',
+            'Fair': '7000',
+            'Used': '7000',
+            'Pre-owned': '7000',
+            'For parts or not working': '7000'
+        }
+        return condition_map.get(condition, '7000')  # Default to used
+    
+    def search_ebay_and_extract_prices(self, brand, garment_type, size, condition='Used'):
+        """Search eBay and extract actual listing prices"""
+        try:
+            url, query = self.build_ebay_search_url(brand, garment_type, size, condition)
+            
+            # Fetch the page
+            response = self.session.get(url, timeout=10)
+            if response.status_code != 200:
+                logger.warning(f"eBay search returned {response.status_code}")
+                return None
+            
+            # Extract prices from HTML (look for price patterns)
+            prices = self._extract_prices_from_html(response.text)
+            
+            if not prices:
+                logger.warning("No prices found on eBay search")
+                return None
+            
+            return {
+                'success': True,
+                'search_url': url,
+                'query': query,
+                'prices': prices,
+                'count': len(prices)
+            }
+            
+        except Exception as e:
+            logger.error(f"eBay search error: {e}")
+            return None
+    
+    def _extract_prices_from_html(self, html):
+        """Extract prices from eBay search results HTML"""
+        prices = []
+        
+        # Look for price patterns in the HTML
+        # eBay typically shows prices in patterns like "$XX.XX" or "US $XX.XX"
+        price_patterns = [
+            r'\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # $123.45 or $1,234.56
+            r'US\s*\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # US $123.45
+        ]
+        
+        for pattern in price_patterns:
+            matches = re.findall(pattern, html)
+            for match in matches:
+                try:
+                    # Remove commas and convert to float
+                    price = float(match.replace(',', ''))
+                    if 1 < price < 1000:  # Filter out unrealistic prices
+                        prices.append(price)
+                except ValueError:
+                    continue
+        
+        # Remove duplicates and sort
+        prices = sorted(list(set(prices)))
+        
+        return prices[:10] if prices else None  # Return top 10 unique prices
+    
+    def calculate_price_range(self, prices):
+        """Calculate low, mid, high from extracted prices"""
+        if not prices or len(prices) == 0:
+            return None
+        
+        prices = sorted(prices)
+        
+        return {
+            'low': round(prices[0], 2),
+            'mid': round(prices[len(prices)//2], 2),
+            'high': round(prices[-1], 2),
+            'average': round(sum(prices) / len(prices), 2),
+            'count': len(prices)
+        }
+
+# ============================================
+# STREAMLIT UI COMPONENT - Display Pricing
+# ============================================
+
+def display_ebay_pricing_verification(pipeline_data):
+    """Display eBay pricing verification with working links and breakdown"""
+    
+    st.markdown("### 📦 eBay Pricing Verification")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        if st.button("🔍 Search eBay for Similar Items", key="ebay_search"):
+            with st.spinner("Searching eBay..."):
+                verifier = FixedEBayPricingVerifier()
+                
+                result = verifier.search_ebay_and_extract_prices(
+                    brand=pipeline_data.brand,
+                    garment_type=pipeline_data.garment_type,
+                    size=pipeline_data.size,
+                    condition=pipeline_data.condition
+                )
+                
+                if result and result['success']:
+                    st.session_state.ebay_search_result = result
+                    st.success(f"✅ Found {result['count']} similar items on eBay")
+                else:
+                    st.error("❌ Could not search eBay. Please try again.")
+    
+    with col2:
+        if st.button("📊 Show Last Results", key="ebay_show_results"):
+            if 'ebay_search_result' in st.session_state:
+                st.session_state.show_ebay_results = True
+    
+    # Display search results if available
+    if st.session_state.get('ebay_search_result'):
+        result = st.session_state.ebay_search_result
+        
+        # ✅ WORKING LINK TO eBay
+        st.markdown(f"**🔗 [View Search Results on eBay]({result['search_url']})**", 
+                    unsafe_allow_html=True)
+        
+        st.success(f"✅ Found {result['count']} similar items on eBay!")
+        
+        # Calculate price breakdown
+        price_range = FixedEBayPricingVerifier().calculate_price_range(result['prices'])
+        
+        if price_range:
+            st.markdown("#### 💰 Price Breakdown:")
+            
+            # Display in columns for clarity
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("🔻 Low", f"${price_range['low']:.2f}")
+            
+            with col2:
+                st.metric("📊 Mid", f"${price_range['mid']:.2f}")
+            
+            with col3:
+                st.metric("📈 High", f"${price_range['high']:.2f}")
+            
+            with col4:
+                st.metric("➗ Average", f"${price_range['average']:.2f}")
+            
+            # Show extracted prices
+            with st.expander("📋 All Found Prices"):
+                prices_text = ", ".join([f"${p:.2f}" for p in result['prices']])
+                st.write(prices_text)
+            
+            # Update pipeline data with new estimates
+            pipeline_data.price_estimate = {
+                'low': price_range['low'],
+                'mid': price_range['mid'],
+                'high': price_range['high'],
+                'average': price_range['average'],
+                'source': 'eBay Search',
+                'items_found': result['count']
+            }
+        else:
+            st.warning("⚠️ Could not extract pricing data from search results")
+    
+    # Show current price estimate
+    st.markdown("#### 💵 Current Price Estimate:")
+    if pipeline_data.price_estimate:
+        estimate = pipeline_data.price_estimate
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Low", f"${estimate.get('low', 10):.2f}")
+        with col2:
+            st.metric("Mid", f"${estimate.get('mid', 25):.2f}")
+        with col3:
+            st.metric("High", f"${estimate.get('high', 40):.2f}")
+        
+        if 'source' in estimate:
+            st.caption(f"Source: {estimate['source']}")
+
+# ============================================
+# FIXED: Build eBay Item Specifics URLs
+# ============================================
+
+def build_ebay_item_specifics_link(pipeline_data):
+    """Build working eBay link with proper item specifics"""
+    
+    search_terms = []
+    
+    # Add brand
+    if pipeline_data.brand and pipeline_data.brand != 'Unknown':
+        search_terms.append(pipeline_data.brand)
+    
+    # Add garment type
+    if pipeline_data.garment_type and pipeline_data.garment_type != 'Unknown':
+        search_terms.append(pipeline_data.garment_type)
+    
+    # Add size if available
+    if pipeline_data.size and pipeline_data.size != 'Unknown':
+        search_terms.append(f"Size {pipeline_data.size}")
+    
+    # Add style/fit if available
+    if pipeline_data.style and pipeline_data.style != 'Unknown':
+        search_terms.append(pipeline_data.style)
+    
+    # Build query
+    query = ' '.join(search_terms)
+    
+    # Build eBay URL
+    base_url = "https://www.ebay.com/sch/i.html"
+    params = {
+        '_nkw': query,
+        'LH_Complete': 1,
+        'LH_Sold': 1
+    }
+    
+    url = base_url + "?" + "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
+    return url
+
 # ==========================
 # GOOGLE LENS INTEGRATION
 # ==========================
@@ -9130,7 +9382,12 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         render_correction_panel(self.pipeline_data)
         
         # === EBAY PRICING VERIFICATION ===
-        verify_ebay_pricing(self.pipeline_data)
+        if self.pipeline_data.brand != 'Unknown':
+            display_ebay_pricing_verification(self.pipeline_data)
+            
+            # Also show working link for manual browsing
+            ebay_link = build_ebay_item_specifics_link(self.pipeline_data)
+            st.markdown(f"[📍 Browse All Similar Items on eBay]({ebay_link})", unsafe_allow_html=True)
         
         # === SAVE BUTTON ===
         st.markdown("---")
