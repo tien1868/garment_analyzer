@@ -742,8 +742,22 @@ def validate_sweater_vs_jacket(garment_data: dict, material: str) -> dict:
 
 class KnitwearDetector:
     """
-    Detects knitted/soft fabrics vs structured jackets
-    Fixes the jacket/sweater misclassification issue
+    Multi-layered knitwear detection system that fixes jacket/sweater misclassification.
+    
+    Detection Strategy (Fallback Chain):
+    1. Material tags (40%) + Brand signals (20%) = 60% ✅
+    2. No material, but "Punto"? → Use Punto signal (50%) = 50% ✅  
+    3. No tag data at all? → Visual texture (50%) + keywords (20%) = 70% ✅
+    4. Edge case? → Lower threshold + multiple weak signals
+    
+    Features:
+    - Enhanced AI prompting (prevention)
+    - Material-based detection (strongest signal)
+    - Brand-based detection (AKRIS, Punto, etc.)
+    - Visual texture analysis (computer vision)
+    - Style keyword analysis (strong/weak indicators)
+    - Visual-only fallback mode (no tag data)
+    - Dynamic confidence thresholds
     """
     
     def __init__(self):
@@ -823,8 +837,9 @@ class KnitwearDetector:
             }
         
         logger.info(f"[KNITWEAR] Checking jacket classification...")
-        logger.info(f"[KNITWEAR] Brand: {brand}, Material: {material}")
-        logger.info(f"[KNITWEAR] Style: {style}, Has opening: {has_front_opening}")
+        logger.info(f"[KNITWEAR] Brand: '{brand}', Material: '{material}'")
+        logger.info(f"[KNITWEAR] Style: '{style}', Has opening: {has_front_opening}")
+        logger.info(f"[KNITWEAR] Visible features: {visible_features}")
         
         # CHECK 1: Material-based detection (STRONGEST signal)
         material_lower = material.lower()
@@ -849,27 +864,49 @@ class KnitwearDetector:
             confidence_score += 0.2
             logger.warning(f"[KNITWEAR] ✅ Brand check: Knitwear brand detected")
         
-        # CHECK 3: Style/visible features analysis
-        all_features_text = f"{style} {' '.join(visible_features)}".lower()
+        # CHECK 3: Enhanced style/description analysis with strong/weak keywords
+        all_text = f"{style} {' '.join(visible_features)} {brand} {material}".lower()
         
-        knitwear_feature_count = sum(
-            1 for indicator in self.knitwear_indicators
-            if indicator in all_features_text
-        )
+        # Strong knitwear keywords (worth more points)
+        strong_knitwear = [
+            'cable knit', 'ribbed', 'knitted', 'sweater', 'cardigan', 
+            'pullover', 'turtleneck', 'crewneck', 'knitwear', 'punto',
+            'chunky knit', 'waffle knit', 'cable', 'ribbing'
+        ]
         
+        # Weak knitwear keywords (worth fewer points)
+        weak_knitwear = [
+            'soft', 'cozy', 'chunky', 'textured', 'casual', 'comfortable',
+            'draped', 'loose', 'relaxed', 'stretchy', 'flexible'
+        ]
+        
+        # Count strong and weak indicators
+        strong_count = sum(1 for kw in strong_knitwear if kw in all_text)
+        weak_count = sum(1 for kw in weak_knitwear if kw in all_text)
+        
+        # Calculate keyword confidence (strong keywords worth more)
+        keyword_confidence = (strong_count * 0.2) + (weak_count * 0.1)
+        keyword_confidence = min(keyword_confidence, 0.4)  # Cap at 40%
+        
+        if keyword_confidence > 0:
+            corrections.append(
+                f"Style keywords suggest knitwear ({strong_count} strong, {weak_count} weak)"
+            )
+            confidence_score += keyword_confidence
+            logger.warning(f"[KNITWEAR] ✅ Keyword check: +{keyword_confidence:.2f} ({strong_count} strong, {weak_count} weak)")
+        
+        # Also check for jacket indicators (negative points)
         jacket_feature_count = sum(
             1 for indicator in self.jacket_indicators
-            if indicator in all_features_text
+            if indicator in all_text
         )
         
-        if knitwear_feature_count > jacket_feature_count:
-            corrections.append(
-                f"Visual features suggest knitwear ({knitwear_feature_count} indicators)"
-            )
-            confidence_score += 0.2
-            logger.warning(f"[KNITWEAR] ✅ Feature check: {knitwear_feature_count} knitwear indicators")
+        if jacket_feature_count > 0:
+            confidence_score -= 0.1 * jacket_feature_count  # Reduce confidence for jacket indicators
+            logger.info(f"[KNITWEAR] ⚠️ Jacket indicators found: {jacket_feature_count} (reducing confidence)")
         
         # CHECK 4: Visual texture analysis (if image provided)
+        texture_result = None
         if garment_image is not None:
             texture_result = self._analyze_texture(garment_image)
             
@@ -880,8 +917,38 @@ class KnitwearDetector:
                 confidence_score += 0.2
                 logger.warning(f"[KNITWEAR] ✅ Texture check: Soft/knitted texture detected")
         
-        # DECISION: Apply correction if confidence is high enough
-        if confidence_score >= 0.3:  # Lowered threshold to catch more cases
+        # CHECK 5: Visual-only fallback (when no tag data available)
+        if material == "Unknown" and brand == "Unknown":
+            logger.warning("[KNITWEAR] No tag data - relying on visual analysis only")
+            
+            # Run visual texture analysis if not already done
+            if texture_result is None and garment_image is not None:
+                texture_result = self._analyze_texture(garment_image)
+            
+            if texture_result and texture_result['is_knitwear']:
+                # In visual-only mode, be more aggressive
+                corrections.append("Visual-only mode: texture analysis indicates knitwear")
+                confidence_score += 0.5  # Higher weight when we have no tag data
+                logger.warning(f"[KNITWEAR] ✅ VISUAL-ONLY: Knitwear detected from image")
+        
+        # DECISION: Dynamic threshold based on available data
+        min_threshold = 0.4  # Default threshold
+        
+        # Lower threshold if we have strong visual indicators
+        if texture_result and texture_result.get('is_knitwear'):
+            min_threshold = 0.3  # More lenient with good visual evidence
+        
+        # Even lower if we have multiple strong keywords
+        if strong_count >= 2:  # Multiple strong keywords
+            min_threshold = 0.25
+        
+        # Very low threshold for visual-only mode
+        if material == "Unknown" and brand == "Unknown" and texture_result and texture_result.get('is_knitwear'):
+            min_threshold = 0.2
+        
+        logger.info(f"[KNITWEAR] Confidence: {confidence_score:.2f}, Threshold: {min_threshold:.2f}")
+        
+        if confidence_score >= min_threshold:
             # Determine if cardigan or pullover based on front opening
             correct_type = 'cardigan' if has_front_opening else 'sweater'
 
@@ -920,12 +987,13 @@ class KnitwearDetector:
     
     def _analyze_texture(self, image: np.ndarray) -> Dict:
         """
-        Analyze image texture to detect knitwear
+        Enhanced texture analysis to detect knitwear using computer vision
         
         Knitwear characteristics:
-        - Soft, low-contrast texture
-        - Repetitive patterns (knit structure)
+        - Soft, low-contrast texture with repetitive patterns
         - Fewer sharp edges than structured jackets
+        - Uniform, matte surface (not shiny/structured)
+        - Visible knitting patterns or texture
         """
         try:
             # Convert to grayscale
@@ -940,44 +1008,56 @@ class KnitwearDetector:
                 scale = 800 / max(h, w)
                 gray = cv2.resize(gray, None, fx=scale, fy=scale)
             
-            # Calculate texture metrics
-            
-            # 1. Edge density (knitwear has softer, fewer edges)
+            # 1. Edge density (knitwear has softer, fewer sharp edges)
             edges = cv2.Canny(gray, 50, 150)
             edge_density = np.sum(edges > 0) / edges.size
             
-            # 2. Texture variance (knitwear has moderate, uniform variance)
+            # 2. Texture variance (knitwear has repetitive patterns)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             texture_var = np.var(cv2.Laplacian(blur, cv2.CV_64F))
             
-            # 3. Standard deviation (knitwear has lower std than structured fabrics)
+            # 3. Local Binary Patterns approximation - check for uniform texture
             std_dev = np.std(gray)
             
-            # Thresholds (tuned for knitwear detection)
-            is_soft_fabric = edge_density < 0.08  # Low edge density
-            is_uniform_texture = 200 < texture_var < 1200  # Moderate variance
-            is_matte_finish = std_dev < 55  # Not too shiny/reflective
+            # 4. Additional texture analysis - check for repetitive patterns
+            # Simple approach: look for consistent texture patterns
+            kernel = np.ones((3,3), np.float32) / 9
+            filtered = cv2.filter2D(gray, -1, kernel)
+            texture_consistency = np.std(gray - filtered)
             
-            is_knitwear = is_soft_fabric and (is_uniform_texture or is_matte_finish)
+            # Enhanced thresholds for better knitwear detection
+            is_soft_fabric = edge_density < 0.10  # Low sharp edges (increased threshold)
+            is_textured = 150 < texture_var < 1500  # Moderate variance (broader range)
+            is_uniform = 35 < std_dev < 60  # Not too flat, not too varied
+            is_consistent = texture_consistency < 25  # Consistent texture patterns
             
-            reason = []
+            # Knitwear detection logic
+            is_knitwear = is_soft_fabric and (is_textured or is_uniform) and is_consistent
+            
+            # Build detailed reason
+            reason_parts = []
             if is_soft_fabric:
-                reason.append("soft texture (low edges)")
-            if is_uniform_texture:
-                reason.append("uniform knit pattern")
-            if is_matte_finish:
-                reason.append("matte finish")
+                reason_parts.append("soft texture (low edges)")
+            if is_textured:
+                reason_parts.append("repetitive knit pattern")
+            if is_uniform:
+                reason_parts.append("uniform surface")
+            if is_consistent:
+                reason_parts.append("consistent texture")
             
-            logger.debug(f"[TEXTURE] Edge density: {edge_density:.4f}")
-            logger.debug(f"[TEXTURE] Texture variance: {texture_var:.1f}")
-            logger.debug(f"[TEXTURE] Std dev: {std_dev:.1f}")
+            reason = ', '.join(reason_parts) if reason_parts else 'structured fabric'
+            
+            logger.info(f"[TEXTURE] Edge: {edge_density:.3f}, Var: {texture_var:.1f}, Std: {std_dev:.1f}, Consistency: {texture_consistency:.1f}")
+            logger.info(f"[TEXTURE] Result: {'KNITWEAR' if is_knitwear else 'STRUCTURED'} - {reason}")
             
             return {
                 'is_knitwear': is_knitwear,
-                'reason': ', '.join(reason) if reason else 'structured fabric',
+                'reason': reason,
                 'edge_density': edge_density,
                 'texture_variance': texture_var,
-                'std_dev': std_dev
+                'std_dev': std_dev,
+                'texture_consistency': texture_consistency,
+                'confidence': 0.8 if is_knitwear else 0.2
             }
             
         except Exception as e:
@@ -987,7 +1067,9 @@ class KnitwearDetector:
                 'reason': 'analysis failed',
                 'edge_density': 0.0,
                 'texture_variance': 0.0,
-                'std_dev': 0.0
+                'std_dev': 0.0,
+                'texture_consistency': 0.0,
+                'confidence': 0.0
             }
 
 
@@ -5666,34 +5748,34 @@ class OpenAIGarmentAnalyzer:
             
             prompt = """🔍 GARMENT CLASSIFICATION - CRITICAL FOCUS ON SWEATERS VS JACKETS
 
-            Analyze this garment image with SPECIAL ATTENTION to fabric type.
+            Analyze this garment image with SPECIAL ATTENTION to fabric texture and visual appearance.
 
             ⚠️ COMMON MISTAKE TO AVOID:
             DO NOT confuse SWEATERS/CARDIGANS with JACKETS!
 
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            🧶 SWEATER/CARDIGAN (Knitwear):
-            ✓ Soft, knitted or woven fabric
-            ✓ Visible knit texture (cable knit, ribbed, chunky)
-            ✓ Drapes softly, not structured
-            ✓ Made for comfort, worn indoors
-            ✓ Materials: wool, cotton knit, cashmere, acrylic
-            ✓ Usually no stiff collar or lapels
-            ✓ Stretchy, flexible fabric
+            🧶 CLASSIFY AS SWEATER/CARDIGAN if you see:
+            ✓ Visible knit texture (cable knit, ribbed, waffle pattern, chunky knit)
+            ✓ Soft, draped fabric that looks flexible and stretchy
+            ✓ Ribbed cuffs and hem (common in knitwear)
+            ✓ Uniform, matte surface (not shiny/structured)
+            ✓ Cozy, casual appearance
+            ✓ Fabric that looks like it would drape softly
+            ✓ Any visible knitting patterns or texture
 
-            Examples: pullover sweater, cardigan, turtleneck, crewneck
+            Examples: pullover sweater, cardigan, turtleneck, crewneck, cable knit
 
-            🧥 JACKET (Structured Outerwear):
-            ✓ Stiff, structured fabric holds its shape
-            ✓ Designed for outdoor wear/protection
-            ✓ Formal or utilitarian styling
-            ✓ Materials: denim, leather, nylon, canvas
-            ✓ Often has structured collar, lapels, or hood
-            ✓ Buttons/zippers are heavier duty
-            ✓ Not stretchy, more rigid
+            🧥 CLASSIFY AS JACKET only if you see:
+            ✓ Smooth, structured fabric (leather, denim, canvas, nylon)
+            ✓ Stiff collar with lapels or formal structure
+            ✓ Multiple pockets with flaps or heavy-duty closures
+            ✓ Shiny/glossy finish (leather, nylon, windbreaker material)
+            ✓ Heavy-duty zipper, snaps, or buttons
+            ✓ Formal/tailored structure that holds its shape
+            ✓ Fabric that looks stiff and structured
 
-            Examples: blazer, denim jacket, leather jacket, bomber
+            Examples: blazer, denim jacket, leather jacket, bomber, windbreaker
 
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -6089,34 +6171,34 @@ Return JSON:
             
             prompt = """🔍 GARMENT CLASSIFICATION - CRITICAL FOCUS ON SWEATERS VS JACKETS
 
-            Analyze this garment image with SPECIAL ATTENTION to fabric type.
+            Analyze this garment image with SPECIAL ATTENTION to fabric texture and visual appearance.
 
             ⚠️ COMMON MISTAKE TO AVOID:
             DO NOT confuse SWEATERS/CARDIGANS with JACKETS!
 
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            🧶 SWEATER/CARDIGAN (Knitwear):
-            ✓ Soft, knitted or woven fabric
-            ✓ Visible knit texture (cable knit, ribbed, chunky)
-            ✓ Drapes softly, not structured
-            ✓ Made for comfort, worn indoors
-            ✓ Materials: wool, cotton knit, cashmere, acrylic
-            ✓ Usually no stiff collar or lapels
-            ✓ Stretchy, flexible fabric
+            🧶 CLASSIFY AS SWEATER/CARDIGAN if you see:
+            ✓ Visible knit texture (cable knit, ribbed, waffle pattern, chunky knit)
+            ✓ Soft, draped fabric that looks flexible and stretchy
+            ✓ Ribbed cuffs and hem (common in knitwear)
+            ✓ Uniform, matte surface (not shiny/structured)
+            ✓ Cozy, casual appearance
+            ✓ Fabric that looks like it would drape softly
+            ✓ Any visible knitting patterns or texture
 
-            Examples: pullover sweater, cardigan, turtleneck, crewneck
+            Examples: pullover sweater, cardigan, turtleneck, crewneck, cable knit
 
-            🧥 JACKET (Structured Outerwear):
-            ✓ Stiff, structured fabric holds its shape
-            ✓ Designed for outdoor wear/protection
-            ✓ Formal or utilitarian styling
-            ✓ Materials: denim, leather, nylon, canvas
-            ✓ Often has structured collar, lapels, or hood
-            ✓ Buttons/zippers are heavier duty
-            ✓ Not stretchy, more rigid
+            🧥 CLASSIFY AS JACKET only if you see:
+            ✓ Smooth, structured fabric (leather, denim, canvas, nylon)
+            ✓ Stiff collar with lapels or formal structure
+            ✓ Multiple pockets with flaps or heavy-duty closures
+            ✓ Shiny/glossy finish (leather, nylon, windbreaker material)
+            ✓ Heavy-duty zipper, snaps, or buttons
+            ✓ Formal/tailored structure that holds its shape
+            ✓ Fabric that looks stiff and structured
 
-            Examples: blazer, denim jacket, leather jacket, bomber
+            Examples: blazer, denim jacket, leather jacket, bomber, windbreaker
 
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -7478,9 +7560,8 @@ class FixedEBayPricingVerifier:
         if garment_type and garment_type != 'Unknown':
             search_terms.append(garment_type)
         
-        # Add size only if it's a standard size
-        if size and size != 'Unknown' and size.upper() in ['XS', 'S', 'M', 'L', 'XL', 'XXL', '0', '2', '4', '6', '8', '10', '12', '14', '16', '18', '20']:
-            search_terms.append(f"Size {size}")
+        # REMOVED: Size from search terms to improve result relevance
+        # Size filtering can be done on eBay's side if needed
         
         search_query = ' '.join(search_terms)
         
@@ -8606,9 +8687,8 @@ class EbaySearchFilter:
         if garment_type and garment_type != 'Unknown':
             query_parts.append(garment_type)
         
-        # Add size only if it's a standard size
-        if size and size != 'Unknown' and size.upper() in ['XS', 'S', 'M', 'L', 'XL', 'XXL', '0', '2', '4', '6', '8', '10', '12', '14', '16', '18', '20']:
-            query_parts.append(f"Size {size}")
+        # REMOVED: Size from search terms to improve result relevance
+        # Size filtering can be done on eBay's side if needed
         
         q = " ".join(query_parts)
         
@@ -9955,6 +10035,589 @@ def test_knitwear_detection():
         st.error(f"❌ Knitwear detection test failed: {e}")
         logger.error(f"Knitwear detection test error: {e}")
 
+def test_akris_case():
+    """Test the specific AKRIS case that's failing"""
+    st.markdown("### 🔍 AKRIS Case Test")
+    
+    try:
+        detector = KnitwearDetector()
+        
+        # Test the exact AKRIS case
+        result = detector.fix_classification(
+            garment_type='jacket',
+            brand='A-KRIS- punto',
+            material='wool blend',
+            style='cable knit',
+            visible_features=['soft texture', 'ribbed cuffs'],
+            has_front_opening=True
+        )
+        
+        st.write("**AKRIS Test Case:**")
+        st.write(f"- Brand: A-KRIS- punto")
+        st.write(f"- Material: wool blend")
+        st.write(f"- Style: cable knit")
+        st.write(f"- Has front opening: True")
+        st.write(f"- Visible features: ['soft texture', 'ribbed cuffs']")
+        
+        if result['correction_applied']:
+            st.success(f"✅ CORRECTED: jacket → {result['corrected_type']} (confidence: {result['confidence']:.2f})")
+            st.caption(f"Reason: {result['correction_reason']}")
+        else:
+            st.error(f"❌ NOT CORRECTED: Confidence too low ({result['confidence']:.2f})")
+            st.caption(f"Reason: {result['correction_reason']}")
+            if 'suggested_type' in result:
+                st.info(f"💡 Suggested: {result['suggested_type']}")
+        
+        # Test visual-only mode (no tag data)
+        st.markdown("---")
+        st.markdown("### 🔍 Visual-Only Mode Test")
+        
+        result_visual = detector.fix_classification(
+            garment_type='jacket',
+            brand='Unknown',
+            material='Unknown',
+            style='soft cozy',
+            visible_features=['draped fabric', 'casual'],
+            has_front_opening=False
+        )
+        
+        st.write("**Visual-Only Test Case (no tag data):**")
+        st.write(f"- Brand: Unknown")
+        st.write(f"- Material: Unknown")
+        st.write(f"- Style: soft cozy")
+        st.write(f"- Visible features: ['draped fabric', 'casual']")
+        
+        if result_visual['correction_applied']:
+            st.success(f"✅ VISUAL-ONLY CORRECTED: jacket → {result_visual['corrected_type']} (confidence: {result_visual['confidence']:.2f})")
+            st.caption(f"Reason: {result_visual['correction_reason']}")
+        else:
+            st.warning(f"⚠️ VISUAL-ONLY: Not corrected (confidence: {result_visual['confidence']:.2f})")
+            st.caption(f"Reason: {result_visual['correction_reason']}")
+        
+    except Exception as e:
+        st.error(f"❌ AKRIS test failed: {e}")
+        logger.error(f"AKRIS test error: {e}")
+
+def test_correction_memory():
+    """Test the correction memory system"""
+    st.markdown("### 🧠 Correction Memory Test")
+    
+    try:
+        # Initialize memory
+        memory = CorrectionMemory()
+        
+        # Test 1: Add a brand correction
+        st.write("**Test 1: Adding Brand Correction**")
+        memory.add_brand_correction(
+            original_brand="Unknown",
+            correct_brand="AKRIS",
+            tag_image_hash="test_hash_123"
+        )
+        st.success("✅ Added brand correction: Unknown → AKRIS")
+        
+        # Test 2: Apply the correction
+        st.write("**Test 2: Applying Brand Correction**")
+        result = memory.apply_brand_correction(
+            detected_brand="Unknown",
+            tag_image_hash="test_hash_123"
+        )
+        
+        if result['was_corrected']:
+            st.success(f"✅ Correction applied: {result['corrected_brand']}")
+            st.caption(f"Reason: {result['correction_reason']}")
+        else:
+            st.error("❌ Correction not applied")
+        
+        # Test 3: Add garment correction
+        st.write("**Test 3: Adding Garment Correction**")
+        memory.add_garment_correction(
+            original_type="jacket",
+            correct_type="cardigan",
+            brand="AKRIS",
+            material="wool blend"
+        )
+        st.success("✅ Added garment correction: jacket → cardigan")
+        
+        # Test 4: Apply garment correction
+        st.write("**Test 4: Applying Garment Correction**")
+        garment_result = memory.apply_garment_correction(
+            detected_type="jacket",
+            brand="AKRIS",
+            material="wool blend"
+        )
+        
+        if garment_result['was_corrected']:
+            st.success(f"✅ Garment correction applied: {garment_result['corrected_type']}")
+            st.caption(f"Reason: {garment_result['correction_reason']}")
+        else:
+            st.error("❌ Garment correction not applied")
+        
+        # Test 5: Show statistics
+        st.write("**Test 5: Memory Statistics**")
+        stats = memory.get_statistics()
+        st.json(stats)
+        
+        st.success("🎉 Correction memory test completed!")
+        
+    except Exception as e:
+        st.error(f"❌ Correction memory test failed: {e}")
+        logger.error(f"Correction memory test error: {e}")
+
+# ============================================
+# CORRECTION MEMORY SYSTEM
+# ============================================
+
+@dataclass
+class BrandCorrection:
+    """Single brand correction entry"""
+    original_brand: str
+    correct_brand: str
+    tag_image_hash: str  # Hash of the tag image
+    correction_count: int = 1
+    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    last_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    confidence: float = 1.0
+
+
+@dataclass
+class GarmentCorrection:
+    """Single garment type correction entry"""
+    original_type: str
+    correct_type: str
+    brand: str
+    material: str
+    visual_features: List[str] = field(default_factory=list)
+    correction_count: int = 1
+    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    last_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+class CorrectionMemory:
+    """
+    Remembers user corrections and applies them to prevent repeat mistakes
+    
+    This is the KEY to making your feedback loop actually work!
+    """
+    
+    def __init__(self, storage_path='training_data/correction_memory.json'):
+        self.storage_path = storage_path
+        self.brand_corrections = {}  # image_hash -> BrandCorrection
+        self.garment_corrections = []  # List of GarmentCorrection
+        self.brand_patterns = defaultdict(int)  # Track common correction patterns
+        
+        self.load_corrections()
+        logger.info(f"[MEMORY] Loaded {len(self.brand_corrections)} brand corrections, {len(self.garment_corrections)} garment corrections")
+    
+    def load_corrections(self):
+        """Load all saved corrections from disk"""
+        try:
+            if os.path.exists(self.storage_path):
+                with open(self.storage_path, 'r') as f:
+                    data = json.load(f)
+                
+                # Load brand corrections
+                for key, value in data.get('brand_corrections', {}).items():
+                    self.brand_corrections[key] = BrandCorrection(**value)
+                
+                # Load garment corrections
+                for item in data.get('garment_corrections', []):
+                    self.garment_corrections.append(GarmentCorrection(**item))
+                
+                # Load patterns
+                self.brand_patterns = defaultdict(int, data.get('brand_patterns', {}))
+                
+                logger.info(f"✅ Loaded correction memory from {self.storage_path}")
+            else:
+                logger.info("No existing correction memory found, starting fresh")
+                
+        except Exception as e:
+            logger.error(f"Failed to load correction memory: {e}")
+    
+    def save_corrections(self):
+        """Save all corrections to disk"""
+        try:
+            os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
+            
+            data = {
+                'brand_corrections': {
+                    k: {
+                        'original_brand': v.original_brand,
+                        'correct_brand': v.correct_brand,
+                        'tag_image_hash': v.tag_image_hash,
+                        'correction_count': v.correction_count,
+                        'first_seen': v.first_seen,
+                        'last_seen': v.last_seen,
+                        'confidence': v.confidence
+                    }
+                    for k, v in self.brand_corrections.items()
+                },
+                'garment_corrections': [
+                    {
+                        'original_type': c.original_type,
+                        'correct_type': c.correct_type,
+                        'brand': c.brand,
+                        'material': c.material,
+                        'visual_features': c.visual_features,
+                        'correction_count': c.correction_count,
+                        'first_seen': c.first_seen,
+                        'last_seen': c.last_seen
+                    }
+                    for c in self.garment_corrections
+                ],
+                'brand_patterns': dict(self.brand_patterns),
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            with open(self.storage_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            logger.info(f"💾 Saved correction memory to {self.storage_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save correction memory: {e}")
+    
+    def add_brand_correction(
+        self,
+        original_brand: str,
+        correct_brand: str,
+        tag_image_hash: str
+    ):
+        """Record a brand correction"""
+        
+        # Check if we already have this correction
+        if tag_image_hash in self.brand_corrections:
+            correction = self.brand_corrections[tag_image_hash]
+            correction.correction_count += 1
+            correction.last_seen = datetime.now().isoformat()
+            logger.info(f"[MEMORY] Updated existing correction: {original_brand} → {correct_brand} (count: {correction.correction_count})")
+        else:
+            # New correction
+            correction = BrandCorrection(
+                original_brand=original_brand,
+                correct_brand=correct_brand,
+                tag_image_hash=tag_image_hash
+            )
+            self.brand_corrections[tag_image_hash] = correction
+            logger.info(f"[MEMORY] Saved new correction: {original_brand} → {correct_brand}")
+        
+        # Track pattern (helps with fuzzy matching)
+        pattern_key = f"{original_brand.lower()}→{correct_brand.lower()}"
+        self.brand_patterns[pattern_key] += 1
+        
+        self.save_corrections()
+    
+    def add_garment_correction(
+        self,
+        original_type: str,
+        correct_type: str,
+        brand: str,
+        material: str,
+        visual_features: List[str] = None
+    ):
+        """Record a garment type correction"""
+        
+        if visual_features is None:
+            visual_features = []
+        
+        # Check if we have a similar correction already
+        existing = self._find_similar_garment_correction(
+            original_type, brand, material
+        )
+        
+        if existing:
+            existing.correction_count += 1
+            existing.last_seen = datetime.now().isoformat()
+            logger.info(f"[MEMORY] Updated garment correction: {original_type} → {correct_type} (count: {existing.correction_count})")
+        else:
+            correction = GarmentCorrection(
+                original_type=original_type,
+                correct_type=correct_type,
+                brand=brand,
+                material=material,
+                visual_features=visual_features
+            )
+            self.garment_corrections.append(correction)
+            logger.info(f"[MEMORY] Saved new garment correction: {original_type} → {correct_type}")
+        
+        self.save_corrections()
+    
+    def apply_brand_correction(
+        self,
+        detected_brand: str,
+        tag_image_hash: str
+    ) -> Dict:
+        """
+        Apply learned corrections to a brand detection
+        
+        Returns:
+            dict with 'corrected_brand' and 'was_corrected' flag
+        """
+        
+        # Exact match on image hash
+        if tag_image_hash in self.brand_corrections:
+            correction = self.brand_corrections[tag_image_hash]
+            logger.warning("="*60)
+            logger.warning(f"[MEMORY] APPLYING SAVED CORRECTION")
+            logger.warning(f"[MEMORY] {detected_brand} → {correction.correct_brand}")
+            logger.warning(f"[MEMORY] This correction has been made {correction.correction_count} times")
+            logger.warning("="*60)
+            
+            return {
+                'corrected_brand': correction.correct_brand,
+                'was_corrected': True,
+                'correction_reason': f'Previously corrected {correction.correction_count} times',
+                'confidence': correction.confidence
+            }
+        
+        # Fuzzy match on brand name patterns
+        detected_lower = detected_brand.lower()
+        
+        for pattern_key, count in self.brand_patterns.items():
+            if count >= 2:  # Need at least 2 corrections to trust pattern
+                original, correct = pattern_key.split('→')
+                
+                # Check similarity
+                if self._is_similar(detected_lower, original):
+                    logger.warning(f"[MEMORY] Fuzzy match found: {detected_brand} → {correct}")
+                    
+                    return {
+                        'corrected_brand': correct.title(),
+                        'was_corrected': True,
+                        'correction_reason': f'Similar to pattern corrected {count} times',
+                        'confidence': 0.8
+                    }
+        
+        # No correction found
+        return {
+            'corrected_brand': detected_brand,
+            'was_corrected': False
+        }
+    
+    def apply_garment_correction(
+        self,
+        detected_type: str,
+        brand: str,
+        material: str
+    ) -> Dict:
+        """
+        Apply learned corrections to a garment classification
+        
+        Returns:
+            dict with 'corrected_type' and 'was_corrected' flag
+        """
+        
+        # Look for matching correction
+        for correction in self.garment_corrections:
+            if (correction.original_type.lower() == detected_type.lower() and
+                self._brands_match(correction.brand, brand) and
+                self._materials_match(correction.material, material)):
+                
+                logger.warning("="*60)
+                logger.warning(f"[MEMORY] APPLYING SAVED CORRECTION")
+                logger.warning(f"[MEMORY] {detected_type} → {correction.correct_type}")
+                logger.warning(f"[MEMORY] Brand: {brand}, Material: {material}")
+                logger.warning(f"[MEMORY] This correction has been made {correction.correction_count} times")
+                logger.warning("="*60)
+                
+                return {
+                    'corrected_type': correction.correct_type,
+                    'was_corrected': True,
+                    'correction_reason': f'Previously corrected {correction.correction_count} times'
+                }
+        
+        # No correction found
+        return {
+            'corrected_type': detected_type,
+            'was_corrected': False
+        }
+    
+    def _find_similar_garment_correction(
+        self,
+        original_type: str,
+        brand: str,
+        material: str
+    ) -> Optional[GarmentCorrection]:
+        """Find a similar existing correction"""
+        
+        for correction in self.garment_corrections:
+            if (correction.original_type.lower() == original_type.lower() and
+                self._brands_match(correction.brand, brand) and
+                self._materials_match(correction.material, material)):
+                return correction
+        
+        return None
+    
+    def _is_similar(self, str1: str, str2: str, threshold: float = 0.8) -> bool:
+        """Check if two strings are similar using simple matching"""
+        # Simple word-based similarity
+        words1 = set(str1.lower().split())
+        words2 = set(str2.lower().split())
+        
+        if not words1 or not words2:
+            return False
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        similarity = len(intersection) / len(union)
+        return similarity >= threshold
+    
+    def _brands_match(self, brand1: str, brand2: str) -> bool:
+        """Check if two brand names match (with fuzzy logic)"""
+        if brand1 == "Unknown" or brand2 == "Unknown":
+            return True  # Unknown matches anything
+        
+        return self._is_similar(brand1, brand2, threshold=0.7)
+    
+    def _materials_match(self, mat1: str, mat2: str) -> bool:
+        """Check if two materials match"""
+        if mat1 == "Unknown" or mat2 == "Unknown":
+            return True  # Unknown matches anything
+        
+        return self._is_similar(mat1, mat2, threshold=0.6)
+    
+    def get_statistics(self) -> Dict:
+        """Get statistics about corrections"""
+        total_brand_corrections = sum(
+            c.correction_count for c in self.brand_corrections.values()
+        )
+        total_garment_corrections = sum(
+            c.correction_count for c in self.garment_corrections
+        )
+        
+        most_common_patterns = sorted(
+            self.brand_patterns.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
+        
+        return {
+            'total_brand_corrections': total_brand_corrections,
+            'unique_brands': len(self.brand_corrections),
+            'total_garment_corrections': total_garment_corrections,
+            'unique_garments': len(self.garment_corrections),
+            'most_common_patterns': most_common_patterns
+        }
+
+
+def hash_image(image: np.ndarray) -> str:
+    """
+    Create a hash of an image for matching
+    
+    Args:
+        image: numpy array of the image
+    
+    Returns:
+        MD5 hash string
+    """
+    import hashlib
+    
+    # Resize to standard size to avoid resolution differences
+    resized = cv2.resize(image, (256, 256))
+    
+    # Convert to grayscale to ignore color differences
+    if len(resized.shape) == 3:
+        gray = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = resized
+    
+    # Create hash
+    image_hash = hashlib.md5(gray.tobytes()).hexdigest()
+    
+    return image_hash
+
+
+def integrate_correction_memory(pipeline_data, tag_image_hash: str):
+    """
+    Integrate correction memory into your pipeline
+    
+    Call this AFTER initial analysis but BEFORE displaying results
+    
+    Args:
+        pipeline_data: Your PipelineData object
+        tag_image_hash: Hash of the tag image (use hashlib.md5)
+    
+    Returns:
+        Updated pipeline_data with corrections applied
+    """
+    
+    # Initialize memory (only once per session)
+    if not hasattr(integrate_correction_memory, 'memory'):
+        integrate_correction_memory.memory = CorrectionMemory()
+    
+    memory = integrate_correction_memory.memory
+    
+    # Apply brand correction
+    brand_result = memory.apply_brand_correction(
+        detected_brand=pipeline_data.brand,
+        tag_image_hash=tag_image_hash
+    )
+    
+    if brand_result['was_corrected']:
+        pipeline_data.brand = brand_result['corrected_brand']
+        if not hasattr(pipeline_data, 'warnings'):
+            pipeline_data.warnings = []
+        pipeline_data.warnings.append(f"Brand corrected based on past corrections")
+        logger.info(f"✅ Applied brand correction from memory")
+    
+    # Apply garment correction
+    garment_result = memory.apply_garment_correction(
+        detected_type=pipeline_data.garment_type,
+        brand=pipeline_data.brand,
+        material=pipeline_data.material
+    )
+    
+    if garment_result['was_corrected']:
+        pipeline_data.garment_type = garment_result['corrected_type']
+        if not hasattr(pipeline_data, 'warnings'):
+            pipeline_data.warnings = []
+        pipeline_data.warnings.append(f"Garment type corrected based on past corrections")
+        logger.info(f"✅ Applied garment correction from memory")
+    
+    return pipeline_data
+
+
+def save_user_correction(
+    original_brand: str,
+    correct_brand: str,
+    original_type: str,
+    correct_type: str,
+    pipeline_data,
+    tag_image_hash: str
+):
+    """
+    Save a user correction to memory
+    
+    Call this when user makes a correction via the UI
+    """
+    
+    # Initialize memory if needed
+    if not hasattr(integrate_correction_memory, 'memory'):
+        integrate_correction_memory.memory = CorrectionMemory()
+    
+    memory = integrate_correction_memory.memory
+    
+    # Save brand correction if changed
+    if original_brand != correct_brand:
+        memory.add_brand_correction(
+            original_brand=original_brand,
+            correct_brand=correct_brand,
+            tag_image_hash=tag_image_hash
+        )
+        logger.info(f"📚 Saved brand correction: {original_brand} → {correct_brand}")
+    
+    # Save garment correction if changed
+    if original_type != correct_type:
+        memory.add_garment_correction(
+            original_type=original_type,
+            correct_type=correct_type,
+            brand=pipeline_data.brand,
+            material=pipeline_data.material,
+            visual_features=getattr(pipeline_data, 'visible_features', [])
+        )
+        logger.info(f"📚 Saved garment correction: {original_type} → {correct_type}")
+
+
 # ============================================
 # STREAMLIT UI COMPONENTS FOR LEARNING
 # ============================================
@@ -10067,9 +10730,17 @@ def show_learning_dashboard():
     if st.sidebar.button("🧪 Test Learning System"):
         test_learning_system()
     
-    # Test button for knitwear detection
-    if st.sidebar.button("🧶 Test Knitwear Detection"):
-        test_knitwear_detection()
+        # Test button for knitwear detection
+        if st.sidebar.button("🧶 Test Knitwear Detection"):
+            test_knitwear_detection()
+        
+        # Quick test for AKRIS case
+        if st.sidebar.button("🔍 Test AKRIS Case"):
+            test_akris_case()
+        
+        # Test correction memory system
+        if st.sidebar.button("🧠 Test Correction Memory"):
+            test_correction_memory()
 
 def apply_knitwear_correction(pipeline_data, garment_image: np.ndarray = None) -> Dict:
     """
@@ -11133,6 +11804,21 @@ class EnhancedPipelineManager:
                 self.pipeline_data.brand = result.get('brand')
                 raw_size = result.get('size')
                 
+                # INTEGRATE CORRECTION MEMORY - Apply saved corrections
+                try:
+                    # Calculate image hash for this tag
+                    tag_hash = hash_image(roi_image)
+                    
+                    # Apply any saved corrections
+                    self.pipeline_data = integrate_correction_memory(self.pipeline_data, tag_hash)
+                    
+                    # Store the hash for later use in corrections
+                    self.pipeline_data.tag_image_hash = tag_hash
+                    
+                    logger.info(f"[MEMORY] Applied correction memory to tag analysis")
+                except Exception as e:
+                    logger.error(f"[MEMORY] Failed to apply correction memory: {e}")
+                
                 # ENHANCED: Check for numerical sizing if no size detected
                 if not raw_size or raw_size == 'Unknown':
                     logger.info("[SIZE-DETECTION] No size detected, checking for numerical sizing...")
@@ -11189,6 +11875,10 @@ class EnhancedPipelineManager:
                 self.pipeline_data.font_era = result.get('font_era', 'unknown')
                 self.pipeline_data.vintage_indicators = result.get('vintage_indicators', [])
                 self.pipeline_data.material = result.get('material')
+                
+                # DEBUG: Log what material was extracted from tag
+                logger.info(f"[TAG-ANALYSIS] Material extracted from tag: '{result.get('material')}'")
+                logger.info(f"[TAG-ANALYSIS] Full tag result: {result}")
                 
                 # Stop live feed after successful analysis (if running in Streamlit)
                 try:
@@ -11698,6 +12388,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             # NEW: Apply comprehensive knitwear correction
             if pipeline_data.garment_type.lower() == 'jacket':
                 logger.info(f"[KNITWEAR] Checking jacket classification for correction...")
+                logger.info(f"[KNITWEAR] DEBUG - Material from tag: '{pipeline_data.material}'")
+                logger.info(f"[KNITWEAR] DEBUG - Brand: '{pipeline_data.brand}'")
+                logger.info(f"[KNITWEAR] DEBUG - Style: '{pipeline_data.style}'")
 
                 # Apply comprehensive knitwear detection
                 correction_result = apply_knitwear_correction(pipeline_data, self.garment_image)
@@ -11744,6 +12437,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             # Only update material if we don't have it from tag
             if pipeline_data.material == "Unknown":
                 pipeline_data.material = data.get('material', 'Unknown')
+                logger.info(f"[GARMENT-ANALYSIS] Material from garment analysis: '{data.get('material', 'Unknown')}'")
+            else:
+                logger.info(f"[GARMENT-ANALYSIS] Keeping material from tag: '{pipeline_data.material}'")
             
             # Gender
             pipeline_data.gender = data.get('gender', 'Unisex')
@@ -12405,32 +13101,30 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             # Use the same camera as the main display but without ROI
             frame = None
             
-            # Check if user wants to switch camera view
-            camera_switched = st.session_state.get('armpit_camera_switched', False)
+            # Get camera manager reference - try multiple sources
+            camera_manager = None
+            if hasattr(self, 'camera_manager') and self.camera_manager:
+                camera_manager = self.camera_manager
+            elif 'pipeline_manager' in st.session_state and hasattr(st.session_state.pipeline_manager, 'camera_manager'):
+                camera_manager = st.session_state.pipeline_manager.camera_manager
             
-            if camera_switched:
-                # Try RealSense first if user switched
-                if hasattr(self.camera_manager, 'realsense_cap') and self.camera_manager.realsense_cap:
-                    ret, raw_frame = self.camera_manager.realsense_cap.read()
-                    if ret:
-                        frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-                        logger.info("[ARMPIT-MEASUREMENT] Using RealSense frame (user switched)")
-                # Clear the switch flag
-                st.session_state.armpit_camera_switched = False
+            if camera_manager:
+                # Always use Logitech C930e camera for garment analysis (NOT ArduCam, NOT RealSense)
+                if hasattr(camera_manager, 'c930e') and camera_manager.c930e:
+                    try:
+                        # Get full resolution frame from Logitech (not preview)
+                        frame = camera_manager.c930e.get_frame(use_preview_res=False)
+                        if frame is not None:
+                            logger.info("[ARMPIT-MEASUREMENT] Using Logitech C930e full resolution frame (no ROI)")
+                        else:
+                            logger.warning("[ARMPIT-MEASUREMENT] C930e returned None frame")
+                    except Exception as e:
+                        logger.warning(f"[ARMPIT-MEASUREMENT] C930e get_frame failed: {e}")
+                        frame = None
+                
+                # NO FALLBACK TO ARDUCAM - ArduCam is for tag capture only, not garment measurement
             else:
-                # Default: Use Logitech C930e camera for garment analysis (NOT ArduCam)
-                if hasattr(self.camera_manager, 'c930e') and self.camera_manager.c930e:
-                    # Get full resolution frame from Logitech (not preview)
-                    frame = self.camera_manager.c930e.get_frame(use_preview_res=False)
-                    if frame is not None:
-                        logger.info("[ARMPIT-MEASUREMENT] Using Logitech C930e full resolution frame (no ROI)")
-            
-            # Fallback: Try RealSense if Logitech not available
-            if frame is None and hasattr(self.camera_manager, 'realsense_cap') and self.camera_manager.realsense_cap:
-                ret, raw_frame = self.camera_manager.realsense_cap.read()
-                if ret:
-                    frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-                    logger.info("[ARMPIT-MEASUREMENT] Using raw RealSense frame (no ROI)")
+                logger.error("[ARMPIT-MEASUREMENT] No camera manager available")
             
             # DO NOT use ArduCam for armpit measurement - it's for tag capture only
             
@@ -12474,10 +13168,14 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 - ✅ Current garment on top of the stack
                 """)
             
-            # Add fallback option if user still can't see full garment
-            if st.button("🔄 Try Different Camera View", key="switch_camera_view"):
-                st.session_state.armpit_camera_switched = True
-                st.rerun()
+            # Camera is now always Logitech C930e for garment analysis
+            
+            # Add clear points button for testing
+            if len(st.session_state.armpit_points) > 0:
+                if st.button("🗑️ Clear Points", key="clear_armpit_points"):
+                    st.session_state.armpit_points = []
+                    st.success("✅ Points cleared")
+                    st.rerun()
             
             # Add manual measurement option
             if st.button("📏 Use Manual Measurement Instead", key="manual_armpit_measurement"):
@@ -12536,6 +13234,13 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     
                     # Draw line between points
                     cv2.line(display_frame, (x1, y1), (x2, y2), (0, 255, 255), 3)
+                    logger.info(f"[ARMPIT-LINE] Drawing line from ({x1}, {y1}) to ({x2}, {y2})")
+                    
+                    # Add measurement text
+                    mid_x = (x1 + x2) // 2
+                    mid_y = (y1 + y2) // 2
+                    distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                    cv2.putText(display_frame, f"{distance:.0f}px", (mid_x, mid_y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     
                     # Calculate and display measurement
                     pixel_distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
@@ -12557,6 +13262,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 
                 # Debug: Show current state
                 st.caption(f"🔍 Debug: {len(points)} points, clicked_point: {clicked_point}")
+                logger.info(f"[ARMPIT-CLICK] Debug: {len(points)} points, clicked_point: {clicked_point}")
                 
                 # Handle click - FIXED: Prevent double-click registration
                 if clicked_point is not None:
@@ -12582,6 +13288,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                             st.success(f"✅ Point 1 added at ({x}, {y}). Click to add point 2.")
                         elif len(points) == 2:
                             st.success(f"✅ Point 2 added at ({x}, {y}). Measurement complete!")
+                            logger.info(f"[ARMPIT-CLICK] Both points added - line should be drawn between them")
                         # FIXED: Don't call st.rerun() - let Streamlit handle the state naturally
                     elif not new_click:
                         st.info("👆 Click detected but ignored (too close to existing point)")
@@ -12591,8 +13298,12 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     # Show instruction based on current state
                     if len(points) == 0:
                         st.info("👆 Click on the left armpit seam to add Point 1")
+                        logger.info("[ARMPIT-CLICK] Waiting for first click (left armpit)")
                     elif len(points) == 1:
                         st.info("👆 Click on the right armpit seam to add Point 2")
+                        logger.info("[ARMPIT-CLICK] Waiting for second click (right armpit)")
+                    else:
+                        logger.info("[ARMPIT-CLICK] All points collected, no more clicks needed")
                         
             except Exception as e:
                 logger.error(f"[ARMPIT-CLICK] Error with streamlit_image_coordinates: {e}")
@@ -12637,18 +13348,15 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             # Try fallback to ArduCam
             try:
                 logger.info("[ARMPIT-MEASUREMENT] Trying ArduCam fallback...")
-                fallback_frame = self.camera_manager.get_arducam_frame()
-                if fallback_frame is not None:
-                    st.info("📷 Using ArduCam as fallback for measurements")
-                    st.image(fallback_frame, caption="ArduCam Fallback View", width='stretch')
-                    st.caption("💡 Note: ArduCam doesn't support click detection. Use manual measurement below.")
-                    
-                    # Manual measurement input
-                    st.markdown("#### 📏 Manual Armpit Measurement")
-                    manual_width = st.number_input("Enter armpit-to-armpit width (inches):", 
-                                                  min_value=0.0, max_value=50.0, value=20.0, step=0.1)
-                    
-                    if st.button("✅ Use Manual Measurement", key="manual_armpit_width"):
+                st.error("❌ Logitech camera not available for measurements")
+                st.warning("⚠️ Please ensure Logitech C930e camera is connected and working")
+                
+                # Manual measurement input as fallback
+                st.markdown("#### 📏 Manual Armpit Measurement")
+                manual_width = st.number_input("Enter armpit-to-armpit width (inches):", 
+                                              min_value=0.0, max_value=50.0, value=20.0, step=0.1)
+                
+                if st.button("✅ Use Manual Measurement", key="manual_armpit_width"):
                         # Store manual measurement
                         self.pipeline_data.armpit_measurement = {
                             'inches': manual_width,
@@ -15249,6 +15957,22 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 if result.get('success'):
                     self.pipeline_data.brand = result.get('brand')
                     self.pipeline_data.size = result.get('size')
+                    
+                    # INTEGRATE CORRECTION MEMORY - Apply saved corrections
+                    try:
+                        # Calculate image hash for this tag
+                        tag_hash = hash_image(tag_roi)
+                        
+                        # Apply any saved corrections
+                        self.pipeline_data = integrate_correction_memory(self.pipeline_data, tag_hash)
+                        
+                        # Store the hash for later use in corrections
+                        self.pipeline_data.tag_image_hash = tag_hash
+                        
+                        logger.info(f"[MEMORY] Applied correction memory to tag analysis")
+                    except Exception as e:
+                        logger.error(f"[MEMORY] Failed to apply correction memory: {e}")
+                    
                     st.success(f"✅ Brand: {self.pipeline_data.brand}")
                     
                     # INTEGRATE LEARNING SYSTEM - Store predictions for correction
