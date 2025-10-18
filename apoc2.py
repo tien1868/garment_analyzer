@@ -67,6 +67,16 @@ import statistics
 from functools import wraps
 
 # Rate limiting decorator for eBay API
+
+# ============================================
+# CAMERA CONFIGURATION - CRITICAL FOR MEASUREMENTS
+# ============================================
+CAMERA_CONFIG = {
+    'tag_camera_index': 0,        # ArduCam for tag reading
+    'measurement_camera_index': 1, # RealSense for measurements (MUST BE INDEX 1)
+    'force_indices': True,         # Set to False to allow auto-detection
+    'swap_cameras': False          # Set to True if cameras are physically swapped
+}
 def rate_limited(max_per_minute=5000):
     """Rate limiting decorator for API calls"""
     min_interval = 60.0 / max_per_minute
@@ -2845,7 +2855,14 @@ class OpenAIVisionCameraManager:
         # Focus scoring
         self.max_focus_score = 0.0
         
+        # Measurement calibration
+        self.pixels_per_inch = 0.0  # Will be loaded from calibration.json
+        
+        # Load measurement calibration
+        self.load_measurement_calibration()
+        
         self.find_cameras()  # Auto-detect working cameras
+        self.validate_measurement_camera_index()  # Ensure correct camera index
         self.initialize_cameras()  # Initialize once at startup
         logger.info("Updated Camera Manager initialized (ArduCam + C930e)")
     
@@ -2941,24 +2958,50 @@ class OpenAIVisionCameraManager:
         cv2.setLogLevel(0)  # Only show errors
     
     def find_cameras(self):
-        """Auto-detect which cameras work - ensure we get two different cameras"""
-        logger.info("Detecting available cameras...")
+        """FIXED: Force specific camera indices to prevent measurement issues"""
+        logger.info("🎥 Detecting cameras...")
+        
+        # Check if we should use forced indices
+        if CAMERA_CONFIG.get('force_indices', True):
+            # FORCE specific indices for reliability
+            self.arducam_index = CAMERA_CONFIG['tag_camera_index']
+            self.realsense_index = CAMERA_CONFIG['measurement_camera_index']
+            
+            # Handle camera swap if configured
+            if CAMERA_CONFIG.get('swap_cameras', False):
+                self.arducam_index, self.realsense_index = self.realsense_index, self.arducam_index
+                logger.info("🔄 Cameras swapped per configuration")
+            
+            logger.info(f"🔒 FORCED ASSIGNMENT:")
+            logger.info(f"   📷 ArduCam (tags): Index {self.arducam_index}")
+            logger.info(f"   📷 RealSense (measurements): Index {self.realsense_index}")
+            
+            # Verify cameras exist
+            backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            for idx, name in [(self.arducam_index, "ArduCam"), (self.realsense_index, "RealSense")]:
+                cap = cv2.VideoCapture(idx, backend)
+                if cap.isOpened():
+                    ret, _ = cap.read()
+                    cap.release()
+                    if ret:
+                        logger.info(f"   ✅ {name} at index {idx}: OK")
+                    else:
+                        logger.warning(f"   ⚠️ {name} at index {idx}: Cannot read frames")
+                else:
+                    logger.error(f"   ❌ {name} at index {idx}: NOT FOUND")
+            
+            return
+        
+        # FALLBACK: Auto-detection (not recommended for measurements)
+        logger.warning("⚠️ Auto-detection enabled - may cause measurement issues")
         
         working_cameras = []
+        backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
         
-        # Only try DirectShow on Windows as it's most reliable
-        if os.name == 'nt':
-            backend = cv2.CAP_DSHOW
-        else:
-            backend = cv2.CAP_ANY
-        
-        # Quick scan of first few indices
         for i in range(3):
             try:
-                # Suppress output during test
                 cap = cv2.VideoCapture(i, backend)
                 if cap.isOpened():
-                    # Quick test - just one frame
                     ret, frame = cap.read()
                     cap.release()
                     
@@ -2971,21 +3014,67 @@ class OpenAIVisionCameraManager:
             except:
                 continue
         
-        # Assign cameras - FORCE RealSense/Logitech to index 1 for measurements
+        # Assign cameras
         if len(working_cameras) >= 2:
-            # Use first camera for ArduCam (tag reading)
             self.arducam_index = working_cameras[0]['index']
-            # FORCE RealSense/Logitech to index 1 for measurements
-            self.realsense_index = 1
-            logger.info(f"✅ FORCED: ArduCam={self.arducam_index}, RealSense/Logitech=1 (for measurements)")
+            self.realsense_index = working_cameras[1]['index']
+            logger.info(f"Auto-assigned: ArduCam={self.arducam_index}, RealSense={self.realsense_index}")
         elif len(working_cameras) == 1:
             self.arducam_index = working_cameras[0]['index']
-            self.realsense_index = 1  # Try next index
-            logger.warning("Only one camera detected, second camera may not work")
+            self.realsense_index = 1
+            logger.warning("Only one camera detected")
         else:
             self.arducam_index = 0
             self.realsense_index = 1
-            logger.warning("No cameras auto-detected, using default indices")
+            logger.warning("No cameras detected, using defaults")
+    
+    def load_measurement_calibration(self):
+        """Load pixels-per-inch calibration for accurate measurements"""
+        try:
+            if os.path.exists('calibration.json'):
+                with open('calibration.json', 'r') as f:
+                    calib = json.load(f)
+                    self.pixels_per_inch = calib.get('pixels_per_inch', 0.0)
+                    quality = calib.get('quality_score', 0)
+                    logger.info(f"✅ Loaded calibration: {self.pixels_per_inch:.2f} px/inch (quality: {quality:.1f}%)")
+                    return self.pixels_per_inch
+            else:
+                logger.warning("⚠️ No calibration.json found - run calibration_setup.py first!")
+                logger.warning("   Measurements will be in pixels only until calibrated")
+                self.pixels_per_inch = 0.0
+                return 0.0
+        except Exception as e:
+            logger.error(f"Error loading calibration: {e}")
+            self.pixels_per_inch = 0.0
+            return 0.0
+    
+    def validate_measurement_camera_index(self):
+        """CRITICAL: Ensure measurement camera is always at index 1"""
+        expected_index = CAMERA_CONFIG['measurement_camera_index']
+        
+        if self.realsense_index != expected_index:
+            logger.error(f"❌ WRONG CAMERA INDEX: RealSense at {self.realsense_index}, needs to be {expected_index}")
+            logger.info(f"🔧 Forcing RealSense to index {expected_index}...")
+            
+            # Force correction
+            if hasattr(self, 'realsense_cap') and self.realsense_cap:
+                self.realsense_cap.release()
+                self.realsense_cap = None
+            if hasattr(self, 'realsense_pipeline') and self.realsense_pipeline:
+                try:
+                    self.realsense_pipeline.stop()
+                except:
+                    pass
+                self.realsense_pipeline = None
+            
+            # Set to correct index
+            self.realsense_index = expected_index
+            
+            logger.info(f"✅ RealSense index corrected to {expected_index}")
+            return True
+        else:
+            logger.info(f"✅ RealSense already at correct index {expected_index}")
+            return True
     
     def _set_fourcc(self, cap, fourcc_str="MJPG"):
         """Set camera codec (MJPG preferred for high-res over USB)"""
@@ -11085,7 +11174,8 @@ def convert_armpit_to_size(armpit_inches, gender="Unisex"):
             if distance < min_distance:
                 min_distance = distance
                 closest_size = size
-                confidence = max(0.0, 1.0 - (distance / 2.0))  # Lower confidence for close matches
+                # More lenient confidence calculation for edge cases
+                confidence = max(0.2, 1.0 - (distance / 3.0))  # Minimum 20% confidence, more lenient scaling
         
         best_size = closest_size
     
@@ -11103,6 +11193,244 @@ def convert_armpit_to_size(armpit_inches, gender="Unisex"):
         "measurement": armpit_inches,
         "gender": gender
     }
+
+def display_camera_diagnostics():
+    """Display camera diagnostic information in sidebar"""
+    with st.sidebar.expander("🎥 Camera Diagnostics"):
+        st.markdown("### Camera Configuration")
+        
+        # Show current config
+        st.info(f"""
+        **Tag Camera:** Index {CAMERA_CONFIG['tag_camera_index']}
+        **Measurement Camera:** Index {CAMERA_CONFIG['measurement_camera_index']}
+        **Force Indices:** {CAMERA_CONFIG['force_indices']}
+        """)
+        
+        # Show actual assignments
+        if hasattr(st.session_state, 'camera_manager') and st.session_state.camera_manager:
+            cam = st.session_state.camera_manager
+            st.success(f"""
+            **Actual Assignments:**
+            - ArduCam: Index {cam.arducam_index}
+            - RealSense: Index {cam.realsense_index}
+            """)
+            
+            # Show calibration status
+            if hasattr(cam, 'pixels_per_inch') and cam.pixels_per_inch > 0:
+                st.success(f"✅ Calibrated: {cam.pixels_per_inch:.2f} px/inch")
+            else:
+                st.warning("⚠️ Not calibrated - run calibration_setup.py")
+        else:
+            st.error("Camera manager not available")
+        
+        # Manual camera test
+        st.markdown("---")
+        st.markdown("### Test Cameras")
+        
+        test_index = st.selectbox("Camera Index:", [0, 1, 2], index=1)
+        
+        if st.button("📸 Test Camera"):
+            import cv2
+            backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            cap = cv2.VideoCapture(test_index, backend)
+            
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                
+                if ret and frame is not None:
+                    st.success(f"✅ Camera {test_index} works!")
+                    st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
+                            caption=f"Camera {test_index}", 
+                            width=300)
+                else:
+                    st.error(f"❌ Camera {test_index} can't read frames")
+            else:
+                st.error(f"❌ Camera {test_index} not available")
+        
+        # Swap cameras button
+        st.markdown("---")
+        if st.button("🔄 Swap Camera Assignments"):
+            CAMERA_CONFIG['swap_cameras'] = not CAMERA_CONFIG.get('swap_cameras', False)
+            st.info("Restart app to apply changes")
+
+def display_armpit_measurement_with_validation():
+    """Display armpit measurement interface with camera validation"""
+    
+    st.subheader("📏 Armpit-to-Armpit Measurement")
+    
+    # Validate camera index FIRST
+    if not hasattr(st.session_state, 'camera_manager') or not st.session_state.camera_manager:
+        st.error("❌ Camera manager not available")
+        return
+    
+    cam = st.session_state.camera_manager
+    
+    if not cam.validate_measurement_camera_index():
+        st.error("❌ Cannot access measurement camera at index 1")
+        st.info("Check camera connections and restart app")
+        return
+    
+    # Check calibration
+    if not hasattr(cam, 'pixels_per_inch') or cam.pixels_per_inch == 0:
+        st.warning("⚠️ Not calibrated! Run calibration_setup.py first")
+        st.info("Measurements will be in pixels only")
+    else:
+        st.success(f"✅ Calibrated: {cam.pixels_per_inch:.2f} px/inch")
+    
+    # Get frame from CORRECT camera (index 1)
+    st.info(f"📷 Using Camera Index {cam.realsense_index} for measurements")
+    
+    frame = cam.c930e.get_frame(use_preview_res=False)
+    
+    if frame is None:
+        st.error(f"❌ Cannot get frame from camera {cam.realsense_index}")
+        
+        # Offer manual camera selection
+        st.markdown("---")
+        st.markdown("**Try Different Camera:**")
+        manual_index = st.radio("Select Camera:", [0, 1, 2], index=1)
+        
+        if st.button("Test Selected Camera"):
+            import cv2
+            backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            test_cap = cv2.VideoCapture(manual_index, backend)
+            
+            if test_cap.isOpened():
+                ret, test_frame = test_cap.read()
+                test_cap.release()
+                
+                if ret:
+                    st.success(f"✅ Camera {manual_index} works!")
+                    st.image(cv2.cvtColor(test_frame, cv2.COLOR_BGR2RGB),
+                            caption=f"Camera {manual_index}",
+                            use_container_width=True)
+                else:
+                    st.error(f"❌ Camera {manual_index} can't read frames")
+            else:
+                st.error(f"❌ Camera {manual_index} not available")
+        return
+    
+    # Display measurement interface
+    st.info("👆 Click on **left armpit seam**, then **right armpit seam**")
+    
+    # Initialize points
+    if 'armpit_points' not in st.session_state:
+        st.session_state.armpit_points = []
+    
+    # Draw overlay
+    display_frame = frame.copy()
+    
+    if len(st.session_state.armpit_points) > 0:
+        for i, point in enumerate(st.session_state.armpit_points):
+            cv2.circle(display_frame, point, 15, (0, 255, 0), -1)
+            cv2.circle(display_frame, point, 17, (255, 255, 255), 2)
+            label = "LEFT" if i == 0 else "RIGHT"
+            cv2.putText(display_frame, label,
+                       (point[0] - 40, point[1] - 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Draw line if both points exist
+        if len(st.session_state.armpit_points) == 2:
+            p1, p2 = st.session_state.armpit_points
+            cv2.line(display_frame, p1, p2, (0, 255, 0), 3)
+            
+            # Calculate distance
+            distance_pixels = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+            
+            # Show on image
+            midpoint = ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2)
+            text = f"{distance_pixels:.0f}px"
+            if hasattr(cam, 'pixels_per_inch') and cam.pixels_per_inch > 0:
+                inches = distance_pixels / cam.pixels_per_inch
+                text = f"{inches:.2f}\""
+            
+            cv2.rectangle(display_frame,
+                         (midpoint[0]-60, midpoint[1]-30),
+                         (midpoint[0]+60, midpoint[1]+10),
+                         (0, 0, 0), -1)
+            cv2.putText(display_frame, text, midpoint,
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    
+    # Display with coordinates
+    clicked = streamlit_image_coordinates(
+        display_frame,
+        key="armpit_measurement"
+    )
+    
+    if clicked and len(st.session_state.armpit_points) < 2:
+        point = (int(clicked['x']), int(clicked['y']))
+        
+        # Check if different from existing points (reduced threshold for faster clicking)
+        is_new = True
+        for p in st.session_state.armpit_points:
+            if abs(p[0] - point[0]) < 5 and abs(p[1] - point[1]) < 5:  # Reduced from 10 to 5
+                is_new = False
+                break
+        
+        if is_new:
+            st.session_state.armpit_points.append(point)
+            side = "Left" if len(st.session_state.armpit_points) == 1 else "Right"
+            st.success(f"✅ {side} armpit marked!")
+            st.rerun()
+        else:
+            st.warning("⚠️ Point too close to existing point, try clicking elsewhere")
+    
+    # Show results
+    if len(st.session_state.armpit_points) == 2:
+        p1, p2 = st.session_state.armpit_points
+        distance_pixels = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Distance (pixels)", f"{distance_pixels:.1f}px")
+        
+        with col2:
+            if hasattr(cam, 'pixels_per_inch') and cam.pixels_per_inch > 0:
+                inches = distance_pixels / cam.pixels_per_inch
+                st.metric("Distance (inches)", f"{inches:.2f}\"")
+            else:
+                st.warning("Not calibrated")
+        
+        # Control buttons
+        col_reset, col_save = st.columns(2)
+        with col_reset:
+            if st.button("🔄 Reset Points"):
+                st.session_state.armpit_points = []
+                st.rerun()
+        
+        with col_save:
+            if st.button("✅ Save Measurement"):
+                # Check both possible locations for pipeline data
+                pipeline_data = None
+                if hasattr(st.session_state, 'pipeline_data'):
+                    pipeline_data = st.session_state.pipeline_data
+                elif hasattr(st.session_state, 'pipeline_manager') and hasattr(st.session_state.pipeline_manager, 'pipeline_data'):
+                    pipeline_data = st.session_state.pipeline_manager.pipeline_data
+                
+                if pipeline_data:
+                    pipeline_data.measurement_points = st.session_state.armpit_points
+                    if hasattr(cam, 'pixels_per_inch') and cam.pixels_per_inch > 0:
+                        inches = distance_pixels / cam.pixels_per_inch
+                        pipeline_data.bust_measurement = inches
+                    st.success("💾 Measurement saved!")
+                    
+                    # CRITICAL: Also save to the session state pipeline manager
+                    if hasattr(st.session_state, 'pipeline_manager'):
+                        st.session_state.pipeline_manager.pipeline_data.measurement_points = st.session_state.armpit_points
+                        if hasattr(cam, 'pixels_per_inch') and cam.pixels_per_inch > 0:
+                            inches = distance_pixels / cam.pixels_per_inch
+                            st.session_state.pipeline_manager.pipeline_data.bust_measurement = inches
+                        logger.info(f"[MEASUREMENT-SAVE] Saved measurement data to both pipeline_data and session state")
+                    
+                    # Advance to next step
+                    if hasattr(st.session_state, 'pipeline_manager'):
+                        st.session_state.pipeline_manager.current_step = 3
+                        st.success("✅ Moving to final results step...")
+                        st.rerun()
+                else:
+                    st.error("❌ No pipeline data available to save to")
+                    st.info("💡 Try starting a new analysis first")
 
 def display_armpit_measurement_interface():
     """Display armpit measurement interface with FORCED camera 1"""
@@ -11321,13 +11649,13 @@ def display_armpit_measurement_interface():
             with col3:
                 st.metric("Size Range", size_result["size_range"])
             
-            # Size details
-            if size_result["confidence"] > 0.8:
-                st.success(f"✅ **{size_result['size']}** - High confidence match")
-            elif size_result["confidence"] > 0.6:
+            # Size details (adjusted thresholds for better user experience)
+            if size_result["confidence"] > 0.6:
+                st.success(f"✅ **{size_result['size']}** - Good confidence match")
+            elif size_result["confidence"] > 0.3:
                 st.warning(f"⚠️ **{size_result['size']}** - Moderate confidence")
             else:
-                st.error(f"❌ **{size_result['size']}** - Low confidence, consider manual verification")
+                st.info(f"ℹ️ **{size_result['size']}** - Best available match")
             
             # Size chart reference
             with st.expander("📊 Size Chart Reference"):
@@ -11347,16 +11675,40 @@ def display_armpit_measurement_interface():
             
             # Save to pipeline data
             if st.button("💾 Save Size to Pipeline"):
+                # Check both possible locations for pipeline data
+                pipeline_data = None
                 if hasattr(st.session_state, 'pipeline_data'):
-                    st.session_state.pipeline_data.size = size_result["size"]
-                    st.session_state.pipeline_data.armpit_measurement = {
+                    pipeline_data = st.session_state.pipeline_data
+                elif hasattr(st.session_state, 'pipeline_manager') and hasattr(st.session_state.pipeline_manager, 'pipeline_data'):
+                    pipeline_data = st.session_state.pipeline_manager.pipeline_data
+                
+                if pipeline_data:
+                    pipeline_data.size = size_result["size"]
+                    pipeline_data.armpit_measurement = {
                         'inches': distance_inches,
                         'pixels': distance_pixels,
                         'method': 'clicked_points'
                     }
                     st.success(f"✅ Saved size {size_result['size']} to pipeline data")
+                    
+                    # CRITICAL: Also save to the session state pipeline manager
+                    if hasattr(st.session_state, 'pipeline_manager'):
+                        st.session_state.pipeline_manager.pipeline_data.size = size_result["size"]
+                        st.session_state.pipeline_manager.pipeline_data.armpit_measurement = {
+                            'inches': distance_inches,
+                            'pixels': distance_pixels,
+                            'method': 'clicked_points'
+                        }
+                        logger.info(f"[SIZE-SAVE] Saved size {size_result['size']} to both pipeline_data and session state")
+                    
+                    # Advance to next step
+                    if hasattr(st.session_state, 'pipeline_manager'):
+                        st.session_state.pipeline_manager.current_step = 3
+                        st.success("✅ Moving to final results step...")
+                        st.rerun()
                 else:
                     st.error("❌ No pipeline data available to save to")
+                    st.info("💡 Try starting a new analysis first")
         else:
             st.warning("⚠️ Need to calibrate pixels-per-inch for accurate measurements")
             st.info(f"📏 Distance in pixels: {distance_pixels:.1f} (calibrate for inches)")
@@ -11373,10 +11725,30 @@ def display_armpit_measurement_interface():
     with col2:
         if len(st.session_state.armpit_points) == 2:
             if st.button("✅ Save Measurement"):
-                # Save to pipeline data
+                # Check both possible locations for pipeline data
+                pipeline_data = None
                 if hasattr(st.session_state, 'pipeline_data'):
-                    st.session_state.pipeline_data.measurement_points = st.session_state.armpit_points
-                st.success("Measurement saved!")
+                    pipeline_data = st.session_state.pipeline_data
+                elif hasattr(st.session_state, 'pipeline_manager') and hasattr(st.session_state.pipeline_manager, 'pipeline_data'):
+                    pipeline_data = st.session_state.pipeline_manager.pipeline_data
+                
+                if pipeline_data:
+                    pipeline_data.measurement_points = st.session_state.armpit_points
+                    st.success("Measurement saved!")
+                    
+                    # CRITICAL: Also save to the session state pipeline manager
+                    if hasattr(st.session_state, 'pipeline_manager'):
+                        st.session_state.pipeline_manager.pipeline_data.measurement_points = st.session_state.armpit_points
+                        logger.info(f"[MEASUREMENT-SAVE] Saved measurement points to both pipeline_data and session state")
+                    
+                    # Advance to next step
+                    if hasattr(st.session_state, 'pipeline_manager'):
+                        st.session_state.pipeline_manager.current_step = 3
+                        st.success("✅ Moving to final results step...")
+                        st.rerun()
+                else:
+                    st.error("❌ No pipeline data available to save to")
+                    st.info("💡 Try starting a new analysis first")
 
 def apply_knitwear_correction(pipeline_data, garment_image: np.ndarray = None) -> Dict:
     """
@@ -12545,7 +12917,11 @@ class EnhancedPipelineManager:
                 if self.ebay_finder:
                     try:
                         logger.info(f"[EBAY] Starting research for {self.pipeline_data.brand}...")
-                        self.pipeline_data = research_brand_with_ebay(self.pipeline_data, self.ebay_finder)
+                        research_brand_with_ebay(self.pipeline_data, self.ebay_finder)
+                        logger.info(f"[EBAY] Research complete - price estimate: {self.pipeline_data.price_estimate}")
+                        # Debug: Force update price estimate if eBay data was found
+                        if hasattr(self.pipeline_data, 'ebay_comps') and self.pipeline_data.ebay_comps:
+                            logger.info(f"[EBAY] eBay data found, updating price estimate")
                     except Exception as e:
                         logger.warning(f"[EBAY] Research failed: {e}")
                         # Continue without eBay data
@@ -16460,10 +16836,12 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             
             # Size with revise button
             size = getattr(self.pipeline_data, 'size', 'Not analyzed')
-            if size != 'Not analyzed':
+            # Debug: Show what size value we actually have
+            st.caption(f"🔍 Debug - Size value: '{size}' (type: {type(size)})")
+            if size and size != 'Not analyzed' and size != 'Unknown' and size != 'None':
                 self._render_field_with_revise("📏 Size", size, 'size', self.current_step)
             else:
-                st.write(f"**📏 Size:** {size}")
+                st.write(f"**📏 Size:** None")
             
             # Material with revise button
             material = getattr(self.pipeline_data, 'material', 'Not analyzed')
@@ -16495,6 +16873,10 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 st.write(f"**🎨 Style:** {style}")
         
         # Pricing information (if available)
+        # Debug: Show price estimate details
+        if hasattr(self.pipeline_data, 'price_estimate'):
+            st.caption(f"🔍 Debug - Price estimate: {self.pipeline_data.price_estimate}")
+        
         if hasattr(self.pipeline_data, 'estimated_price') and self.pipeline_data.estimated_price:
             st.markdown("#### 💰 Pricing Information")
             st.write(f"**Estimated Price:** ${self.pipeline_data.estimated_price}")
@@ -17509,8 +17891,11 @@ def main():
         page_title="Garment Analyzer Pipeline",
         page_icon="🔍",  # Using search icon - more stable encoding
         layout="wide",
-        initial_sidebar_state="collapsed"  # No sidebar needed - pipeline in main layout
+        initial_sidebar_state="expanded"  # Enable sidebar for camera diagnostics
     )
+    
+    # Add camera diagnostics to sidebar
+    display_camera_diagnostics()
     
     # Handle pipeline reset request
     if st.session_state.get('pipeline_reset_requested', False):
