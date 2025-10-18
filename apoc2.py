@@ -2971,13 +2971,20 @@ class OpenAIVisionCameraManager:
             except:
                 continue
         
-        # Assign cameras
-        if len(working_cameras) >= 1:
+        # Assign cameras - FORCE RealSense/Logitech to index 1 for measurements
+        if len(working_cameras) >= 2:
+            # Use first camera for ArduCam (tag reading)
             self.arducam_index = working_cameras[0]['index']
-            logger.info(f"Camera assigned: ArduCam={self.arducam_index}")
+            # FORCE RealSense/Logitech to index 1 for measurements
+            self.realsense_index = 1
+            logger.info(f"✅ FORCED: ArduCam={self.arducam_index}, RealSense/Logitech=1 (for measurements)")
+        elif len(working_cameras) == 1:
+            self.arducam_index = working_cameras[0]['index']
+            self.realsense_index = 1  # Try next index
+            logger.warning("Only one camera detected, second camera may not work")
         else:
             self.arducam_index = 0
-            logger.warning("No working cameras found, using default index")
+            self.realsense_index = 1
             logger.warning("No cameras auto-detected, using default indices")
     
     def _set_fourcc(self, cap, fourcc_str="MJPG"):
@@ -3177,6 +3184,158 @@ class OpenAIVisionCameraManager:
                 # Fallback to OpenCV
                 logger.info("[REALSENSE] Using OpenCV fallback (SDK not available)")
                 self._initialize_realsense_opencv_fallback()
+    
+    def validate_measurement_camera(self):
+        """Ensure measurement camera is at index 1"""
+        if self.realsense_index != 1:
+            logger.error(f"❌ WRONG CAMERA INDEX: RealSense is at {self.realsense_index}, needs to be at 1")
+            
+            # Force correction
+            logger.info("🔧 Forcing RealSense to index 1...")
+            
+            # Release current camera
+            if hasattr(self, 'realsense_cap') and self.realsense_cap:
+                self.realsense_cap.release()
+            if hasattr(self, 'realsense_pipeline') and self.realsense_pipeline:
+                self.realsense_pipeline.stop()
+            
+            # Reset to index 1
+            self.realsense_index = 1
+            self.initialize_cameras()
+            
+            # Verify
+            if self.realsense_index == 1:
+                logger.info("✅ RealSense successfully set to index 1")
+                return True
+            else:
+                logger.error("❌ Failed to set RealSense to index 1")
+                return False
+        else:
+            logger.info(f"✅ RealSense already at index 1")
+            return True
+    
+    def display_measurement_feed_with_points(self):
+        """Display camera feed for armpit measurement with clickable points"""
+        
+        # FORCE camera 1 for measurements
+        if self.realsense_index != 1:
+            logger.warning(f"⚠️ RealSense at index {self.realsense_index}, forcing to index 1")
+            self.realsense_index = 1
+            self.initialize_cameras()  # Reinitialize with correct index
+        
+        # Get frame from measuring camera (index 1) - use C930e instead of RealSense
+        frame = self.c930e.get_frame(use_preview_res=False)
+        
+        if frame is None:
+            st.warning("⚠️ Measuring camera (C930e) not available")
+            return None
+        
+        # Display frame with coordinate capture
+        st.write("### Click on both armpit points")
+        st.write("Left armpit first, then right armpit")
+        
+        # Use streamlit_image_coordinates for point selection
+        value = streamlit_image_coordinates(
+            frame,
+            key="armpit_points",
+            width=frame.shape[1]
+        )
+        
+        # Store points in session state
+        if value is not None:
+            if 'armpit_points' not in st.session_state:
+                st.session_state.armpit_points = []
+            
+            # Add point if we don't have 2 yet
+            if len(st.session_state.armpit_points) < 2:
+                point = (value['x'], value['y'])
+                st.session_state.armpit_points.append(point)
+                st.success(f"✅ Point {len(st.session_state.armpit_points)} recorded: {point}")
+            
+            # Calculate measurement when we have both points
+            if len(st.session_state.armpit_points) == 2:
+                p1, p2 = st.session_state.armpit_points
+                distance_pixels = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+                
+                # Convert pixels to inches (you'll need to calibrate pixels_per_inch)
+                if hasattr(self, 'pixels_per_inch') and self.pixels_per_inch > 0:
+                    distance_inches = distance_pixels / self.pixels_per_inch
+                    st.success(f"📏 Armpit-to-armpit: {distance_inches:.2f} inches")
+                else:
+                    st.info(f"Distance in pixels: {distance_pixels:.1f} (calibrate for inches)")
+                
+                # Reset button
+                if st.button("🔄 Reset Points"):
+                    st.session_state.armpit_points = []
+                    st.rerun()
+        
+        # Draw existing points on frame
+        if 'armpit_points' in st.session_state and len(st.session_state.armpit_points) > 0:
+            display_frame = frame.copy()
+            for i, point in enumerate(st.session_state.armpit_points):
+                # Draw circle at point
+                cv2.circle(display_frame, point, 10, (0, 255, 0), -1)
+                # Add label
+                cv2.putText(display_frame, f"P{i+1}", (point[0]+15, point[1]-15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            # Draw line between points if we have 2
+            if len(st.session_state.armpit_points) == 2:
+                p1, p2 = st.session_state.armpit_points
+                cv2.line(display_frame, p1, p2, (0, 255, 0), 2)
+            
+            st.image(display_frame, channels="RGB", use_container_width=True)
+        else:
+            st.image(frame, channels="RGB", use_container_width=True)
+        
+        return frame
+    
+    def get_measurement_camera_frame(self):
+        """
+        FORCE camera index 1 for garment measurements.
+        This bypasses the normal camera selection.
+        """
+        import cv2
+        import numpy as np
+        
+        # FORCE index 1 - override whatever the camera manager thinks
+        logger.info("🎯 FORCING camera index 1 for measurements")
+        
+        try:
+            # Use DirectShow on Windows for reliability
+            backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            
+            # Open camera 1 DIRECTLY
+            cap = cv2.VideoCapture(1, backend)
+            
+            if not cap.isOpened():
+                logger.error("❌ Camera index 1 is not available!")
+                return None
+            
+            # Set properties for good quality
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+            
+            # Flush buffer and get fresh frame
+            for _ in range(5):
+                cap.grab()
+            
+            ret, frame = cap.read()
+            cap.release()  # Release immediately after capture
+            
+            if ret and frame is not None:
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                logger.info(f"✅ Got frame from camera 1: {frame_rgb.shape}")
+                return frame_rgb
+            else:
+                logger.error("❌ Failed to read from camera 1")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Error accessing camera 1: {e}")
+            return None
     
     def setup_camera_properties(self, cap, high_res=False):
         """Optimized camera properties for 12MP Arducam with calibration settings"""
@@ -10741,6 +10900,483 @@ def show_learning_dashboard():
         # Test correction memory system
         if st.sidebar.button("🧠 Test Correction Memory"):
             test_correction_memory()
+        
+        # Camera diagnostic button
+        if st.sidebar.button("📷 Camera Diagnostics"):
+            st.write("### Camera Index Information")
+            if hasattr(st.session_state, 'camera_manager') and st.session_state.camera_manager:
+                cm = st.session_state.camera_manager
+                st.write(f"**ArduCam Index:** {cm.arducam_index}")
+                st.write(f"**RealSense Index:** {cm.realsense_index}")
+                st.write(f"**C930e Status:** {'✅ Working' if cm.camera_status.get('c930e', False) else '❌ Not working'}")
+                
+                # Test each camera
+                st.write("### Camera Tests")
+                for idx in [0, 1, 2]:
+                    try:
+                        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                        if cap.isOpened():
+                            ret, frame = cap.read()
+                            cap.release()
+                            if ret and frame is not None:
+                                st.success(f"✅ Camera {idx}: Working ({frame.shape[1]}x{frame.shape[0]})")
+                            else:
+                                st.error(f"❌ Camera {idx}: Failed to read frame")
+                        else:
+                            st.error(f"❌ Camera {idx}: Not available")
+                    except Exception as e:
+                        st.error(f"❌ Camera {idx}: Error - {e}")
+            else:
+                st.error("Camera manager not available")
+        
+        # Enhanced camera debug with visual testing
+        if st.sidebar.button("🔍 Test All Cameras"):
+            st.write("### Camera Debug - Visual Test")
+            import cv2
+            backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            
+            for i in range(3):
+                st.write(f"**Testing Camera {i}:**")
+                cap = cv2.VideoCapture(i, backend)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    cap.release()
+                    
+                    if ret and frame is not None:
+                        # Show thumbnail
+                        st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
+                                caption=f"Camera {i} - {frame.shape}", 
+                                width=300)
+                        
+                        # Identify which is which
+                        if i == 0:
+                            st.info("👆 This is Camera 0 (currently showing)")
+                        elif i == 1:
+                            st.success("👆 **This is Camera 1 (you need this one!)**")
+                    else:
+                        st.error(f"Camera {i} opened but can't read frame")
+                else:
+                        st.warning(f"Camera {i} not available")
+        
+        # Test new measurement interface
+        if st.sidebar.button("📏 Test New Measurement Interface"):
+            st.session_state.test_measurement = True
+        
+        if st.session_state.get('test_measurement', False):
+            display_armpit_measurement_interface()
+            if st.button("❌ Close Test"):
+                st.session_state.test_measurement = False
+                st.rerun()
+
+def get_measurement_camera_frame_direct():
+    """
+    FORCE camera index 1 for garment measurements - STANDALONE VERSION.
+    This bypasses the camera manager completely.
+    """
+    import cv2
+    import numpy as np
+    
+    # FORCE index 1 - override whatever the camera manager thinks
+    logger.info("🎯 FORCING camera index 1 for measurements (standalone)")
+    
+    try:
+        # Use DirectShow on Windows for reliability
+        backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+        
+        # Open camera 1 DIRECTLY
+        cap = cv2.VideoCapture(1, backend)
+        
+        if not cap.isOpened():
+            logger.error("❌ Camera index 1 is not available!")
+            return None
+        
+        # Set properties for good quality
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+        
+        # Flush buffer and get fresh frame
+        for _ in range(5):
+            cap.grab()
+        
+        ret, frame = cap.read()
+        cap.release()  # Release immediately after capture
+        
+        if ret and frame is not None:
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            logger.info(f"✅ Got frame from camera 1: {frame_rgb.shape}")
+            return frame_rgb
+        else:
+            logger.error("❌ Failed to read from camera 1")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Error accessing camera 1: {e}")
+        return None
+
+def convert_armpit_to_size(armpit_inches, gender="Unisex"):
+    """
+    Convert armpit-to-armpit measurement to garment size
+    
+    Args:
+        armpit_inches: Measurement in inches
+        gender: "Men", "Women", or "Unisex"
+    
+    Returns:
+        dict with size information
+    """
+    # Size charts based on armpit-to-armpit measurements
+    size_charts = {
+        "Men": {
+            "XS": (16.0, 18.0),
+            "S": (18.0, 20.0),
+            "M": (20.0, 22.0),
+            "L": (22.0, 24.0),
+            "XL": (24.0, 26.0),
+            "XXL": (26.0, 28.0),
+            "XXXL": (28.0, 30.0)
+        },
+        "Women": {
+            "XS": (14.0, 16.0),
+            "S": (16.0, 18.0),
+            "M": (18.0, 20.0),
+            "L": (20.0, 22.0),
+            "XL": (22.0, 24.0),
+            "XXL": (24.0, 26.0),
+            "XXXL": (26.0, 28.0)
+        },
+        "Unisex": {
+            "XS": (15.0, 17.0),
+            "S": (17.0, 19.0),
+            "M": (19.0, 21.0),
+            "L": (21.0, 23.0),
+            "XL": (23.0, 25.0),
+            "XXL": (25.0, 27.0),
+            "XXXL": (27.0, 29.0)
+        }
+    }
+    
+    # Get the appropriate size chart
+    chart = size_charts.get(gender, size_charts["Unisex"])
+    
+    # Find the best matching size
+    best_size = None
+    confidence = 0.0
+    
+    for size, (min_inches, max_inches) in chart.items():
+        if min_inches <= armpit_inches <= max_inches:
+            # Calculate confidence based on how close to center of range
+            center = (min_inches + max_inches) / 2
+            range_size = max_inches - min_inches
+            distance_from_center = abs(armpit_inches - center)
+            confidence = max(0.0, 1.0 - (distance_from_center / (range_size / 2)))
+            best_size = size
+            break
+    
+    # If no exact match, find closest size
+    if best_size is None:
+        closest_size = None
+        min_distance = float('inf')
+        
+        for size, (min_inches, max_inches) in chart.items():
+            center = (min_inches + max_inches) / 2
+            distance = abs(armpit_inches - center)
+            if distance < min_distance:
+                min_distance = distance
+                closest_size = size
+                confidence = max(0.0, 1.0 - (distance / 2.0))  # Lower confidence for close matches
+        
+        best_size = closest_size
+    
+    # Get size range for display
+    if best_size in chart:
+        min_inches, max_inches = chart[best_size]
+        size_range = f"{min_inches:.0f}\"-{max_inches:.0f}\""
+    else:
+        size_range = "Unknown"
+    
+    return {
+        "size": best_size,
+        "confidence": confidence,
+        "size_range": size_range,
+        "measurement": armpit_inches,
+        "gender": gender
+    }
+
+def display_armpit_measurement_interface():
+    """Display armpit measurement interface with FORCED camera 1"""
+    import cv2
+    import numpy as np
+    
+    st.subheader("📏 Armpit-to-Armpit Measurement")
+    st.write("**Camera: Forcing Index 1** (Garment View)")
+    
+    # Force camera 1 frame - direct access without camera manager
+    frame = get_measurement_camera_frame_direct()
+    
+    if frame is None:
+        st.error("❌ Cannot access camera 1 for measurements")
+        
+        # Try other camera indices automatically
+        st.write("---")
+        st.write("**🔍 Trying other camera indices...**")
+        
+        working_camera = None
+        for camera_idx in [0, 2, 3]:  # Try 0, 2, 3 (skip 1 since it failed)
+            try:
+                backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+                test_cap = cv2.VideoCapture(camera_idx, backend)
+                if test_cap.isOpened():
+                    ret, test_frame = test_cap.read()
+                    test_cap.release()
+                    if ret and test_frame is not None:
+                        st.success(f"✅ Found working camera at index {camera_idx}")
+                        working_camera = camera_idx
+                        frame = cv2.cvtColor(test_frame, cv2.COLOR_BGR2RGB)
+                        break
+            except Exception as e:
+                st.warning(f"❌ Camera {camera_idx}: {e}")
+        
+        if frame is None:
+            st.error("❌ No working cameras found!")
+            st.write("**Manual camera test:**")
+            camera_choice = st.radio("Select Camera Index:", [0, 1, 2], index=1)
+            
+            if st.button("Test Selected Camera"):
+                backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+                test_cap = cv2.VideoCapture(camera_choice, backend)
+                if test_cap.isOpened():
+                    ret, test_frame = test_cap.read()
+                    test_cap.release()
+                    if ret:
+                        st.success(f"✅ Camera {camera_choice} works!")
+                        st.image(cv2.cvtColor(test_frame, cv2.COLOR_BGR2RGB), 
+                                caption=f"Camera {camera_choice}", 
+                                use_container_width=True)
+                        # Use this camera for measurement
+                        frame = cv2.cvtColor(test_frame, cv2.COLOR_BGR2RGB)
+                    else:
+                        st.error(f"❌ Camera {camera_choice} opened but can't read frame")
+                else:
+                    st.error(f"❌ Camera {camera_choice} not available")
+            else:
+                return
+        else:
+            st.info(f"📷 Using camera index {working_camera} for measurements")
+    
+    # Instructions
+    st.info("👆 Click on the **left armpit seam**, then the **right armpit seam**")
+    
+    # Initialize session state for points
+    if 'armpit_points' not in st.session_state:
+        st.session_state.armpit_points = []
+    
+    # Debug display
+    st.caption(f"Debug: Current points: {st.session_state.armpit_points}")
+    
+    # Show PPI calibration status
+    pixels_per_inch = 26.73  # Fixed PPI: 508 pixels = 19 inches
+    
+    # Try to get stored PPI value
+    if hasattr(st.session_state, 'pipeline_manager') and st.session_state.pipeline_manager:
+        if hasattr(st.session_state.pipeline_manager, 'measurement_calculator'):
+            stored_ppi = st.session_state.pipeline_manager.measurement_calculator.pixels_per_inch
+            if stored_ppi > 0:
+                pixels_per_inch = stored_ppi
+    
+    st.caption(f"📏 PPI: {pixels_per_inch:.2f} pixels/inch (508px = 19\")")
+    
+    # Create a copy for drawing
+    display_frame = frame.copy()
+    
+    # Draw existing points
+    if len(st.session_state.armpit_points) > 0:
+        for i, point in enumerate(st.session_state.armpit_points):
+            # Draw circle
+            cv2.circle(display_frame, point, 15, (0, 255, 0), -1)
+            cv2.circle(display_frame, point, 17, (255, 255, 255), 2)
+            # Label
+            label = "LEFT" if i == 0 else "RIGHT"
+            cv2.putText(display_frame, label, 
+                       (point[0] - 40, point[1] - 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Draw line between points if we have both
+        if len(st.session_state.armpit_points) == 2:
+            p1, p2 = st.session_state.armpit_points
+            cv2.line(display_frame, p1, p2, (0, 255, 0), 3)
+            
+            # Calculate distance
+            distance_pixels = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+            
+            # Show distance on image
+            midpoint = ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2)
+            
+            # Try to get pixels_per_inch for display
+            pixels_per_inch = 26.73  # Fixed PPI: 508 pixels = 19 inches
+            
+            # Try to get stored PPI value
+            if hasattr(st.session_state, 'pipeline_manager') and st.session_state.pipeline_manager:
+                if hasattr(st.session_state.pipeline_manager, 'measurement_calculator'):
+                    stored_ppi = st.session_state.pipeline_manager.measurement_calculator.pixels_per_inch
+                    if stored_ppi > 0:
+                        pixels_per_inch = stored_ppi
+            
+            if pixels_per_inch > 0:
+                distance_inches = distance_pixels / pixels_per_inch
+                cv2.putText(display_frame, f"{distance_inches:.1f}\"", 
+                           midpoint,
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            else:
+                cv2.putText(display_frame, f"{distance_pixels:.0f}px", 
+                           midpoint,
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    
+    # Display with coordinate capture
+    value = streamlit_image_coordinates(
+        display_frame,
+        key="armpit_coords",
+        width=display_frame.shape[1]
+    )
+    
+    # Handle click - prevent duplicate points
+    if value is not None and len(st.session_state.armpit_points) < 2:
+        point = (int(value['x']), int(value['y']))
+        
+        # Debug logging
+        logger.info(f"[ARMPIT-CLICK] Clicked at ({point[0]}, {point[1]})")
+        logger.info(f"[ARMPIT-CLICK] Current points: {st.session_state.armpit_points}")
+        
+        # Check if this point is too close to existing points
+        too_close = False
+        for existing_point in st.session_state.armpit_points:
+            distance = np.sqrt((point[0] - existing_point[0])**2 + (point[1] - existing_point[1])**2)
+            logger.info(f"[ARMPIT-CLICK] Distance to existing point {existing_point}: {distance:.1f}px")
+            if distance < 20:  # If within 20 pixels, consider it too close
+                too_close = True
+                break
+        
+        if not too_close:
+            st.session_state.armpit_points.append(point)
+            logger.info(f"[ARMPIT-CLICK] Added point. Total points: {len(st.session_state.armpit_points)}")
+            st.success(f"✅ {'Left' if len(st.session_state.armpit_points)==1 else 'Right'} armpit marked!")
+            st.rerun()
+        else:
+            logger.warning(f"[ARMPIT-CLICK] Point too close to existing point")
+            st.warning("⚠️ Point too close to existing point. Please click a different location.")
+    
+    # Show results
+    if len(st.session_state.armpit_points) == 2:
+        p1, p2 = st.session_state.armpit_points
+        distance_pixels = np.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+        
+        st.success(f"📏 **Distance: {distance_pixels:.1f} pixels**")
+        
+        # Conversion to inches using calibrated pixels_per_inch
+        pixels_per_inch = 26.73  # Fixed PPI: 508 pixels = 19 inches
+        
+        # Try to get pixels_per_inch from pipeline manager's measurement calculator
+        if hasattr(st.session_state, 'pipeline_manager') and st.session_state.pipeline_manager:
+            if hasattr(st.session_state.pipeline_manager, 'measurement_calculator'):
+                stored_ppi = st.session_state.pipeline_manager.measurement_calculator.pixels_per_inch
+                if stored_ppi > 0:
+                    pixels_per_inch = stored_ppi
+                logger.info(f"[MEASUREMENT] Using PPI: {pixels_per_inch:.2f} (stored: {stored_ppi:.2f})")
+            else:
+                logger.warning("[MEASUREMENT] pipeline_manager exists but no measurement_calculator found")
+        else:
+            logger.warning("[MEASUREMENT] No pipeline_manager found in session_state")
+        
+        # Fallback to session state
+        if pixels_per_inch == 26.73 and hasattr(st.session_state, 'pixels_per_inch'):
+            if st.session_state.pixels_per_inch > 0:
+                pixels_per_inch = st.session_state.pixels_per_inch
+        
+        if pixels_per_inch > 0:
+            distance_inches = distance_pixels / pixels_per_inch
+            st.metric("📏 Armpit-to-Armpit", f"{distance_inches:.2f} inches")
+            st.success(f"✅ Measurement: {distance_inches:.2f} inches ({distance_pixels:.0f} pixels)")
+            
+            # Size conversion
+            st.markdown("---")
+            st.markdown("### 📐 Size Conversion")
+            
+            # Gender selection
+            gender = st.radio("Select Gender:", ["Men", "Women", "Unisex"], index=2)
+            
+            # Convert to size
+            size_result = convert_armpit_to_size(distance_inches, gender)
+            
+            # Display size results
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Size", size_result["size"])
+            
+            with col2:
+                confidence_pct = size_result["confidence"] * 100
+                st.metric("Confidence", f"{confidence_pct:.0f}%")
+            
+            with col3:
+                st.metric("Size Range", size_result["size_range"])
+            
+            # Size details
+            if size_result["confidence"] > 0.8:
+                st.success(f"✅ **{size_result['size']}** - High confidence match")
+            elif size_result["confidence"] > 0.6:
+                st.warning(f"⚠️ **{size_result['size']}** - Moderate confidence")
+            else:
+                st.error(f"❌ **{size_result['size']}** - Low confidence, consider manual verification")
+            
+            # Size chart reference
+            with st.expander("📊 Size Chart Reference"):
+                st.write(f"**{gender} Size Chart:**")
+                size_charts = {
+                    "Men": {"XS": "16\"-18\"", "S": "18\"-20\"", "M": "20\"-22\"", "L": "22\"-24\"", "XL": "24\"-26\"", "XXL": "26\"-28\"", "XXXL": "28\"-30\""},
+                    "Women": {"XS": "14\"-16\"", "S": "16\"-18\"", "M": "18\"-20\"", "L": "20\"-22\"", "XL": "22\"-24\"", "XXL": "24\"-26\"", "XXXL": "26\"-28\""},
+                    "Unisex": {"XS": "15\"-17\"", "S": "17\"-19\"", "M": "19\"-21\"", "L": "21\"-23\"", "XL": "23\"-25\"", "XXL": "25\"-27\"", "XXXL": "27\"-29\""}
+                }
+                
+                chart = size_charts[gender]
+                for size, range_str in chart.items():
+                    if size == size_result["size"]:
+                        st.write(f"**{size}**: {range_str} ← **Your measurement: {distance_inches:.1f}\"**")
+                    else:
+                        st.write(f"{size}: {range_str}")
+            
+            # Save to pipeline data
+            if st.button("💾 Save Size to Pipeline"):
+                if hasattr(st.session_state, 'pipeline_data'):
+                    st.session_state.pipeline_data.size = size_result["size"]
+                    st.session_state.pipeline_data.armpit_measurement = {
+                        'inches': distance_inches,
+                        'pixels': distance_pixels,
+                        'method': 'clicked_points'
+                    }
+                    st.success(f"✅ Saved size {size_result['size']} to pipeline data")
+                else:
+                    st.error("❌ No pipeline data available to save to")
+        else:
+            st.warning("⚠️ Need to calibrate pixels-per-inch for accurate measurements")
+            st.info(f"📏 Distance in pixels: {distance_pixels:.1f} (calibrate for inches)")
+            if st.button("Calibrate Now"):
+                st.info("Place a ruler or dollar bill in view and measure a known distance")
+    
+    # Control buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄 Reset Points"):
+            st.session_state.armpit_points = []
+            st.rerun()
+    
+    with col2:
+        if len(st.session_state.armpit_points) == 2:
+            if st.button("✅ Save Measurement"):
+                # Save to pipeline data
+                if hasattr(st.session_state, 'pipeline_data'):
+                    st.session_state.pipeline_data.measurement_points = st.session_state.armpit_points
+                st.success("Measurement saved!")
 
 def apply_knitwear_correction(pipeline_data, garment_image: np.ndarray = None) -> Dict:
     """
@@ -13078,19 +13714,24 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             
             # OPTIONAL: Show measurement camera only if user wants to verify
             with st.expander("📏 Optional: Measure armpit seams for verification", expanded=False):
-                self._render_simple_armpit_measurement()
+                display_armpit_measurement_interface()
         else:
             st.warning("⚠️ No size detected from tag")
             st.error("❌ Manual measurement required")
             st.info("📏 Please click on both armpit seams to measure the garment")
             
             # MANDATORY: Show measurement camera since no size was detected
-            self._render_simple_armpit_measurement()
+            display_armpit_measurement_interface()
     
     def _render_simple_armpit_measurement(self):
         """Simplified armpit seam measurement - just click two points"""
         st.markdown("#### 📷 Click on Armpit Seams to Measure")
         st.caption("💡 Click the left armpit seam, then the right armpit seam. A line will be drawn automatically.")
+        
+        # Validate camera index FIRST
+        if not self.camera_manager.validate_measurement_camera():
+            st.error("❌ Cannot access measuring camera at index 1")
+            return
         
         # Initialize measurement data
         if 'armpit_points' not in st.session_state:
