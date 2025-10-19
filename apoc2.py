@@ -66,6 +66,44 @@ from datetime import datetime, timedelta
 import statistics
 from functools import wraps
 
+# Real-time tracking system imports
+import firebase_admin
+from firebase_admin import credentials, db, messaging
+import uuid
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+import threading
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import logging
+
+# API integration imports
+import requests
+import json
+import os
+
+# Load environment variables from api.env file
+try:
+    from dotenv import load_dotenv
+    # Load from api.env file specifically
+    load_dotenv('api.env')
+    print("✅ Loaded environment variables from api.env")
+except ImportError:
+    print("⚠️ python-dotenv not installed. Install with: pip install python-dotenv")
+except Exception as e:
+    print(f"⚠️ Could not load api.env: {e}")
+    # Try to load manually
+    try:
+        with open('api.env', 'r') as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    os.environ[key] = value
+        print("✅ Manually loaded environment variables from api.env")
+    except Exception as e2:
+        print(f"❌ Could not load api.env manually: {e2}")
+
 # Rate limiting decorator for eBay API
 
 # ============================================
@@ -588,11 +626,22 @@ BASE_GARMENT_PRICES = {
 }
 
 class AnalysisStatus(Enum):
-    """Status of analysis operations"""
+    """Status of analysis operations - Enhanced with tracking statuses"""
+    # Original statuses
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    
+    # Enhanced tracking statuses for real-time monitoring
+    SUBMITTED = "submitted"           # Just received
+    TAG_SCANNING = "tag_scanning"     # Reading brand/size/material
+    GARMENT_IMAGING = "garment_imaging"  # Capturing photos
+    ANALYZING = "analyzing"           # AI analysis in progress
+    PRICING = "pricing"               # Determining price
+    QUALITY_CHECK = "quality_check"   # Manual review
+    ACCEPTED = "accepted"             # Added to inventory
+    REJECTED = "rejected"             # Did not meet standards
 
 @dataclass
 class UIState:
@@ -638,6 +687,490 @@ class CameraCache:
         """Thread-safe garment frame retrieval"""
         with self.lock:
             return self.garment_frame.copy() if self.garment_frame is not None else None
+
+
+# ============================================
+# REAL-TIME TRACKING SYSTEM DATA MODELS
+# ============================================
+@dataclass
+class GarmentAnalysisUpdate:
+    """Real-time update for a garment being analyzed"""
+    garment_id: str
+    status: AnalysisStatus
+    timestamp: str
+    brand: Optional[str] = None
+    size: Optional[str] = None
+    garment_type: Optional[str] = None
+    condition: Optional[str] = None
+    estimated_price: Optional[float] = None
+    confidence: Optional[float] = None
+    issue_details: Optional[str] = None
+    photos_count: int = 0
+    eta_seconds: Optional[int] = None
+    
+    def to_dict(self):
+        """Convert to dictionary for Firebase"""
+        data = asdict(self)
+        data['status'] = self.status.value
+        return data
+
+
+@dataclass
+class SubmissionBatch:
+    """Batch of garments submitted together"""
+    batch_id: str
+    seller_id: str
+    store_location: str
+    submission_time: str
+    total_items: int
+    completed_items: int = 0
+    accepted_items: int = 0
+    rejected_items: int = 0
+    total_value: float = 0.0
+    phone_number: Optional[str] = None
+    email: Optional[str] = None
+    notifications_enabled: bool = True
+    
+    def to_dict(self):
+        return asdict(self)
+
+
+# ============================================
+# FIREBASE REALTIME DATABASE MANAGER
+# ============================================
+class RealtimeTrackingManager:
+    """Manages real-time tracking using Firebase Realtime Database"""
+    
+    def __init__(self, firebase_config_path='firebase_config.json'):
+        """
+        Initialize Firebase connection
+        
+        Args:
+            firebase_config_path: Path to Firebase service account key
+        """
+        self.initialized = False
+        self.db = None
+        
+        try:
+            # Check if Firebase is already initialized
+            if not firebase_admin.get_app():
+                cred = credentials.Certificate(firebase_config_path)
+                firebase_admin.initialize_app(cred, {
+                    'databaseURL': 'https://your-project.firebaseio.com'
+                })
+            
+            self.db = db
+            self.initialized = True
+            print("✅ Firebase Realtime Database initialized")
+            
+        except Exception as e:
+            print(f"❌ Firebase initialization failed: {e}")
+            print("Running in offline mode - tracking disabled")
+    
+    def create_submission_batch(self, seller_id: str, store_location: str, 
+                               phone: Optional[str] = None, 
+                               email: Optional[str] = None) -> str:
+        """
+        Create a new submission batch for tracking
+        
+        Args:
+            seller_id: Unique identifier for the seller
+            store_location: Physical store location
+            phone: Seller's phone number for SMS notifications
+            email: Seller's email for notifications
+            
+        Returns:
+            batch_id: Unique ID for this submission batch
+        """
+        if not self.initialized:
+            print("Firebase not initialized - cannot create batch")
+            return str(uuid.uuid4())
+        
+        batch_id = str(uuid.uuid4())
+        batch = SubmissionBatch(
+            batch_id=batch_id,
+            seller_id=seller_id,
+            store_location=store_location,
+            submission_time=datetime.now().isoformat(),
+            total_items=0,
+            phone_number=phone,
+            email=email
+        )
+        
+        try:
+            db.reference(f'batches/{batch_id}').set(batch.to_dict())
+            print(f"✅ Batch created: {batch_id}")
+            return batch_id
+        except Exception as e:
+            print(f"Error creating batch: {e}")
+            return batch_id
+    
+    def add_garment_to_batch(self, batch_id: str, garment_id: str) -> bool:
+        """Register a garment for tracking in a batch"""
+        if not self.initialized:
+            return False
+        
+        try:
+            db.reference(f'batches/{batch_id}/garments/{garment_id}').set({
+                'added_time': datetime.now().isoformat(),
+                'status': AnalysisStatus.SUBMITTED.value
+            })
+            
+            # Increment total items
+            current = db.reference(f'batches/{batch_id}/total_items').get()
+            new_count = (current.val() if current.val() else 0) + 1
+            db.reference(f'batches/{batch_id}/total_items').set(new_count)
+            
+            return True
+        except Exception as e:
+            print(f"Error adding garment: {e}")
+            return False
+    
+    def update_garment_status(self, batch_id: str, garment_id: str, 
+                             update: GarmentAnalysisUpdate) -> bool:
+        """
+        Send real-time update for a garment
+        
+        Args:
+            batch_id: Batch ID
+            garment_id: Garment ID
+            update: Analysis update with status and details
+            
+        Returns:
+            Success status
+        """
+        if not self.initialized:
+            print(f"Update (offline): {garment_id} -> {update.status.value}")
+            return False
+        
+        try:
+            update_path = f'batches/{batch_id}/garments/{garment_id}'
+            db.reference(update_path).set(update.to_dict())
+            
+            # Update batch-level stats based on status
+            if update.status == AnalysisStatus.ACCEPTED:
+                self._increment_batch_stat(batch_id, 'accepted_items')
+                if update.estimated_price:
+                    self._add_to_batch_total(batch_id, update.estimated_price)
+            
+            elif update.status == AnalysisStatus.REJECTED:
+                self._increment_batch_stat(batch_id, 'rejected_items')
+            
+            elif update.status == AnalysisStatus.COMPLETED:
+                self._increment_batch_stat(batch_id, 'completed_items')
+            
+            print(f"✅ Updated {garment_id}: {update.status.value}")
+            return True
+            
+        except Exception as e:
+            print(f"Error updating garment status: {e}")
+            return False
+    
+    def _increment_batch_stat(self, batch_id: str, stat_name: str):
+        """Increment a batch statistics counter"""
+        try:
+            current = db.reference(f'batches/{batch_id}/{stat_name}').get()
+            new_val = (current.val() if current.val() else 0) + 1
+            db.reference(f'batches/{batch_id}/{stat_name}').set(new_val)
+        except Exception as e:
+            print(f"Error incrementing {stat_name}: {e}")
+    
+    def _add_to_batch_total(self, batch_id: str, price: float):
+        """Add to batch total value"""
+        try:
+            current = db.reference(f'batches/{batch_id}/total_value').get()
+            new_val = (current.val() if current.val() else 0.0) + price
+            db.reference(f'batches/{batch_id}/total_value').set(round(new_val, 2))
+        except Exception as e:
+            print(f"Error updating total value: {e}")
+    
+    def get_batch_status(self, batch_id: str) -> Optional[Dict]:
+        """Retrieve current batch status"""
+        if not self.initialized:
+            return None
+        
+        try:
+            ref = db.reference(f'batches/{batch_id}')
+            snapshot = ref.get()
+            return snapshot.val() if snapshot.val() else None
+        except Exception as e:
+            print(f"Error fetching batch: {e}")
+            return None
+    
+    def get_garment_status(self, batch_id: str, garment_id: str) -> Optional[Dict]:
+        """Retrieve current garment status"""
+        if not self.initialized:
+            return None
+        
+        try:
+            ref = db.reference(f'batches/{batch_id}/garments/{garment_id}')
+            snapshot = ref.get()
+            return snapshot.val() if snapshot.val() else None
+        except Exception as e:
+            print(f"Error fetching garment: {e}")
+            return None
+
+
+# ============================================
+# NOTIFICATION MANAGER
+# ============================================
+class NotificationManager:
+    """Handles SMS and email notifications"""
+    
+    def __init__(self, smtp_config: Dict = None, fcm_config_path: str = None):
+        """
+        Initialize notification services
+        
+        Args:
+            smtp_config: SMTP configuration for email
+            fcm_config_path: Path to Firebase Cloud Messaging config
+        """
+        self.smtp_config = smtp_config or self._load_smtp_config()
+        self.fcm_initialized = False
+        
+        # Initialize FCM for push notifications
+        if fcm_config_path:
+            try:
+                cred = credentials.Certificate(fcm_config_path)
+                if not firebase_admin.get_app():
+                    firebase_admin.initialize_app(cred)
+                self.fcm_initialized = True
+                print("✅ Firebase Cloud Messaging initialized")
+            except Exception as e:
+                print(f"FCM initialization failed: {e}")
+    
+    def _load_smtp_config(self) -> Dict:
+        """Load SMTP config from environment"""
+        return {
+            'smtp_server': os.getenv('SMTP_SERVER', 'smtp.gmail.com'),
+            'smtp_port': int(os.getenv('SMTP_PORT', 587)),
+            'sender_email': os.getenv('SENDER_EMAIL'),
+            'sender_password': os.getenv('SENDER_PASSWORD'),
+        }
+    
+    def send_email_notification(self, to_email: str, subject: str, 
+                               batch_id: str, garment_details: Dict, 
+                               status: AnalysisStatus) -> bool:
+        """Send email notification to seller"""
+        if not self.smtp_config.get('sender_email'):
+            print("Email config missing - skipping email notification")
+            return False
+        
+        try:
+            email_body = self._build_email_body(
+                batch_id, garment_details, status
+            )
+            
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = self.smtp_config['sender_email']
+            msg['To'] = to_email
+            
+            msg.attach(MIMEText(email_body, 'html'))
+            
+            with smtplib.SMTP(
+                self.smtp_config['smtp_server'], 
+                self.smtp_config['smtp_port']
+            ) as server:
+                server.starttls()
+                server.login(
+                    self.smtp_config['sender_email'],
+                    self.smtp_config['sender_password']
+                )
+                server.send_message(msg)
+            
+            print(f"✅ Email sent to {to_email}")
+            return True
+            
+        except Exception as e:
+            print(f"Email notification failed: {e}")
+            return False
+    
+    def send_sms_notification(self, phone: str, message: str) -> bool:
+        """Send SMS notification using Twilio"""
+        try:
+            from twilio.rest import Client
+            
+            account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+            auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+            twilio_number = os.getenv('TWILIO_PHONE_NUMBER')
+            
+            if not all([account_sid, auth_token, twilio_number]):
+                print("Twilio config missing - skipping SMS")
+                return False
+            
+            client = Client(account_sid, auth_token)
+            msg = client.messages.create(
+                body=message,
+                from_=twilio_number,
+                to=phone
+            )
+            
+            print(f"✅ SMS sent to {phone}: {msg.sid}")
+            return True
+            
+        except ImportError:
+            print("Twilio not installed - skipping SMS")
+            return False
+        except Exception as e:
+            print(f"SMS notification failed: {e}")
+            return False
+    
+    def _build_email_body(self, batch_id: str, garment: Dict, 
+                          status: AnalysisStatus) -> str:
+        """Build HTML email body"""
+        status_colors = {
+            AnalysisStatus.SUBMITTED: '#3498db',
+            AnalysisStatus.ANALYZING: '#f39c12',
+            AnalysisStatus.ACCEPTED: '#27ae60',
+            AnalysisStatus.REJECTED: '#e74c3c',
+            AnalysisStatus.COMPLETED: '#27ae60',
+        }
+        
+        color = status_colors.get(status, '#95a5a6')
+        
+        html = f"""
+        <html>
+            <head>
+                <style>
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+                    .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                    .header {{ background-color: #2c3e50; color: white; padding: 20px; border-radius: 5px; }}
+                    .status-badge {{ 
+                        background-color: {color}; 
+                        color: white; 
+                        padding: 10px 15px; 
+                        border-radius: 3px; 
+                        display: inline-block;
+                        font-weight: bold;
+                    }}
+                    .details {{ background-color: #ecf0f1; padding: 15px; margin-top: 15px; border-radius: 5px; }}
+                    .detail-row {{ display: flex; justify-content: space-between; padding: 8px 0; }}
+                    .price {{ font-size: 24px; color: {color}; font-weight: bold; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h2>Garment Analysis Update</h2>
+                        <p>Batch ID: {batch_id}</p>
+                    </div>
+                    
+                    <div style="margin-top: 20px;">
+                        <span class="status-badge">{status.value.upper()}</span>
+                    </div>
+                    
+                    <div class="details">
+                        <div class="detail-row">
+                            <strong>Item:</strong>
+                            <span>{garment.get('garment_type', 'N/A')}</span>
+                        </div>
+                        <div class="detail-row">
+                            <strong>Brand:</strong>
+                            <span>{garment.get('brand', 'N/A')}</span>
+                        </div>
+                        <div class="detail-row">
+                            <strong>Size:</strong>
+                            <span>{garment.get('size', 'N/A')}</span>
+                        </div>
+                        <div class="detail-row">
+                            <strong>Condition:</strong>
+                            <span>{garment.get('condition', 'N/A')}</span>
+                        </div>
+                        
+                        {f'<div class="detail-row"><strong>Estimated Price:</strong><span class="price">${garment.get("estimated_price", 0):.2f}</span></div>' if garment.get('estimated_price') else ''}
+                    </div>
+                    
+                    {f'<div class="details"><strong>Note:</strong> {garment.get("issue_details", "")}</div>' if garment.get('issue_details') else ''}
+                    
+                    <p style="margin-top: 20px; color: #7f8c8d;">
+                        Track your items in real-time on our app or website.
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+        return html
+
+
+# ============================================
+# ETA CALCULATOR
+# ============================================
+class ETACalculator:
+    """Calculates estimated time of completion"""
+    
+    # Average time per status in seconds
+    STAGE_DURATIONS = {
+        AnalysisStatus.SUBMITTED: 5,
+        AnalysisStatus.TAG_SCANNING: 30,
+        AnalysisStatus.GARMENT_IMAGING: 60,
+        AnalysisStatus.ANALYZING: 120,
+        AnalysisStatus.PRICING: 45,
+        AnalysisStatus.QUALITY_CHECK: 90,
+    }
+    
+    @staticmethod
+    def calculate_eta(current_status: AnalysisStatus, 
+                      start_time: datetime,
+                      batch_size: int = 1) -> Optional[datetime]:
+        """
+        Calculate ETA for garment completion
+        
+        Args:
+            current_status: Current analysis status
+            start_time: When analysis started
+            batch_size: Number of items in batch (affects pricing stage)
+            
+        Returns:
+            Estimated completion datetime
+        """
+        # Get remaining stages
+        statuses_ordered = [
+            AnalysisStatus.SUBMITTED,
+            AnalysisStatus.TAG_SCANNING,
+            AnalysisStatus.GARMENT_IMAGING,
+            AnalysisStatus.ANALYZING,
+            AnalysisStatus.PRICING,
+            AnalysisStatus.QUALITY_CHECK,
+            AnalysisStatus.ACCEPTED,
+        ]
+        
+        current_idx = statuses_ordered.index(current_status)
+        remaining_stages = statuses_ordered[current_idx + 1:]
+        
+        # Calculate total remaining time
+        total_remaining = 0
+        for stage in remaining_stages:
+            duration = ETACalculator.STAGE_DURATIONS.get(stage, 30)
+            # Batch multiplier for pricing stage
+            if stage == AnalysisStatus.PRICING:
+                duration *= min(batch_size / 5, 2.0)  # Cap at 2x for large batches
+            total_remaining += duration
+        
+        # Add 10% buffer for network latency and processing
+        total_remaining = int(total_remaining * 1.1)
+        
+        return datetime.now() + timedelta(seconds=total_remaining)
+    
+    @staticmethod
+    def format_eta(eta: Optional[datetime]) -> str:
+        """Format ETA for display"""
+        if not eta:
+            return "Calculating..."
+        
+        delta = eta - datetime.now()
+        if delta.total_seconds() < 0:
+            return "Complete!"
+        
+        minutes, seconds = divmod(int(delta.total_seconds()), 60)
+        hours, minutes = divmod(minutes, 60)
+        
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
 
 
 def convert_size_to_us(size, gender, region='EU'):
@@ -1628,6 +2161,20 @@ def research_brand_with_ebay(pipeline_data, ebay_finder):
         
         logger.info(f"[EBAY] ✅ Updated pricing: ${comps_data['avg_sold_price']:.2f} avg, "
                    f"{comps_data['sell_through_rate']:.1f}% sell-through")
+        
+    # TRACKING: Update garment status to PRICING
+    if hasattr(pipeline_data, '_pipeline_manager') and pipeline_data._pipeline_manager:
+        pipeline_data._pipeline_manager._update_tracking_status(AnalysisStatus.PRICING, {
+            'estimated_price': comps_data['avg_sold_price'],
+            'confidence': comps_data.get('confidence', 0.8)
+        })
+        
+        # API INTEGRATION: Send pricing update to backend
+        if pipeline_data._pipeline_manager.current_batch_id and pipeline_data._pipeline_manager.current_garment_id:
+            on_pricing(
+                pipeline_data._pipeline_manager.current_batch_id, 
+                pipeline_data._pipeline_manager.current_garment_id
+            )
     else:
         logger.warning(f"[EBAY] Research failed: {comps_data.get('error', 'Unknown error')}")
         # Keep original pricing estimate
@@ -10867,6 +11414,152 @@ def save_user_correction(
 
 
 # ============================================
+# API INTEGRATION FUNCTIONS
+# ============================================
+
+# Backend API URL (set via environment variable)
+API_URL = os.getenv('API_URL', 'http://localhost:8000')
+
+def send_garment_update(batch_id, garment_id, update_data):
+    """
+    Send garment analysis update to backend
+    Call this at each analysis stage
+    
+    Args:
+        batch_id: Unique batch identifier
+        garment_id: Unique garment identifier
+        update_data: Dict with analysis results
+    """
+    try:
+        payload = {
+            'batch_id': batch_id,
+            'garment_id': garment_id,
+            'brand': update_data.get('brand', 'Unknown'),
+            'type': update_data.get('garment_type', 'Unknown'),
+            'size': update_data.get('size', 'Unknown'),
+            'condition': update_data.get('condition', 'Unknown'),
+            'status': update_data.get('status', '🔵 SUBMITTED'),
+            'price': update_data.get('price'),
+            'confidence': update_data.get('confidence', 0),
+            'eta_seconds': update_data.get('eta_seconds'),
+            'reason': update_data.get('reason')
+        }
+        
+        response = requests.post(
+            f"{API_URL}/api/v1/garments/update",
+            json=payload,
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"✓ Sent update for {garment_id}: {update_data.get('status')}")
+            return True
+        else:
+            logger.error(f"API returned {response.status_code}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Failed to send update: {e}")
+        return False
+
+def create_batch_api(seller_id, store_location="Downtown"):
+    """
+    Create new batch in backend
+    Call this when seller drops off items
+    
+    Returns:
+        batch_id if successful, None otherwise
+    """
+    try:
+        response = requests.post(
+            f"{API_URL}/api/v1/batches/create",
+            json={
+                'seller_id': seller_id,
+                'store_location': store_location
+            },
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            batch_id = data.get('batch_id')
+            logger.info(f"✓ API Batch created: {batch_id}")
+            return batch_id
+        
+    except Exception as e:
+        logger.error(f"Failed to create API batch: {e}")
+    
+    return None
+
+def on_garment_submitted(batch_id, garment_id):
+    """Call when garment is submitted"""
+    send_garment_update(batch_id, garment_id, {
+        'brand': 'Scanning...',
+        'garment_type': 'Reading tag...',
+        'size': '...',
+        'condition': 'Scanning',
+        'status': '🔵 SUBMITTED',
+        'confidence': 0
+    })
+
+def on_tag_read(batch_id, garment_id, brand, size, material):
+    """Call after tag reading completes"""
+    send_garment_update(batch_id, garment_id, {
+        'brand': brand,
+        'garment_type': 'Analyzing...',
+        'size': size,
+        'condition': 'Reading tag...',
+        'status': '🟡 TAG_SCANNING',
+        'confidence': 0.85,
+        'eta_seconds': 180
+    })
+
+def on_garment_imaging(batch_id, garment_id):
+    """Call during photo capture"""
+    send_garment_update(batch_id, garment_id, {
+        'status': '🟡 GARMENT_IMAGING',
+        'confidence': 0.80,
+        'eta_seconds': 150
+    })
+
+def on_analyzing(batch_id, garment_id, garment_type, condition):
+    """Call during AI analysis"""
+    send_garment_update(batch_id, garment_id, {
+        'garment_type': garment_type,
+        'condition': condition,
+        'status': '🟡 ANALYZING',
+        'confidence': 0.88,
+        'eta_seconds': 100
+    })
+
+def on_pricing(batch_id, garment_id):
+    """Call during price calculation"""
+    send_garment_update(batch_id, garment_id, {
+        'status': '🟡 PRICING',
+        'confidence': 0.90,
+        'eta_seconds': 60
+    })
+
+def on_analysis_complete(batch_id, garment_id, accepted, price, condition, reason=None):
+    """Call when analysis completes"""
+    
+    if accepted:
+        status = '✅ ACCEPTED'
+        confidence = 0.94
+    else:
+        status = '❌ REJECTED'
+        confidence = 0.75
+    
+    send_garment_update(batch_id, garment_id, {
+        'status': status,
+        'price': price if accepted else 0,
+        'condition': condition,
+        'confidence': confidence,
+        'reason': reason,
+        'eta_seconds': None
+    })
+
+# ============================================
 # STREAMLIT UI COMPONENTS FOR LEARNING
 # ============================================
 
@@ -12720,6 +13413,22 @@ class EnhancedPipelineManager:
         else:
             print("  - Learning orchestrator not provided (will be initialized in session state)")
         
+        # Initialize real-time tracking system
+        try:
+            self.tracking_manager = RealtimeTrackingManager()
+            self.notification_manager = NotificationManager()
+            self.eta_calculator = ETACalculator()
+            print("  - Real-time tracking system initialized")
+        except Exception as e:
+            print(f"  - Tracking system initialization failed: {e}")
+            self.tracking_manager = None
+            self.notification_manager = None
+            self.eta_calculator = None
+        
+        # Tracking state
+        self.current_batch_id = None
+        self.current_garment_id = None
+        
         # Initialize measurement dataset manager
         try:
             self.measurement_manager = MeasurementDatasetManager()
@@ -12768,12 +13477,18 @@ class EnhancedPipelineManager:
         try:
             api_key = os.getenv('OPENAI_API_KEY')
             if api_key:
+                # Show first few characters for debugging (but keep it secure)
+                masked_key = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
+                print(f"  - Found OpenAI API key: {masked_key}")
                 from openai import OpenAI
                 self.openai_client = OpenAI(api_key=api_key)
-                print("  - OpenAI client initialized")
+                print("  - OpenAI client initialized successfully")
             else:
-                print("  - No OpenAI API key found")
+                self.openai_client = None
+                print("  - No OpenAI API key found in environment variables")
+                print("  - Check that api.env file exists and contains OPENAI_API_KEY=your-key")
         except Exception as e:
+            self.openai_client = None
             print(f"  - OpenAI initialization failed: {e}")
     
     def get_background_garment_result(self):
@@ -12811,6 +13526,23 @@ class EnhancedPipelineManager:
                 # Store basic results
                 self.pipeline_data.brand = result.get('brand')
                 raw_size = result.get('size')
+                
+            # TRACKING: Update garment status to TAG_SCANNING
+            self._update_tracking_status(AnalysisStatus.TAG_SCANNING, {
+                'brand': result.get('brand'),
+                'size': raw_size,
+                'confidence': result.get('confidence', 0.8)
+            })
+            
+            # API INTEGRATION: Send tag reading update to backend
+            if self.current_batch_id and self.current_garment_id:
+                on_tag_read(
+                    self.current_batch_id, 
+                    self.current_garment_id, 
+                    result.get('brand', 'Unknown'),
+                    raw_size,
+                    result.get('material', 'Unknown')
+                )
                 
                 # INTEGRATE CORRECTION MEMORY - Apply saved corrections
                 try:
@@ -13156,6 +13888,15 @@ class EnhancedPipelineManager:
             # Store image
             self.pipeline_data.garment_image = roi_image
             
+            # TRACKING: Update garment status to GARMENT_IMAGING
+            self._update_tracking_status(AnalysisStatus.GARMENT_IMAGING, {
+                'photos_count': 1
+            })
+            
+            # API INTEGRATION: Send garment imaging update to backend
+            if self.current_batch_id and self.current_garment_id:
+                on_garment_imaging(self.current_batch_id, self.current_garment_id)
+            
             # Use combined analysis (garment + defects in one call)
             if hasattr(self, 'openai_client') and self.openai_client:
                 logger.info("[GARMENT-ANALYSIS] Starting combined analysis with GPT-4o...")
@@ -13170,18 +13911,188 @@ class EnhancedPipelineManager:
                            f"Condition: {self.pipeline_data.condition}, "
                            f"Defects: {len(self.pipeline_data.defects)}")
                 
+                # TRACKING: Update garment status to ANALYZING
+                self._update_tracking_status(AnalysisStatus.ANALYZING, {
+                    'garment_type': self.pipeline_data.garment_type,
+                    'condition': self.pipeline_data.condition,
+                    'confidence': 0.9
+                })
+                
+                # API INTEGRATION: Send analyzing update to backend
+                if self.current_batch_id and self.current_garment_id:
+                    on_analyzing(
+                        self.current_batch_id, 
+                        self.current_garment_id, 
+                        self.pipeline_data.garment_type,
+                        self.pipeline_data.condition
+                    )
+                
                 # Verify the analysis actually worked
                 if self.pipeline_data.garment_type != 'Unknown':
                     return {'success': True, 'message': f'Combined analysis complete: {self.pipeline_data.garment_type}'}
                 else:
                     return {'success': False, 'error': 'Analysis completed but no garment type detected'}
             else:
-                logger.error("[GARMENT-ANALYSIS] OpenAI client not available")
-                return {'success': False, 'error': 'OpenAI client not available'}
+                logger.warning("[GARMENT-ANALYSIS] OpenAI client not available - using fallback analysis")
+                # Fallback to basic analysis without OpenAI
+                return self._fallback_garment_analysis()
                 
         except Exception as e:
             logger.error(f"Step 1 handler error: {e}")
             return {'success': False, 'error': str(e)}
+    
+    def _fallback_garment_analysis(self):
+        """Fallback garment analysis when OpenAI is not available"""
+        try:
+            # Basic analysis without AI - set default values
+            self.pipeline_data.garment_type = 'Unknown'
+            self.pipeline_data.condition = 'Unknown'
+            self.pipeline_data.defects = []
+            self.pipeline_data.gender = 'Unknown'
+            self.pipeline_data.style = 'Unknown'
+            
+            logger.info("[FALLBACK-ANALYSIS] Using basic analysis without AI")
+            return {'success': True, 'message': 'Fallback analysis complete (OpenAI not available)'}
+            
+        except Exception as e:
+            logger.error(f"Fallback analysis error: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def _update_tracking_status(self, status: AnalysisStatus, details: Dict = None):
+        """Update tracking status for current garment"""
+        if not self.tracking_manager or not self.current_batch_id or not self.current_garment_id:
+            return
+        
+        try:
+            # Create update object
+            update = GarmentAnalysisUpdate(
+                garment_id=self.current_garment_id,
+                status=status,
+                timestamp=datetime.now().isoformat(),
+                brand=getattr(self.pipeline_data, 'brand', None),
+                size=getattr(self.pipeline_data, 'size', None),
+                garment_type=getattr(self.pipeline_data, 'garment_type', None),
+                condition=getattr(self.pipeline_data, 'condition', None),
+                estimated_price=getattr(self.pipeline_data, 'price_estimate', {}).get('mid') if hasattr(self.pipeline_data, 'price_estimate') else None,
+                confidence=details.get('confidence') if details else None,
+                photos_count=details.get('photos_count', 0) if details else 0,
+                eta_seconds=self._calculate_eta_seconds(status) if self.eta_calculator else None
+            )
+            
+            # Send update
+            self.tracking_manager.update_garment_status(
+                self.current_batch_id, 
+                self.current_garment_id, 
+                update
+            )
+            
+            # Send notifications for major status changes
+            if status in [AnalysisStatus.ACCEPTED, AnalysisStatus.REJECTED] and self.notification_manager:
+                self._send_status_notification(status, update)
+                
+        except Exception as e:
+            print(f"Tracking update failed: {e}")
+    
+    def _calculate_eta_seconds(self, current_status: AnalysisStatus) -> Optional[int]:
+        """Calculate ETA in seconds for current status"""
+        if not self.eta_calculator:
+            return None
+        
+        try:
+            eta = self.eta_calculator.calculate_eta(
+                current_status=current_status,
+                start_time=datetime.now(),
+                batch_size=1  # Could be enhanced to track batch size
+            )
+            if eta:
+                return int((eta - datetime.now()).total_seconds())
+        except Exception as e:
+            print(f"ETA calculation failed: {e}")
+        
+        return None
+    
+    def _send_status_notification(self, status: AnalysisStatus, update: GarmentAnalysisUpdate):
+        """Send notification for major status changes - Updated for 30% cash, 50% trade model"""
+        if not self.notification_manager or not self.current_batch_id:
+            return
+        
+        try:
+            batch_data = self.tracking_manager.get_batch_status(self.current_batch_id)
+            if not batch_data:
+                return
+            
+            # Enhanced notification with payout options
+            if status == AnalysisStatus.COMPLETED and update.estimated_price:
+                # Include payout options in notification
+                payout_message = self._get_payout_options_message(update.estimated_price)
+            else:
+                payout_message = ""
+            
+            # Send email notification
+            if batch_data.get('email'):
+                subject = f"Garment {status.value}: {update.brand} {update.garment_type}"
+                self.notification_manager.send_email_notification(
+                    to_email=batch_data['email'],
+                    subject=subject,
+                    batch_id=self.current_batch_id,
+                    garment_details=update.to_dict(),
+                    status=status,
+                    payout_options=payout_message
+                )
+            
+            # Send SMS notification
+            if batch_data.get('phone_number'):
+                base_message = f"Your {update.brand} {update.garment_type} has been {status.value}."
+                if update.estimated_price:
+                    base_message += f" Price: ${update.estimated_price:.2f}"
+                if payout_message:
+                    base_message += f" {payout_message}"
+                
+                self.notification_manager.send_sms_notification(
+                    phone=batch_data['phone_number'],
+                    message=base_message
+                )
+                
+        except Exception as e:
+            print(f"Notification sending failed: {e}")
+    
+    def _get_payout_options_message(self, amount: float) -> str:
+        """Get payout options message for notifications"""
+        return f"Choose payout: Trade Credit (50% choose, no fees), Cash (30% choose, 1-2.5% fees), or Store Credit (20% choose, no fees)."
+    
+    def create_tracking_batch(self, seller_id: str, store_location: str, 
+                             phone: Optional[str] = None, email: Optional[str] = None) -> str:
+        """Create a new tracking batch and set current batch ID"""
+        if not self.tracking_manager:
+            return str(uuid.uuid4())
+        
+        self.current_batch_id = self.tracking_manager.create_submission_batch(
+            seller_id=seller_id,
+            store_location=store_location,
+            phone=phone,
+            email=email
+        )
+        
+        # API INTEGRATION: Also create batch in backend API
+        api_batch_id = create_batch_api(seller_id, store_location)
+        if api_batch_id:
+            logger.info(f"✓ Created both tracking batch ({self.current_batch_id}) and API batch ({api_batch_id})")
+        
+        return self.current_batch_id
+    
+    def add_garment_to_tracking(self, garment_id: str) -> bool:
+        """Add current garment to tracking batch"""
+        if not self.tracking_manager or not self.current_batch_id:
+            return False
+        
+        self.current_garment_id = garment_id
+        success = self.tracking_manager.add_garment_to_batch(self.current_batch_id, garment_id)
+        
+        # API INTEGRATION: Send initial garment submission
+        if success:
+            on_garment_submitted(self.current_batch_id, garment_id)
+        
+        return success
     
     def analyze_garment_comprehensive(self, image, pipeline_data, client):
         """
@@ -14465,6 +15376,26 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 st.write(f"**Price:** ${self.pipeline_data.price_estimate.get('mid', 0)}")
         
         if st.button("🔄 Start New", type="primary", width='stretch'):
+            # TRACKING: Mark garment as completed/accepted
+            self._update_tracking_status(AnalysisStatus.COMPLETED, {
+                'estimated_price': self.pipeline_data.price_estimate.get('mid') if self.pipeline_data.price_estimate else None,
+                'confidence': 0.95
+            })
+            
+            # API INTEGRATION: Send final analysis complete update to backend
+            if self.current_batch_id and self.current_garment_id:
+                accepted = self.pipeline_data.price_estimate.get('mid', 0) > 0
+                price = self.pipeline_data.price_estimate.get('mid', 0) if self.pipeline_data.price_estimate else 0
+                condition = getattr(self.pipeline_data, 'condition', 'Unknown')
+                
+                on_analysis_complete(
+                    self.current_batch_id, 
+                    self.current_garment_id, 
+                    accepted, 
+                    price, 
+                    condition
+                )
+            
             self.current_step = 0
             self.pipeline_data = PipelineData()
             st.rerun()
@@ -17883,6 +18814,99 @@ def render_defect_collection_mode():
             st.session_state.defect_points = []
             st.rerun()
 
+def render_tracking_dashboard_sidebar():
+    """Render real-time tracking dashboard in sidebar"""
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🛍️ Real-Time Tracking")
+    
+    # Check if tracking is available
+    if 'pipeline_manager' not in st.session_state or not st.session_state.pipeline_manager.tracking_manager:
+        st.sidebar.warning("⚠️ Tracking system not initialized")
+        return
+    
+    pipeline_manager = st.session_state.pipeline_manager
+    
+    # Batch creation form
+    with st.sidebar.expander("📦 Create New Batch", expanded=False):
+        with st.form("batch_creation_form"):
+            seller_id = st.text_input("Seller ID", value="seller_001", help="Unique identifier for the seller")
+            store_location = st.text_input("Store Location", value="Downtown Store", help="Physical store location")
+            phone = st.text_input("Phone Number", value="+1234567890", help="For SMS notifications")
+            email = st.text_input("Email", value="seller@example.com", help="For email notifications")
+            
+            if st.form_submit_button("Create Batch", use_container_width=True):
+                batch_id = pipeline_manager.create_tracking_batch(
+                    seller_id=seller_id,
+                    store_location=store_location,
+                    phone=phone,
+                    email=email
+                )
+                st.success(f"✅ Batch created: {batch_id[:8]}...")
+                st.rerun()
+    
+                # Current batch status
+                if pipeline_manager.current_batch_id:
+                    st.sidebar.markdown(f"**Current Batch:** `{pipeline_manager.current_batch_id[:8]}...`")
+                    
+                    # Get batch status
+                    batch_data = pipeline_manager.tracking_manager.get_batch_status(pipeline_manager.current_batch_id)
+                    if batch_data:
+                        col1, col2 = st.sidebar.columns(2)
+                        with col1:
+                            st.metric("Items", batch_data.get('total_items', 0))
+                        with col2:
+                            st.metric("Value", f"${batch_data.get('total_value', 0):.2f}")
+                        
+                        # Progress bar
+                        if batch_data.get('total_items', 0) > 0:
+                            progress = batch_data.get('completed_items', 0) / batch_data.get('total_items', 1)
+                            st.sidebar.progress(progress, text=f"Progress: {int(progress * 100)}%")
+                        
+                        # Business model info
+                        st.sidebar.markdown("---")
+                        st.sidebar.markdown("### 💰 Payout Options")
+                        st.sidebar.info("""
+                        **50%** choose Trade Credit (no fees)
+                        **30%** choose Cash (1-2.5% fees)  
+                        **20%** choose Store Credit (no fees)
+                        """)
+                    
+                    # Add garment to batch
+                    if st.sidebar.button("➕ Add Current Garment", use_container_width=True):
+                        garment_id = str(uuid.uuid4())
+                        if pipeline_manager.add_garment_to_tracking(garment_id):
+                            st.sidebar.success("✅ Garment added to batch")
+                            st.rerun()
+                        else:
+                            st.sidebar.error("❌ Failed to add garment")
+                else:
+                    st.sidebar.info("No active batch. Create one above to start tracking.")
+    
+    # Tracking status for current garment
+    if pipeline_manager.current_garment_id and pipeline_manager.current_batch_id:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 📱 Current Garment")
+        
+        garment_data = pipeline_manager.tracking_manager.get_garment_status(
+            pipeline_manager.current_batch_id, 
+            pipeline_manager.current_garment_id
+        )
+        
+        if garment_data:
+            status = garment_data.get('status', 'submitted')
+            st.sidebar.markdown(f"**Status:** {status.upper()}")
+            
+            if garment_data.get('estimated_price'):
+                st.sidebar.metric("Price", f"${garment_data['estimated_price']:.2f}")
+            
+            if garment_data.get('eta_seconds'):
+                eta_time = datetime.now() + timedelta(seconds=garment_data['eta_seconds'])
+                st.sidebar.caption(f"⏱️ ETA: {ETACalculator.format_eta(eta_time)}")
+        else:
+            st.sidebar.info("No garment data available")
+
+
 def main():
     """Main application entry point - optimized for tablet performance"""
     
@@ -17896,6 +18920,9 @@ def main():
     
     # Add camera diagnostics to sidebar
     display_camera_diagnostics()
+    
+    # Add tracking dashboard to sidebar
+    render_tracking_dashboard_sidebar()
     
     # Handle pipeline reset request
     if st.session_state.get('pipeline_reset_requested', False):
