@@ -1294,7 +1294,7 @@ REALSENSE_SDK_AVAILABLE = False
 # RATE LIMITING UTILITIES
 # ==========================
 
-def rate_limited(max_per_minute=5000):
+def rate_limited(max_per_minute=20):  # Fixed: 5000/day = ~20/min
     """Rate limiting decorator for API calls"""
     min_interval = 60.0 / max_per_minute
     last_called = [0.0]
@@ -1314,6 +1314,24 @@ def rate_limited(max_per_minute=5000):
     return decorator
 
 # Simple file-based cache for API responses
+
+def ebay_api_call_with_retry(func, max_retries=3):
+    """Wrapper to add retry logic to eBay API calls"""
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            result = func()
+            return result
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff
+                logger.warning(f"eBay API call failed (attempt {attempt+1}), retrying in {wait_time}s: {e}")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"eBay API call failed after {max_retries} attempts: {e}")
+                raise
+
 def _cache_key(brand, garment_type, size, gender):
     """Generate cache key for API calls"""
     key_str = f"{brand}_{garment_type}_{size}_{gender}".lower().replace(" ", "_")
@@ -2627,6 +2645,173 @@ def save_correction_for_training(correction_data):
 
 
 @dataclass
+
+# ==========================
+# BRAND TAG IMAGE ARCHIVAL
+# ==========================
+class TagImageArchive:
+    """Archive brand tag images for future ML training"""
+    
+    def __init__(self, base_dir='training_data/brand_tags'):
+        self.base_dir = base_dir
+        os.makedirs(base_dir, exist_ok=True)
+        self.database_csv = f'{base_dir}/brand_tag_database.csv'
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize CSV database if it doesn't exist"""
+        if not os.path.exists(self.database_csv):
+            df = pd.DataFrame(columns=[
+                'timestamp', 'brand', 'ocr_raw', 'image_path', 
+                'preprocessed_path', 'confidence', 'lighting_brightness',
+                'lighting_temp', 'focus_score', 'camera', 'resolution'
+            ])
+            df.to_csv(self.database_csv, index=False)
+            logger.info(f"✅ Created brand tag database: {self.database_csv}")
+    
+    def _hash_image(self, image):
+        """Generate hash of image for deduplication"""
+        import hashlib
+        return hashlib.md5(image.tobytes()).hexdigest()
+    
+    def _image_exists(self, img_hash):
+        """Check if this image hash already exists in database"""
+        if not os.path.exists(self.database_csv):
+            return False
+        
+        try:
+            df = pd.read_csv(self.database_csv)
+            # Check if hash exists (you'd need to add hash column)
+            return False  # For now, always save
+        except:
+            return False
+    
+    def save_brand_tag_image(self, tag_image, ocr_result, corrected_brand, metadata):
+        """
+        Save brand tag image with metadata for training
+        
+        Args:
+            tag_image: numpy array of tag image
+            ocr_result: raw OCR text output
+            corrected_brand: user-corrected brand name
+            metadata: dict with lighting, camera info, etc.
+        """
+        try:
+            # Create brand-specific folder
+            brand_safe = corrected_brand.replace(' ', '_').replace('/', '_')
+            brand_folder = f'{self.base_dir}/{brand_safe}'
+            os.makedirs(brand_folder, exist_ok=True)
+            
+            # Generate unique filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            filename_base = f'{brand_folder}/{timestamp}'
+            
+            # Save original image
+            original_path = f'{filename_base}_original.jpg'
+            cv2.imwrite(original_path, cv2.cvtColor(tag_image, cv2.COLOR_RGB2BGR))
+            
+            # Save preprocessed version (basic preprocessing)
+            preprocessed = self._preprocess_tag(tag_image)
+            preprocessed_path = f'{filename_base}_preprocessed.jpg'
+            cv2.imwrite(preprocessed_path, cv2.cvtColor(preprocessed, cv2.COLOR_RGB2BGR))
+            
+            # Save metadata JSON
+            training_data = {
+                'timestamp': timestamp,
+                'ocr_raw': ocr_result,
+                'corrected_brand': corrected_brand,
+                'image_path': original_path,
+                'preprocessed_path': preprocessed_path,
+                'image_size': tag_image.shape,
+                'metadata': metadata
+            }
+            
+            with open(f'{filename_base}_metadata.json', 'w') as f:
+                json.dump(training_data, f, indent=2)
+            
+            # Append to CSV database
+            self._append_to_database(training_data)
+            
+            logger.info(f"✅ Archived brand tag: {corrected_brand} -> {original_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to archive brand tag image: {e}")
+            return False
+    
+    def _preprocess_tag(self, image):
+        """Basic preprocessing for better OCR"""
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(image, None, 10, 7, 21)
+        
+        # Sharpen
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(denoised, -1, kernel)
+        
+        # Contrast enhancement
+        gray = cv2.cvtColor(sharpened, cv2.COLOR_RGB2GRAY)
+        enhanced = cv2.equalizeHist(gray)
+        
+        # Convert back to RGB
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    
+    def _append_to_database(self, training_data):
+        """Append entry to CSV database"""
+        try:
+            df = pd.read_csv(self.database_csv)
+            
+            new_row = {
+                'timestamp': training_data['timestamp'],
+                'brand': training_data['corrected_brand'],
+                'ocr_raw': training_data['ocr_raw'],
+                'image_path': training_data['image_path'],
+                'preprocessed_path': training_data['preprocessed_path'],
+                'confidence': training_data['metadata'].get('confidence', 0.0),
+                'lighting_brightness': training_data['metadata'].get('lighting', {}).get('brightness', 0),
+                'lighting_temp': training_data['metadata'].get('lighting', {}).get('temperature', 0),
+                'focus_score': training_data['metadata'].get('focus_score', 0.0),
+                'camera': training_data['metadata'].get('camera', 'unknown'),
+                'resolution': str(training_data['image_size'])
+            }
+            
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            df.to_csv(self.database_csv, index=False)
+            
+        except Exception as e:
+            logger.warning(f"Could not append to database: {e}")
+
+
+def save_brand_tag_with_correction(tag_image, ocr_result, corrected_brand, 
+                                   elgato_state=None, focus_score=0.0, camera_name='unknown'):
+    """
+    Convenience function to save brand tag when user makes correction.
+    Call this in your correction workflow.
+    
+    Example usage:
+        if user_corrected_brand != ocr_brand:
+            save_brand_tag_with_correction(
+                tag_image=pipeline_data.tag_image,
+                ocr_result=ocr_brand,
+                corrected_brand=user_corrected_brand,
+                elgato_state=elgato_controller.current_state,
+                focus_score=camera_manager.calculate_focus_score(tag_image),
+                camera_name='arducam_12mp'
+            )
+    """
+    if 'tag_archive' not in st.session_state:
+        st.session_state.tag_archive = TagImageArchive()
+    
+    metadata = {
+        'lighting': elgato_state or {'brightness': 0, 'temperature': 0},
+        'focus_score': focus_score,
+        'camera': camera_name,
+        'confidence': 1.0 if ocr_result != corrected_brand else 0.5
+    }
+    
+    return st.session_state.tag_archive.save_brand_tag_image(
+        tag_image, ocr_result, corrected_brand, metadata
+    )
+
 class AnalysisState:
     """Clean encapsulation of analysis state"""
     tag_analysis_status: AnalysisStatus = AnalysisStatus.PENDING
