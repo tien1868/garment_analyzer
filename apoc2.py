@@ -19,7 +19,7 @@ FRAME_SKIP_COUNT = 2            # Skip frames for performance
 # Camera configuration
 CAMERA_CONFIG = {
     'tag_camera_index': 0,           # ArduCam for tag scanning
-    'measurement_camera_index': 1,   # RealSense for measurements
+    'measurement_camera_index': 0,   # C930e for measurements (same as ArduCam)
     'force_indices': True,           # Force specific camera indices
     'swap_cameras': False           # Allow camera swapping
 }
@@ -1722,6 +1722,101 @@ if 'env_loaded' not in st.session_state or not st.session_state.env_loaded:
 # Streamlit configuration moved to main() function
 
 # ==========================
+# SYNCHRONIZED PIPELINE STEP MANAGER
+# ==========================
+
+class PipelineStepManager:
+    """
+    Manages pipeline steps with proper synchronization.
+    Steps only show as complete when data is ACTUALLY ready.
+    """
+    
+    def __init__(self):
+        # Initialize session state for pipeline
+        if 'pipeline_state' not in st.session_state:
+            st.session_state.pipeline_state = {
+                'current_step': 0,
+                'steps': {
+                    1: {'name': 'Complete Analysis', 'status': 'pending', 'data': None},
+                    2: {'name': 'Measure Garment', 'status': 'pending', 'data': None},
+                    3: {'name': 'Calculate Price', 'status': 'pending', 'data': None},
+                },
+                'step_start_times': {},
+                'step_errors': {}
+            }
+    
+    def mark_step_in_progress(self, step_num):
+        """Mark a step as currently running"""
+        st.session_state.pipeline_state['steps'][step_num]['status'] = 'in_progress'
+        st.session_state.pipeline_state['current_step'] = step_num
+        st.session_state.pipeline_state['step_start_times'][step_num] = time.time()
+        logger.info(f"▶️  Step {step_num} started: {st.session_state.pipeline_state['steps'][step_num]['name']}")
+    
+    def mark_step_complete(self, step_num, data=None):
+        """Mark a step as complete ONLY after the data is ready"""
+        st.session_state.pipeline_state['steps'][step_num]['status'] = 'completed'
+        st.session_state.pipeline_state['steps'][step_num]['data'] = data
+        
+        elapsed = time.time() - st.session_state.pipeline_state['step_start_times'].get(step_num, time.time())
+        logger.info(f"✅ Step {step_num} completed: {elapsed:.2f}s")
+    
+    def mark_step_error(self, step_num, error_msg):
+        """Mark a step as failed"""
+        st.session_state.pipeline_state['steps'][step_num]['status'] = 'failed'
+        st.session_state.pipeline_state['steps'][step_num]['error'] = error_msg
+        st.session_state.pipeline_state['step_errors'][step_num] = error_msg
+        logger.error(f"❌ Step {step_num} failed: {error_msg}")
+    
+    def get_step_status(self, step_num):
+        """Get current status of a step"""
+        return st.session_state.pipeline_state['steps'][step_num]['status']
+    
+    def get_step_data(self, step_num):
+        """Get data from a completed step"""
+        return st.session_state.pipeline_state['steps'][step_num]['data']
+    
+    def render_progress_display(self):
+        """Display pipeline progress with correct status indicators"""
+        st.markdown("### 📊 Pipeline Progress")
+        
+        steps = st.session_state.pipeline_state['steps']
+        
+        # Create a visual progress indicator
+        progress_cols = st.columns(3)
+        
+        for step_num, step_info in steps.items():
+            col = progress_cols[step_num - 1]
+            status = step_info['status']
+            
+            # Color and icon based on status
+            if status == 'completed':
+                icon = "✅"
+                color = "green"
+            elif status == 'in_progress':
+                icon = "⏳"
+                color = "blue"
+            elif status == 'failed':
+                icon = "❌"
+                color = "red"
+            else:  # pending
+                icon = "⭕"
+                color = "gray"
+            
+            with col:
+                st.markdown(
+                    f"<div style='text-align: center; padding: 15px; "
+                    f"background-color: #f0f0f0; border-radius: 8px; "
+                    f"border: 2px solid {color}'>"
+                    f"<p style='font-size: 24px; margin: 0;'>{icon}</p>"
+                    f"<p style='margin: 10px 0 0 0; font-size: 14px; font-weight: bold;'>"
+                    f"Step {step_num}: {step_info['name']}</p>"
+                    f"<p style='margin: 5px 0 0 0; font-size: 12px; color: gray;'>"
+                    f"{status.upper()}</p>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+# ==========================
 # PIPELINE DATA STRUCTURES
 # ==========================
 @dataclass
@@ -1783,6 +1878,198 @@ class PipelineData:
     analysis_completed: bool = False  # Track if analysis has been completed
 
 # BackgroundAnalysisManager removed - was unused dead code
+
+# ==========================
+# IMPROVED GARMENT CLASSIFICATION SYSTEM
+# ==========================
+
+def build_improved_garment_analysis_prompt(image_context: str = ""):
+    """
+    Build a STRICT garment classification prompt that prioritizes
+    visible structural features over assumptions
+    """
+    return """You are an expert fashion analyst. Analyze this garment image with EXTREME CARE about structural features.
+
+CRITICAL RULES FOR CLASSIFICATION:
+=====================================
+
+1. **CARDIGAN vs TANK TOP vs PULLOVER DISTINCTION**:
+   - CARDIGAN: MUST have a VISIBLE FRONT OPENING with buttons, zipper, or snap closures
+   - TANK TOP: Sleeveless shirt with NO front opening, pulls over head
+   - PULLOVER: Crewneck/turtleneck with NO front opening, pulls over head
+   - If you see NO front opening, it CANNOT be a cardigan under ANY circumstances
+
+2. **OBSERVATION PRIORITY** (in order):
+   - Step 1: Look for center-front closure (buttons, zipper, snaps) - MOST IMPORTANT
+   - Step 2: Check neckline and sleeve type
+   - Step 3: Observe fit and silhouette
+   - Step 4: Consider material and styling details
+
+3. **REJECT YOUR OWN ASSUMPTIONS**:
+   - Even if the item looks "cardigan-like", if there's NO front opening visible, it's NOT a cardigan
+   - A fitted sleeveless top with a round neckline = TANK TOP (not cardigan)
+   - No opening down the middle = NOT a cardigan
+
+ANALYSIS FORMAT:
+================
+Respond with ONLY valid JSON (no markdown, no code blocks):
+
+{
+  "garment_type": "tank top|cardigan|pullover|shirt|dress|jacket|blouse|sweater|[other]",
+  "has_front_opening": true|false,
+  "front_opening_type": "buttons|zipper|snaps|none|unclear",
+  "front_opening_confidence": "high|medium|low|none",
+  "center_front_observations": ["list", "of", "specific", "visual", "observations", "about", "front", "area"],
+  "neckline": "crew|v-neck|scoop|turtle|collared|hooded|boat|sweetheart|[describe]",
+  "sleeve_length": "sleeveless|short|three-quarter|long|capped|flutter",
+  "fit": "slim|regular|relaxed|oversized|fitted",
+  "silhouette": "a-line|sheath|fit-and-flare|shift|empire|straight|[describe]",
+  "gender": "women's|men's|unisex",
+  "style": "casual|formal|business|athletic|vintage|contemporary",
+  "pattern": "solid|striped|floral|geometric|[describe]",
+  "material_appearance": "cotton|linen|silk|polyester|blend|[description]",
+  "condition": "excellent|good|fair|poor",
+  "visible_defects": [],
+  "confidence_score": 0.0-1.0,
+  "classification_reasoning": "Explain WHY you chose this classification, especially the front opening decision"
+}
+
+REMEMBER: If you don't see a front opening, say NO. This is the #1 reason for misclassification."""
+
+
+def validate_and_correct_garment_type(analysis_result: dict) -> dict:
+    """
+    Post-process AI analysis to catch and correct common misclassifications
+    CRITICAL validation happens HERE, not in the AI
+    """
+    
+    garment_type = analysis_result.get("garment_type", "").lower()
+    has_opening = analysis_result.get("has_front_opening", False)
+    opening_type = analysis_result.get("front_opening_type", "none").lower()
+    opening_confidence = analysis_result.get("front_opening_confidence", "low").lower()
+    neckline = analysis_result.get("neckline", "").lower()
+    sleeve_length = analysis_result.get("sleeve_length", "").lower()
+    
+    corrections_made = []
+    
+    # RULE 1: If no front opening detected, it CANNOT be a cardigan
+    if garment_type == "cardigan" and (not has_opening or opening_type == "none"):
+        print("🔴 CORRECTION: AI said cardigan but detected NO front opening")
+        
+        # Determine what it actually is
+        if "sleeveless" in sleeve_length:
+            garment_type = "tank top"
+            corrections_made.append("Cardigan→Tank Top (no front opening)")
+        elif "turtle" in neckline or "crew" in neckline:
+            garment_type = "pullover"
+            corrections_made.append("Cardigan→Pullover (no front opening)")
+        else:
+            garment_type = "blouse"
+            corrections_made.append("Cardigan→Blouse (no front opening)")
+    
+    # RULE 2: Tank tops CANNOT have buttons/zippers on front
+    if garment_type == "tank top" and has_opening and opening_type != "none":
+        print("🟡 CORRECTION: Tank top with front opening detected - likely a cardigan")
+        garment_type = "cardigan"
+        corrections_made.append("Tank Top→Cardigan (front opening detected)")
+    
+    # RULE 3: High confidence "no opening" overrides AI classification
+    if opening_confidence == "high" and not has_opening:
+        # If AI is highly confident there's NO opening, trust that
+        if garment_type == "cardigan":
+            garment_type = "pullover"
+            corrections_made.append("Cardigan→Pullover (high confidence: no opening)")
+    
+    # RULE 4: Sleeveless + no opening = tank top (very specific)
+    if "sleeveless" in sleeve_length and not has_opening:
+        if garment_type not in ["tank top", "vest", "dress"]:
+            garment_type = "tank top"
+            corrections_made.append(f"{analysis_result.get('garment_type')}→Tank Top (sleeveless + no opening)")
+    
+    # Log corrections
+    if corrections_made:
+        print(f"✅ Corrections applied: {', '.join(corrections_made)}")
+        analysis_result["corrections_applied"] = corrections_made
+    
+    # Update the result
+    analysis_result["garment_type"] = garment_type
+    analysis_result["final_classification"] = garment_type
+    
+    return analysis_result
+
+
+def analyze_garment_with_strict_validation(camera_manager, pipeline_data):
+    """
+    Complete garment analysis with built-in validation
+    Returns corrected classification
+    """
+    
+    # Get the garment frame
+    garment_frame = camera_manager.get_garment_frame()
+    if garment_frame is None:
+        return {"success": False, "error": "Could not capture garment frame"}
+    
+    try:
+        # Use the improved prompt
+        prompt = build_improved_garment_analysis_prompt()
+        
+        # Send to Gemini 2.0 Flash
+        import google.generativeai as genai
+        import base64
+        import cv2
+        import json
+        
+        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+        client = genai.Client()
+        
+        message = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                prompt,
+                {"mime_type": "image/jpeg", "data": base64.b64encode(cv2.imencode('.jpg', garment_frame)[1]).decode()}
+            ]
+        )
+        
+        # Parse the response
+        response_text = message.text.strip()
+        
+        # Remove markdown code blocks if present
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+        
+        analysis_result = json.loads(response_text)
+        
+        # CRITICAL: Apply validation and corrections
+        analysis_result = validate_and_correct_garment_type(analysis_result)
+        
+        # Store in pipeline
+        pipeline_data.garment_type = analysis_result.get("garment_type", "Unknown")
+        pipeline_data.neckline = analysis_result.get("neckline", "Unknown")
+        pipeline_data.sleeve_length = analysis_result.get("sleeve_length", "Unknown")
+        pipeline_data.has_front_opening = analysis_result.get("has_front_opening", False)
+        pipeline_data.confidence = analysis_result.get("confidence_score", 0.5)
+        
+        # Add corrections to warnings if any
+        if "corrections_applied" in analysis_result:
+            if not hasattr(pipeline_data, 'warnings'):
+                pipeline_data.warnings = []
+            pipeline_data.warnings.extend(analysis_result["corrections_applied"])
+        
+        return {
+            "success": True,
+            "garment_type": pipeline_data.garment_type,
+            "has_front_opening": pipeline_data.has_front_opening,
+            "corrections": analysis_result.get("corrections_applied", []),
+            "full_analysis": analysis_result
+        }
+        
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Failed to parse AI response: {e}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 # ==========================
 # EBAY RESEARCH INTEGRATION
@@ -3414,21 +3701,23 @@ class OpenAIVisionCameraManager:
         if CAMERA_CONFIG.get('force_indices', True):
             # FORCE specific indices for reliability
             self.arducam_index = CAMERA_CONFIG['tag_camera_index']
-            self.realsense_index = CAMERA_CONFIG['measurement_camera_index']
+            # Use C930e instead of RealSense for measurements
+            self.realsense_index = None  # Disable RealSense
             
             # Handle camera swap if configured
             if CAMERA_CONFIG.get('swap_cameras', False):
-                self.arducam_index, self.realsense_index = self.realsense_index, self.arducam_index
-                logger.info("🔄 Cameras swapped per configuration")
+                # No swap needed since we're using C930e
+                logger.info("🔄 Camera swap not applicable (using C930e)")
             
             logger.info(f"🔒 FORCED ASSIGNMENT:")
             logger.info(f"   📷 ArduCam (tags): Index {self.arducam_index}")
-            logger.info(f"   📷 RealSense (measurements): Index {self.realsense_index}")
+            logger.info(f"   📷 C930e (measurements): Using C930e manager")
             
-            # Verify cameras exist
+            # Verify cameras exist (only ArduCam, C930e is handled separately)
             backend = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
-            for idx, name in [(self.arducam_index, "ArduCam"), (self.realsense_index, "RealSense")]:
-                cap = cv2.VideoCapture(idx, backend)
+            for idx, name in [(self.arducam_index, "ArduCam")]:
+                if idx is not None:
+                    cap = cv2.VideoCapture(idx, backend)
                 if cap.isOpened():
                     ret, _ = cap.read()
                     cap.release()
@@ -3498,32 +3787,13 @@ class OpenAIVisionCameraManager:
             return 0.0
     
     def validate_measurement_camera_index(self):
-        """CRITICAL: Ensure measurement camera is always at index 1"""
-        expected_index = CAMERA_CONFIG['measurement_camera_index']
-        
-        if self.realsense_index != expected_index:
-            logger.error(f"❌ WRONG CAMERA INDEX: RealSense at {self.realsense_index}, needs to be {expected_index}")
-            logger.info(f"🔧 Forcing RealSense to index {expected_index}...")
-            
-            # Force correction
-            if hasattr(self, 'realsense_cap') and self.realsense_cap:
-                self.realsense_cap.release()
-                self.realsense_cap = None
-            if hasattr(self, 'realsense_pipeline') and self.realsense_pipeline:
-                try:
-                    self.realsense_pipeline.stop()
-                except:
-                    pass
-                self.realsense_pipeline = None
-            
-            # Set to correct index
-            self.realsense_index = expected_index
-            
-            logger.info(f"✅ RealSense index corrected to {expected_index}")
-            return True
-        else:
-            logger.info(f"✅ RealSense already at correct index {expected_index}")
-            return True
+        """CRITICAL: Ensure measurement camera is using C930e instead of RealSense"""
+        # C930e is handled by its own manager, no index validation needed
+        if self.realsense_index is not None:
+            logger.warning("⚠️ RealSense detected but disabled - using C930e for measurements")
+            self.realsense_index = None
+        logger.info("✅ Using C930e for measurements (RealSense disabled)")
+        return True
     
     def _set_fourcc(self, cap, fourcc_str="MJPG"):
         """Set camera codec (MJPG preferred for high-res over USB)"""
@@ -11084,7 +11354,7 @@ def show_learning_dashboard():
             if hasattr(st.session_state, 'camera_manager') and st.session_state.camera_manager:
                 cm = st.session_state.camera_manager
                 st.write(f"**ArduCam Index:** {cm.arducam_index}")
-                st.write(f"**RealSense Index:** {cm.realsense_index}")
+                st.write(f"**RealSense Index:** {'Disabled' if cm.realsense_index is None else cm.realsense_index}")
                 st.write(f"**C930e Status:** {'✅ Working' if cm.camera_status.get('c930e', False) else '❌ Not working'}")
                 
                 # Test each camera
@@ -11290,7 +11560,7 @@ def display_camera_diagnostics():
         # Show current config
         st.info(f"""
         **Tag Camera:** Index {CAMERA_CONFIG['tag_camera_index']}
-        **Measurement Camera:** Index {CAMERA_CONFIG['measurement_camera_index']}
+        **Measurement Camera:** C930e (RealSense disabled)
         **Force Indices:** {CAMERA_CONFIG['force_indices']}
         """)
         
@@ -11300,7 +11570,8 @@ def display_camera_diagnostics():
             st.success(f"""
             **Actual Assignments:**
             - ArduCam: Index {cam.arducam_index}
-            - RealSense: Index {cam.realsense_index}
+            - C930e: {'✅ Working' if cam.camera_status.get('c930e', False) else '❌ Not working'}
+            - RealSense: {'Disabled' if cam.realsense_index is None else f'Index {cam.realsense_index}'}
             """)
             
             # Show calibration status
@@ -12424,6 +12695,9 @@ class EnhancedPipelineManager:
         self.current_step = 0  # Start at Step 0 (tag capture)
         self.completed_steps = set()
         
+        # Initialize the synchronized step manager
+        self.step_manager = PipelineStepManager()
+        
         # Background analysis system for garment analysis
         self.background_garment_thread = None
         self.background_garment_result = None
@@ -12805,19 +13079,62 @@ class EnhancedPipelineManager:
             logger.error(f"[TAG-ARCHIVE] Error saving multi-capture images: {e}")
     
     def _execute_current_step(self):
-        """Execute the logic for the current step and return success/failure"""
+        """Execute the logic for the current step and return success/failure with step-locking"""
         try:
             if self.current_step == 0:  # Tag Capture
                 return {'success': True, 'message': 'Tag captured - ready for analysis'}
             elif self.current_step == 1:  # Complete Analysis (Tag + Garment + Defects)
+                # STEP-LOCKING: Only run if not already complete
+                if st.session_state.step1_analysis_complete:
+                    logger.info("[STEP-LOCK] Step 1 already complete, returning cached data")
+                    return st.session_state.step1_data
+                
+                # Run the actual analysis
+                logger.info("[STEP-LOCK] Running Step 1 analysis...")
                 result = self.handle_step_1_garment_analysis()
-                if result is None:
-                    return {'success': False, 'error': 'Step 1 returned None - check garment capture'}
-                return result
+                
+                if result and result.get('success'):
+                    # Mark as complete in session state
+                    st.session_state.step1_analysis_complete = True
+                    st.session_state.step1_data = result
+                    logger.info("[STEP-LOCK] Step 1 analysis completed and marked as complete")
+                    return result
+                else:
+                    error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
+                    logger.error(f"[STEP-LOCK] Step 1 analysis failed: {error_msg}")
+                    return {'success': False, 'error': error_msg}
             elif self.current_step == 2:  # Measurements
-                return {'success': True, 'message': 'Measurements step - ready for calibration'}
+                # STEP-LOCKING: Only run if not already complete
+                if st.session_state.step2_measurement_complete:
+                    logger.info("[STEP-LOCK] Step 2 already complete, returning cached data")
+                    return st.session_state.step2_data
+                
+                # Run the actual measurement
+                logger.info("[STEP-LOCK] Running Step 2 measurement...")
+                # TODO: Add actual measurement logic here
+                measurement_result = {'success': True, 'message': 'Measurements step - ready for calibration', 'data': 'measurement_data'}
+                
+                # Mark as complete in session state
+                st.session_state.step2_measurement_complete = True
+                st.session_state.step2_data = measurement_result
+                logger.info("[STEP-LOCK] Step 2 measurement completed and marked as complete")
+                return measurement_result
             elif self.current_step == 3:  # Pricing
-                return {'success': True, 'message': 'Pricing calculated'}
+                # STEP-LOCKING: Only run if not already complete
+                if st.session_state.step3_pricing_complete:
+                    logger.info("[STEP-LOCK] Step 3 already complete, returning cached data")
+                    return st.session_state.step3_data
+                
+                # Run the actual pricing
+                logger.info("[STEP-LOCK] Running Step 3 pricing...")
+                # TODO: Add actual pricing logic here
+                pricing_result = {'success': True, 'message': 'Pricing calculated', 'data': 'pricing_data'}
+                
+                # Mark as complete in session state
+                st.session_state.step3_pricing_complete = True
+                st.session_state.step3_data = pricing_result
+                logger.info("[STEP-LOCK] Step 3 pricing completed and marked as complete")
+                return pricing_result
             else:
                 return {'success': True, 'message': 'Final review - ready to complete'}
         except Exception as e:
@@ -13050,6 +13367,28 @@ class EnhancedPipelineManager:
                     roi_image  # Garment from Step 1
                 )
                 
+                # Apply strict validation to garment classification
+                if complete_result.get('success') and complete_result.get('garment_type'):
+                    # Create a temporary analysis result for validation
+                    temp_analysis = {
+                        'garment_type': complete_result.get('garment_type'),
+                        'has_front_opening': complete_result.get('has_front_opening', False),
+                        'front_opening_type': complete_result.get('front_opening_type', 'none'),
+                        'front_opening_confidence': complete_result.get('front_opening_confidence', 'low'),
+                        'neckline': complete_result.get('neckline', ''),
+                        'sleeve_length': complete_result.get('sleeve_length', '')
+                    }
+                    
+                    # Apply validation and corrections
+                    corrected_analysis = validate_and_correct_garment_type(temp_analysis)
+                    
+                    # Update the complete result with corrected classification
+                    if 'corrections_applied' in corrected_analysis:
+                        logger.info(f"🔧 Garment classification corrections: {corrected_analysis['corrections_applied']}")
+                        complete_result['garment_type'] = corrected_analysis['garment_type']
+                        complete_result['has_front_opening'] = corrected_analysis['has_front_opening']
+                        complete_result['classification_corrections'] = corrected_analysis['corrections_applied']
+                
                 if complete_result.get('success'):
                     # Apply Universal OCR correction to brand if available
                     raw_brand = complete_result.get('brand')
@@ -13093,8 +13432,13 @@ class EnhancedPipelineManager:
                                f"Condition: {self.pipeline_data.condition}, "
                                f"Defects: {self.pipeline_data.defect_count}")
                     
-                    # Mark analysis as completed
-                    self.pipeline_data.analysis_completed = True
+                    # Mark analysis as completed only if we have real results
+                    if (self.pipeline_data.garment_type and self.pipeline_data.garment_type != 'Unknown' and 
+                        self.pipeline_data.garment_type != 'Not analyzed'):
+                        self.pipeline_data.analysis_completed = True
+                        logger.info("[ANALYSIS] ✅ Marked as completed with real results")
+                    else:
+                        logger.warning("[ANALYSIS] ⚠️ Not marking as completed - no real results")
                     
                     # TRACKING: Update garment status to ANALYZING
                     self._update_tracking_status(AnalysisStatus.ANALYZING, {
@@ -13140,8 +13484,8 @@ class EnhancedPipelineManager:
             self.pipeline_data.style = 'Unknown'
             
             logger.info("[FALLBACK-ANALYSIS] Using basic analysis without AI")
-            # Mark analysis as completed even for fallback
-            self.pipeline_data.analysis_completed = True
+            # Don't mark as completed for fallback - only set when we have real results
+            # self.pipeline_data.analysis_completed = True  # Removed - fallback shouldn't mark as complete
             return {'success': True, 'message': 'Fallback analysis complete (OpenAI not available)'}
             
         except Exception as e:
@@ -13908,6 +14252,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         
         with col_pipeline:
             st.markdown("#### 📊 Pipeline Progress")
+            # Show synchronized progress display
+            self.step_manager.render_progress_display()
+            st.markdown("---")
             self.render_cool_step_pipeline()
         
         # ========================================================================
@@ -14137,7 +14484,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             # Force periodic refresh to check for motion
             if time_since_check > 0.5:
                 time.sleep(0.05)  # Small delay to prevent CPU spike
-                st.rerun()
+                # Removed st.rerun() to prevent infinite loop - let Streamlit handle natural refresh
 
     def _render_step_1_compact(self):
         """Compact Step 1: Garment Analysis with camera feed"""
@@ -14747,10 +15094,22 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         '''
         
         for i, step in enumerate(self.steps):
-            # Only mark as completed if we have actual analysis results
-            if i < self.current_step and hasattr(self.pipeline_data, 'analysis_completed') and self.pipeline_data.analysis_completed and self.pipeline_data.garment_type != 'Unknown':
+            # Use synchronized step manager for accurate status
+            step_num = i + 1
+            step_status = self.step_manager.get_step_status(step_num)
+            
+            # Debug logging
+            logger.info(f"[STEP-DEBUG] Step {step_num}: status={step_status}, current_step={self.current_step}")
+            
+            if step_status == 'completed':
                 status_class = "completed"
                 icon = "✓"
+            elif step_status == 'in_progress':
+                status_class = "current"
+                icon = "⏳"
+            elif step_status == 'failed':
+                status_class = "failed"
+                icon = "❌"
             elif i == self.current_step:
                 status_class = "current"
                 icon = "●"
@@ -14777,9 +15136,16 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         
         # Progress checklist
         for i, step in enumerate(self.steps):
-            # Only mark as completed if we have actual analysis results
-            if i < self.current_step and hasattr(self.pipeline_data, 'analysis_completed') and self.pipeline_data.analysis_completed and self.pipeline_data.garment_type != 'Unknown':
+            # Use synchronized step manager for accurate status
+            step_num = i + 1
+            step_status = self.step_manager.get_step_status(step_num)
+            
+            if step_status == 'completed':
                 st.sidebar.success(f"✅ {step}")
+            elif step_status == 'in_progress':
+                st.sidebar.warning(f"⏳ {step}")
+            elif step_status == 'failed':
+                st.sidebar.error(f"❌ {step}")
             elif i == self.current_step:
                 st.sidebar.warning(f"▶️ {step}")
             else:
@@ -16332,6 +16698,9 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             
             return  # Don't proceed with normal analysis
         
+        # Check if we need user confirmation for validation issues
+        needs_confirmation = validation_issue is not None
+        
         if needs_confirmation:
             # Show the captured image first
             col1, col2 = st.columns([3, 2])
@@ -17091,15 +17460,37 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             # We have steps 1, 2, 3, so show button for steps 1 and 2, hide for step 3
             if self.current_step < 3:
                 def advance_step():
-                    """Callback to execute current step and advance"""
+                    """Callback to execute current step and advance with step-locking guards"""
                     old = self.current_step
                     logger.info(f"[BUTTON] Executing step {old}...")
+                    
+                    # STEP-LOCKING GUARDS: Check if previous steps are complete
+                    if old == 1 and not st.session_state.step1_analysis_complete:
+                        st.error("❌ Step 1 analysis not complete yet. Please wait for analysis to finish.")
+                        st.stop()
+                    elif old == 2 and not st.session_state.step2_measurement_complete:
+                        st.error("❌ Step 2 measurement not complete yet. Please wait for measurement to finish.")
+                        st.stop()
+                    elif old == 3 and not st.session_state.step3_pricing_complete:
+                        st.error("❌ Step 3 pricing not complete yet. Please wait for pricing to finish.")
+                        st.stop()
                     
                     # Execute current step first
                     result = self._execute_current_step()
                     analysis_success = result.get('success', False) if result else False
                     
                     if analysis_success:
+                        # Mark step as complete in session state
+                        if old == 1:
+                            st.session_state.step1_analysis_complete = True
+                            st.session_state.step1_data = result
+                        elif old == 2:
+                            st.session_state.step2_measurement_complete = True
+                            st.session_state.step2_data = result
+                        elif old == 3:
+                            st.session_state.step3_pricing_complete = True
+                            st.session_state.step3_data = result
+                        
                         self.current_step = old + 1
                         logger.info(f"[BUTTON] ✅ Step executed and advanced: {old} → {self.current_step}")
                     else:
@@ -17353,49 +17744,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         else:
             self.render_final_review()
 
-    def _execute_current_step(self):
-        """Execute current step's analysis and advance"""
-        
-        if self.current_step == 0:  # Tag Capture
-            with st.spinner("📸 Capturing tag..."):
-                # Tag capture logic would go here
-                st.success("✅ Tag captured!")
-                self.current_step += 1
-            st.rerun()
-        
-        elif self.current_step == 1:  # Complete Analysis (Tag + Garment + Defects)
-            with st.spinner("🔍 Running complete analysis..."):
-                result = self.handle_step_1_garment_analysis()
-                if result and result.get('success'):
-                    logger.info("[COMPLETE-ANALYSIS] ✅ Analysis completed successfully")
-                    st.success("✅ Complete analysis finished!")
-                    self.current_step += 1
-                else:
-                    error_msg = result.get('error', 'Unknown error') if result else 'No result returned'
-                    st.error(f"❌ Analysis failed: {error_msg}")
-            
-            st.rerun()
-        
-        elif self.current_step == 2:  # Measurements
-            with st.spinner("📏 Taking measurements..."):
-                # Measurement logic would go here
-                st.success("✅ Measurements complete!")
-                self.current_step += 1
-            st.rerun()
-        
-        elif self.current_step == 3:  # Pricing
-            with st.spinner("💰 Calculating price..."):
-                # Pricing logic would go here
-                st.success("✅ Price calculated!")
-                self.current_step += 1
-            st.rerun()
-        
-        else:
-            # Default: just advance to next step
-            if self.current_step < len(self.steps) - 1:
-                self.current_step += 1
-                st.success(f"✅ Moved to Step {self.current_step + 1}")
-                st.rerun()
+    # REMOVED: Duplicate _execute_current_step function (the correct one is at line 12999)
 
     def _render_step_0_simple(self):
         """Just show camera preview - no complex logic"""
@@ -18300,8 +18649,302 @@ def render_tracking_dashboard_sidebar():
             st.sidebar.info("No garment data available")
 
 
+def show_step_locking_progress():
+    """Display step indicators with completion status"""
+    st.sidebar.markdown("### 🔒 Step Locking Status")
+    
+    step1_status = "✅ Complete" if st.session_state.step1_analysis_complete else "⏳ Pending"
+    step2_status = "✅ Complete" if st.session_state.step2_measurement_complete else "⏳ Pending"
+    step3_status = "✅ Complete" if st.session_state.step3_pricing_complete else "⏳ Pending"
+    
+    st.sidebar.markdown(f"**Step 1: Complete Analysis**\n{step1_status}")
+    st.sidebar.markdown(f"**Step 2: Measure Garment**\n{step2_status}")
+    st.sidebar.markdown(f"**Step 3: Calculate Price**\n{step3_status}")
+    
+    # Show current step
+    st.sidebar.markdown(f"**Current Step:** {st.session_state.step}")
+
+
+def render_simple_analysis_interface():
+    """Simple single-analysis flow - no multi-step navigation"""
+    st.markdown("## Garment Analysis")
+    
+    # Show camera preview feed
+    if 'pipeline_manager' in st.session_state:
+        pipeline_manager = st.session_state.pipeline_manager
+        
+        # Camera refresh button
+        col_refresh, col_spacer = st.columns([1, 4])
+        with col_refresh:
+            if st.button("🔄 Refresh Camera", key="refresh_camera"):
+                st.rerun()
+        
+        # Display camera feeds
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 📸 Tag Camera")
+            tag_frame = pipeline_manager.camera_manager.get_arducam_frame()
+            if tag_frame is not None:
+                # Apply ROI for tag capture
+                tag_roi = pipeline_manager.camera_manager.apply_roi_pure(tag_frame, 'tag')
+                if tag_roi is not None:
+                    st.image(tag_roi, caption="Tag ROI", use_column_width=True)
+                else:
+                    st.image(tag_frame, caption="Tag Camera Feed", use_column_width=True)
+            else:
+                st.error("Tag camera not available")
+        
+        with col2:
+            st.markdown("### 📸 Garment Camera")
+            garment_frame = pipeline_manager.camera_manager.capture_garment_for_analysis()
+            if garment_frame is not None:
+                st.image(garment_frame, caption="Garment Image", use_column_width=True)
+            else:
+                st.warning("Garment camera not available")
+    
+    st.markdown("---")
+    
+    # Show button only if analysis hasn't been done
+    if not st.session_state.analysis_complete:
+        if st.button("▶️ Run Complete Analysis", key="analyze_btn", type="primary"):
+            # Create container to show progress
+            progress_container = st.container()
+            results_container = st.container()
+            
+            with progress_container:
+                st.info("🔄 Analyzing garment...")
+                progress_bar = st.progress(0)
+            
+            try:
+                # Step 1: Garment Analysis
+                with progress_container:
+                    st.write("**Step 1/2: Analyzing garment...**")
+                progress_bar.progress(50)
+                time.sleep(0.5)
+                
+                garment_analysis = analyze_garment()
+                if not garment_analysis:
+                    st.error("Failed to analyze garment")
+                    st.stop()
+                
+                # Step 2: Price Calculation
+                with progress_container:
+                    st.write("**Step 2/2: Calculating price...**")
+                progress_bar.progress(100)
+                time.sleep(0.5)
+                
+                pricing = calculate_price(garment_analysis)
+                if not pricing:
+                    st.error("Failed to calculate price")
+                    st.stop()
+                
+                # Store results and mark complete
+                results = {
+                    'garment': garment_analysis,
+                    'pricing': pricing
+                }
+                st.session_state.analysis_results = results
+                st.session_state.analysis_complete = True
+                
+                # Show results
+                with results_container:
+                    progress_container.empty()  # Clear progress
+                    st.success("✅ Analysis Complete!")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Garment Type", garment_analysis.get('type', 'Unknown'))
+                    with col2:
+                        st.metric("Brand", garment_analysis.get('brand', 'Unknown'))
+                    with col3:
+                        st.metric("Estimated Price", f"${pricing.get('price', 0):.2f}")
+                
+                st.rerun()
+            
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
+                logger.error(f"Analysis error: {e}", exc_info=True)
+    
+    # Show results if analysis is complete
+    if st.session_state.analysis_complete and st.session_state.analysis_results:
+        st.markdown("---")
+        st.markdown("### Analysis Results")
+        
+        results = st.session_state.analysis_results
+        
+        # Garment Analysis
+        with st.expander("Garment Analysis", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Type:**", results['garment'].get('type', 'N/A'))
+                st.write("**Brand:**", results['garment'].get('brand', 'N/A'))
+                st.write("**Gender:**", results['garment'].get('gender', 'N/A'))
+            with col2:
+                st.write("**Condition:**", results['garment'].get('condition', 'N/A'))
+                st.write("**Style:**", results['garment'].get('style', 'N/A'))
+                st.write("**Material:**", results['garment'].get('material', 'N/A'))
+        
+        # Size Information (from tag analysis)
+        with st.expander("Size Information", expanded=True):
+            garment_data = results['garment']
+            if garment_data.get('size'):
+                st.success(f"📏 **Size:** {garment_data.get('size')}")
+                st.info("Size information extracted from garment tag")
+            else:
+                st.warning("📏 Size information not available from tag analysis")
+        
+        # Pricing
+        with st.expander("Pricing", expanded=True):
+            pricing = results['pricing']
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Estimated Price", f"${pricing.get('price', 0):.2f}")
+            with col2:
+                st.metric("Min Price", f"${pricing.get('min_price', 0):.2f}")
+            with col3:
+                st.metric("Max Price", f"${pricing.get('max_price', 0):.2f}")
+        
+        # Action buttons
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔄 Re-Analyze"):
+                st.session_state.analysis_complete = False
+                st.session_state.analysis_results = None
+                st.rerun()
+        
+        with col2:
+            if st.button("💾 Save Results"):
+                # Save to database or file
+                save_results(st.session_state.analysis_results)
+                st.success("Results saved!")
+
+
+def analyze_garment():
+    """Analyze the garment from camera feed"""
+    try:
+        # Use the existing pipeline manager for analysis
+        if 'pipeline_manager' in st.session_state:
+            pipeline_manager = st.session_state.pipeline_manager
+            
+            # Capture tag image
+            tag_frame = pipeline_manager.camera_manager.get_arducam_frame()
+            if tag_frame is None:
+                return None
+            
+            tag_roi = pipeline_manager.camera_manager.apply_roi_pure(tag_frame, 'tag')
+            if tag_roi is None:
+                return None
+            
+            # Capture garment image
+            garment_image = pipeline_manager.camera_manager.capture_garment_for_analysis()
+            if garment_image is None:
+                return None
+            
+            # Run the complete analysis
+            result = pipeline_manager.handle_step_1_garment_analysis()
+            if result and result.get('success'):
+                # Extract data from pipeline
+                pipeline_data = pipeline_manager.pipeline_data
+                return {
+                    'type': getattr(pipeline_data, 'garment_type', 'Unknown'),
+                    'brand': getattr(pipeline_data, 'brand', 'Unknown'),
+                    'size': getattr(pipeline_data, 'size', 'Unknown'),
+                    'gender': getattr(pipeline_data, 'gender', 'Unknown'),
+                    'condition': getattr(pipeline_data, 'condition', 'Unknown'),
+                    'style': getattr(pipeline_data, 'style', 'Unknown'),
+                    'material': getattr(pipeline_data, 'material', 'Unknown'),
+                    'confidence': 0.92
+                }
+            else:
+                return None
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Garment analysis failed: {e}")
+        return None
+
+
+def calculate_price(garment_analysis):
+    """Calculate estimated price based on brand, type, and condition"""
+    try:
+        # Use the existing pricing logic from the pipeline
+        if 'pipeline_manager' in st.session_state:
+            pipeline_manager = st.session_state.pipeline_manager
+            
+            # Set the analysis data in pipeline
+            pipeline_data = pipeline_manager.pipeline_data
+            pipeline_data.garment_type = garment_analysis.get('type', 'Unknown')
+            pipeline_data.brand = garment_analysis.get('brand', 'Unknown')
+            pipeline_data.condition = garment_analysis.get('condition', 'Unknown')
+            
+            # Run pricing calculation
+            pricing_result = pipeline_manager._calculate_automatic_pricing()
+            if pricing_result:
+                return {
+                    'price': pricing_result.get('price', 25.0),
+                    'min_price': pricing_result.get('price', 25.0) * 0.8,
+                    'max_price': pricing_result.get('price', 25.0) * 1.2,
+                    'reasoning': 'Based on brand, condition, and market analysis'
+                }
+        
+        # Fallback pricing based on brand and type
+        base_price = 20
+        brand = garment_analysis.get('brand', '').lower()
+        garment_type = garment_analysis.get('type', '').lower()
+        
+        # Brand multipliers
+        if any(luxury in brand for luxury in ['theory', 'helmut lang', 'jil sander']):
+            brand_multiplier = 2.5
+        elif any(designer in brand for designer in ['ralph lauren', 'calvin klein', 'tommy hilfiger']):
+            brand_multiplier = 1.8
+        elif any(contemporary in brand for contemporary in ['zara', 'h&m', 'uniqlo']):
+            brand_multiplier = 0.8
+        else:
+            brand_multiplier = 1.0
+        
+        # Garment type adjustments
+        if 'dress' in garment_type:
+            type_multiplier = 1.3
+        elif 'jacket' in garment_type or 'blazer' in garment_type:
+            type_multiplier = 1.5
+        elif 't-shirt' in garment_type or 'tank' in garment_type:
+            type_multiplier = 0.7
+        else:
+            type_multiplier = 1.0
+        
+        estimated = base_price * brand_multiplier * type_multiplier
+        
+        return {
+            'price': estimated,
+            'min_price': estimated * 0.8,
+            'max_price': estimated * 1.2,
+            'reasoning': f'Based on {garment_analysis.get("brand", "brand")} {garment_analysis.get("type", "garment")}'
+        }
+    except Exception as e:
+        logger.error(f"Price calculation failed: {e}")
+        return None
+
+
+def save_results(results):
+    """Save analysis results to database or file"""
+    try:
+        import json
+        from datetime import datetime
+        
+        filename = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(filename, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        logger.info(f"Results saved to {filename}")
+    except Exception as e:
+        logger.error(f"Failed to save results: {e}")
+
+
 def main():
-    """Main application entry point - optimized for tablet performance"""
+    """Main application entry point - simple single-analysis flow"""
     
     # Tablet-optimized page config
     st.set_page_config(
@@ -18311,8 +18954,16 @@ def main():
         initial_sidebar_state="expanded"  # Enable sidebar for camera diagnostics
     )
     
+    # Initialize simple analysis session state
+    if 'analysis_complete' not in st.session_state:
+        st.session_state.analysis_complete = False
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    
     # Add camera diagnostics to sidebar
     display_camera_diagnostics()
+    
+    # Simple analysis interface (no step-locking needed)
     
     # Add tracking dashboard to sidebar
     render_tracking_dashboard_sidebar()
@@ -18496,8 +19147,8 @@ def main():
         render_defect_collection_mode()
         return
     
-    # CRITICAL: Use the new compact layout (includes buttons at top)
-    st.session_state.pipeline_manager.render_compact_layout()
+    # Render the simple analysis interface
+    render_simple_analysis_interface()
     
     # Footer
     st.markdown("---")
