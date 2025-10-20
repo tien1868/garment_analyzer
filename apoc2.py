@@ -83,6 +83,20 @@ import requests
 import json
 import os
 
+# eBay research imports
+from ebay_research import EbayResearchAPI, analyze_garment_with_ebay_pricing
+
+# Learning system imports
+from learning_system import LearningSystem, show_learning_system_ui, create_correction_form_ui
+
+# Brand translation and tag archive imports
+import shutil
+
+# Universal OCR correction imports
+from collections import defaultdict, Counter
+import difflib
+import re
+
 # Load environment variables from api.env file
 try:
     from dotenv import load_dotenv
@@ -107,6 +121,790 @@ except Exception as e:
 # Rate limiting decorator for eBay API
 
 # ============================================
+# UNIVERSAL OCR CORRECTION ENGINE
+# ============================================
+
+class UniversalOCRCorrector:
+    """
+    Learn OCR error patterns universally.
+    Apply learned patterns to correct similar mistakes across all fields.
+    
+    Examples:
+    - "for all mankind" → "7 For All Mankind" (brand)
+    - "sizs M" → "size M" (size field)
+    - "100 % cotton" → "100% cotton" (material)
+    - "Red-ish" → "Red" (color)
+    - All learned with the same system!
+    """
+    
+    def __init__(self, db_file='universal_ocr_corrections.json'):
+        self.db_file = db_file
+        self.db = self._load_db()
+        logger.info("✅ Universal OCR Corrector initialized")
+    
+    def learn_correction(self, 
+                        ocr_text: str, 
+                        corrected_text: str, 
+                        field_type: str = "generic",
+                        confidence: float = 1.0) -> bool:
+        """
+        Learn a single correction and analyze the pattern.
+        
+        Args:
+            ocr_text: What OCR read (wrong)
+            corrected_text: What it should be (right)
+            field_type: Context (brand, size, material, color, garment_type, etc)
+            confidence: How certain (0.0-1.0)
+        """
+        
+        if not ocr_text or not corrected_text or ocr_text == corrected_text:
+            return False
+        
+        # Normalize inputs
+        ocr_clean = ocr_text.strip()
+        corrected_clean = corrected_text.strip()
+        
+        # Analyze the error pattern
+        pattern = self._analyze_error_pattern(ocr_clean, corrected_clean)
+        
+        # Store correction with pattern metadata
+        correction_entry = {
+            'ocr': ocr_clean,
+            'corrected': corrected_clean,
+            'field_type': field_type,
+            'confidence': confidence,
+            'timestamp': datetime.now().isoformat(),
+            'pattern': pattern,
+            'pattern_category': pattern.get('category')
+        }
+        
+        # Initialize field type if needed
+        if field_type not in self.db:
+            self.db[field_type] = {
+                'corrections': [],
+                'patterns': defaultdict(int),
+                'stats': {}
+            }
+        
+        # Add correction
+        self.db[field_type]['corrections'].append(correction_entry)
+        
+        # Track pattern frequency
+        pattern_key = self._pattern_to_key(pattern)
+        self.db[field_type]['patterns'][pattern_key] += 1
+        
+        # Save
+        self._save_db()
+        
+        logger.info(f"📝 LEARNED [{field_type}]: '{ocr_clean}' → '{corrected_clean}'")
+        logger.debug(f"   Pattern: {pattern.get('category')}")
+        
+        return True
+    
+    def _analyze_error_pattern(self, ocr: str, corrected: str) -> Dict:
+        """
+        Analyze WHAT changed between OCR and corrected text.
+        Categorize the type of error.
+        """
+        pattern = {
+            'category': None,
+            'details': {}
+        }
+        
+        ocr_lower = ocr.lower()
+        corrected_lower = corrected.lower()
+        
+        # Character-level analysis
+        if len(ocr) != len(corrected):
+            if len(ocr) < len(corrected):
+                pattern['category'] = 'missing_chars'
+                pattern['details']['missing_count'] = len(corrected) - len(ocr)
+            else:
+                pattern['category'] = 'extra_chars'
+                pattern['details']['extra_count'] = len(ocr) - len(corrected)
+        else:
+            # Same length but different characters
+            diff_positions = [i for i, (a, b) in enumerate(zip(ocr, corrected)) if a != b]
+            if diff_positions:
+                pattern['category'] = 'char_substitution'
+                pattern['details']['positions'] = diff_positions
+                pattern['details']['count'] = len(diff_positions)
+                
+                # Find common substitutions
+                substitutions = []
+                for pos in diff_positions:
+                    substitutions.append({
+                        'position': pos,
+                        'from': ocr[pos],
+                        'to': corrected[pos]
+                    })
+                pattern['details']['substitutions'] = substitutions
+        
+        # Word-level analysis
+        ocr_words = ocr.split()
+        corrected_words = corrected.split()
+        
+        if len(ocr_words) != len(corrected_words):
+            if len(ocr_words) < len(corrected_words):
+                pattern['category'] = 'missing_words'
+                pattern['details']['missing_words'] = set(corrected_words) - set(ocr_words)
+            else:
+                pattern['category'] = 'extra_words'
+                pattern['details']['extra_words'] = set(ocr_words) - set(corrected_words)
+        
+        # Whitespace/formatting
+        if ocr != corrected and ocr_lower == corrected_lower:
+            pattern['category'] = 'case_mismatch'
+            pattern['details']['original_case'] = ocr
+            pattern['details']['corrected_case'] = corrected
+        
+        # Punctuation
+        if re.sub(r'[^\w\s]', '', ocr) == re.sub(r'[^\w\s]', '', corrected):
+            pattern['category'] = 'punctuation_error'
+            pattern['details']['ocr_punct'] = ocr
+            pattern['details']['corrected_punct'] = corrected
+        
+        # Special characters
+        if pattern['category'] is None:
+            if any(ord(c) > 127 for c in ocr) or any(ord(c) > 127 for c in corrected):
+                pattern['category'] = 'unicode_error'
+            elif ' ' not in ocr and ' ' not in corrected:
+                pattern['category'] = 'single_word_substitution'
+            else:
+                pattern['category'] = 'complex_pattern'
+        
+        return pattern
+    
+    def _pattern_to_key(self, pattern: Dict) -> str:
+        """Convert pattern to hashable key"""
+        category = pattern.get('category', 'unknown')
+        details = pattern.get('details', {})
+        
+        if category == 'char_substitution':
+            count = details.get('count', 0)
+            return f"{category}_{count}"
+        elif category == 'missing_chars':
+            count = details.get('missing_count', 0)
+            return f"{category}_{count}"
+        elif category == 'missing_words':
+            count = len(details.get('missing_words', set()))
+            return f"{category}_{count}"
+        else:
+            return category
+    
+    def correct_text(self, text: str, field_type: str = "generic") -> Tuple[str, Optional[Dict]]:
+        """
+        Correct OCR text using learned patterns.
+        
+        Returns:
+            (corrected_text, correction_details)
+        """
+        
+        if field_type not in self.db or not self.db[field_type]['corrections']:
+            return text, None
+        
+        # Try exact match first
+        for correction in self.db[field_type]['corrections']:
+            if correction['ocr'].lower() == text.lower():
+                return correction['corrected'], {
+                    'match_type': 'exact',
+                    'confidence': correction['confidence']
+                }
+        
+        # Try fuzzy match with lower threshold for better matching
+        ocr_texts = [c['ocr'] for c in self.db[field_type]['corrections']]
+        matches = difflib.get_close_matches(text.lower(), [o.lower() for o in ocr_texts], n=1, cutoff=0.5)
+        
+        if matches:
+            for correction in self.db[field_type]['corrections']:
+                if correction['ocr'].lower() == matches[0]:
+                    confidence = difflib.SequenceMatcher(None, text.lower(), matches[0]).ratio()
+                    return correction['corrected'], {
+                        'match_type': 'fuzzy',
+                        'confidence': confidence,
+                        'similarity': confidence
+                    }
+        
+        # Try pattern-based correction
+        corrected = self._apply_pattern_correction(text, field_type)
+        if corrected != text:
+            return corrected, {'match_type': 'pattern', 'confidence': 0.6}
+        
+        return text, None
+    
+    def _apply_pattern_correction(self, text: str, field_type: str) -> str:
+        """Apply learned patterns to correct new text"""
+        
+        if field_type not in self.db:
+            return text
+        
+        corrections = self.db[field_type]['corrections']
+        
+        # Find most common pattern
+        most_common_pattern = None
+        pattern_count = 0
+        
+        for correction in corrections:
+            pattern_key = self._pattern_to_key(correction['pattern'])
+            if self.db[field_type]['patterns'].get(pattern_key, 0) > pattern_count:
+                pattern_count = self.db[field_type]['patterns'][pattern_key]
+                most_common_pattern = correction['pattern']
+        
+        if not most_common_pattern:
+            return text
+        
+        category = most_common_pattern.get('category')
+        
+        # Apply pattern fixes
+        if category == 'case_mismatch':
+            # Find the most common case pattern
+            case_patterns = [c for c in corrections if c['pattern'].get('category') == 'case_mismatch']
+            if case_patterns:
+                # Use most frequent case pattern
+                return case_patterns[0]['corrected']
+        
+        elif category == 'punctuation_error':
+            # Remove common punctuation errors
+            corrected = text
+            for correction in corrections:
+                if correction['pattern'].get('category') == 'punctuation_error':
+                    # Try replacing
+                    if correction['ocr'] in text:
+                        corrected = text.replace(correction['ocr'], correction['corrected'])
+                        return corrected
+        
+        elif category == 'missing_chars':
+            # Common missing character patterns
+            for correction in corrections:
+                if correction['pattern'].get('category') == 'missing_chars':
+                    # Try common substitutions
+                    if correction['ocr'] in text.lower():
+                        return text.replace(correction['ocr'], correction['corrected'])
+        
+        return text
+    
+    def get_suggestions(self, text: str, field_type: str = "generic", top_n: int = 3) -> List[Tuple[str, float]]:
+        """
+        Get correction suggestions for text, ranked by confidence.
+        """
+        
+        if field_type not in self.db:
+            return []
+        
+        corrections = self.db[field_type]['corrections']
+        ocr_texts = [c['ocr'] for c in corrections]
+        
+        # Find close matches
+        matches = difflib.get_close_matches(text, ocr_texts, n=top_n, cutoff=0.6)
+        
+        suggestions = []
+        for match in matches:
+            for correction in corrections:
+                if correction['ocr'] == match:
+                    confidence = difflib.SequenceMatcher(None, text.lower(), match.lower()).ratio()
+                    suggestions.append((correction['corrected'], confidence))
+        
+        # Sort by confidence
+        suggestions.sort(key=lambda x: x[1], reverse=True)
+        return suggestions
+    
+    def get_field_stats(self, field_type: str) -> Dict:
+        """Get statistics for a field type"""
+        
+        if field_type not in self.db:
+            return {'total_corrections': 0}
+        
+        field_data = self.db[field_type]
+        corrections = field_data['corrections']
+        
+        stats = {
+            'total_corrections': len(corrections),
+            'unique_ocr_errors': len(set(c['ocr'] for c in corrections)),
+            'unique_corrections': len(set(c['corrected'] for c in corrections)),
+            'average_confidence': sum(c['confidence'] for c in corrections) / len(corrections) if corrections else 0,
+            'error_patterns': dict(field_data['patterns']),
+            'most_common_pattern': max(field_data['patterns'].items(), key=lambda x: x[1])[0] if field_data['patterns'] else None
+        }
+        
+        return stats
+    
+    def _load_db(self) -> Dict:
+        """Load correction database"""
+        try:
+            if os.path.exists(self.db_file):
+                with open(self.db_file) as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load DB: {e}")
+        
+        return {}
+    
+    def _save_db(self):
+        """Save correction database"""
+        try:
+            # Convert defaultdict to regular dict for JSON
+            db_to_save = {}
+            for field_type, data in self.db.items():
+                db_to_save[field_type] = {
+                    'corrections': data['corrections'],
+                    'patterns': dict(data['patterns']),
+                    'stats': data.get('stats', {})
+                }
+            
+            with open(self.db_file, 'w') as f:
+                json.dump(db_to_save, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"Could not save DB: {e}")
+
+# ============================================
+# TAG IMAGE ARCHIVE SYSTEM
+# ============================================
+
+class TagImageArchive:
+    """Store tag images for future reference and training"""
+    
+    def __init__(self, archive_dir='tag_images'):
+        self.archive_dir = archive_dir
+        self.metadata_file = os.path.join(archive_dir, 'manifest.json')
+        os.makedirs(archive_dir, exist_ok=True)
+        self.manifest = self._load_manifest()
+        logger.info("✅ Tag Image Archive initialized")
+    
+    def save_tag_image(self, image_np, pipeline_data, tag_result):
+        """
+        Save tag image with metadata for future use
+        
+        Args:
+            image_np: numpy array of tag image
+            pipeline_data: PipelineData object with garment info
+            tag_result: result from tag analysis
+        """
+        try:
+            # Create unique filename based on brand + size + timestamp
+            brand = (pipeline_data.brand or 'unknown').replace(' ', '_')
+            size = (pipeline_data.size or 'unknown').replace(' ', '_')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            filename = f"{brand}_{size}_{timestamp}.jpg"
+            filepath = os.path.join(self.archive_dir, filename)
+            
+            # Save image
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(filepath, image_bgr)
+            
+            # Create metadata entry
+            metadata_entry = {
+                'filename': filename,
+                'filepath': filepath,
+                'timestamp': timestamp,
+                'brand': pipeline_data.brand,
+                'size': pipeline_data.size,
+                'garment_type': pipeline_data.garment_type,
+                'condition': pipeline_data.condition,
+                'tag_result': {
+                    'method': tag_result.get('method'),
+                    'confidence': tag_result.get('confidence'),
+                    'vintage_indicators': tag_result.get('vintage_indicators', [])
+                },
+                'image_hash': self._hash_image(image_np)
+            }
+            
+            # Add to manifest
+            self.manifest.append(metadata_entry)
+            self._save_manifest()
+            
+            logger.info(f"✅ Saved tag image: {filename}")
+            return filepath
+            
+        except Exception as e:
+            logger.error(f"Failed to save tag image: {e}")
+            return None
+    
+    def _hash_image(self, image_np):
+        """Create a hash of the image for deduplication"""
+        import hashlib
+        image_bytes = image_np.tobytes()
+        return hashlib.md5(image_bytes).hexdigest()
+    
+    def find_similar_tags(self, image_hash, threshold=0.95):
+        """Find similar tags in archive"""
+        similar = []
+        for entry in self.manifest:
+            if entry.get('image_hash') == image_hash:
+                similar.append(entry)
+        return similar
+    
+    def get_stats(self):
+        """Get archive statistics"""
+        try:
+            total_images = len(self.manifest)
+            unique_brands = len(set(e.get('brand', '') for e in self.manifest if e.get('brand')))
+            unique_sizes = len(set(e.get('size', '') for e in self.manifest if e.get('size')))
+            
+            # Calculate archive size
+            archive_size_mb = 0
+            if os.path.exists(self.archive_dir):
+                for f in os.listdir(self.archive_dir):
+                    if f.endswith('.jpg'):
+                        try:
+                            archive_size_mb += os.path.getsize(os.path.join(self.archive_dir, f))
+                        except:
+                            pass
+                archive_size_mb = archive_size_mb / 1024 / 1024
+            
+            return {
+                'total_images': total_images,
+                'unique_brands': unique_brands,
+                'unique_sizes': unique_sizes,
+                'archive_size_mb': round(archive_size_mb, 1)
+            }
+        except Exception as e:
+            logger.error(f"Error getting archive stats: {e}")
+            return {'total_images': 0, 'unique_brands': 0, 'unique_sizes': 0, 'archive_size_mb': 0}
+    
+    def _load_manifest(self):
+        """Load existing manifest"""
+        try:
+            if os.path.exists(self.metadata_file):
+                with open(self.metadata_file) as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load manifest: {e}")
+        return []
+    
+    def _save_manifest(self):
+        """Save manifest"""
+        try:
+            with open(self.metadata_file, 'w') as f:
+                json.dump(self.manifest, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"Could not save manifest: {e}")
+    
+    def export_for_training(self, output_dir='training_tags'):
+        """Export tag images organized by brand for training"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Group by brand
+        by_brand = {}
+        for entry in self.manifest:
+            brand = entry.get('brand', 'unknown')
+            if brand not in by_brand:
+                by_brand[brand] = []
+            by_brand[brand].append(entry)
+        
+        # Copy images
+        count = 0
+        for brand, entries in by_brand.items():
+            brand_dir = os.path.join(output_dir, brand.replace(' ', '_'))
+            os.makedirs(brand_dir, exist_ok=True)
+            
+            for entry in entries:
+                src = entry['filepath']
+                dst = os.path.join(brand_dir, entry['filename'])
+                try:
+                    shutil.copy(src, dst)
+                    count += 1
+                except:
+                    pass
+        
+        logger.info(f"✅ Exported {count} images to {output_dir}")
+        return output_dir
+    
+    def save_brand_tag_for_training(self, tag_image, ocr_result, corrected_brand, metadata=None):
+        """Save brand tag images with OCR results for future ML training"""
+        try:
+            # Create directory structure
+            brand_folder = f'training_data/brands/{corrected_brand.replace(" ", "_").replace("/", "_")}'
+            os.makedirs(brand_folder, exist_ok=True)
+            
+            # Generate unique filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename_base = f'{brand_folder}/{timestamp}'
+            
+            # Save the original tag image
+            image_bgr = cv2.cvtColor(tag_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(f'{filename_base}_original.jpg', image_bgr)
+            
+            # Save preprocessed version (grayscale for OCR training)
+            gray_image = cv2.cvtColor(tag_image, cv2.COLOR_RGB2GRAY)
+            cv2.imwrite(f'{filename_base}_preprocessed.jpg', gray_image)
+            
+            # Save metadata with OCR results
+            training_data = {
+                'timestamp': timestamp,
+                'ocr_raw': ocr_result,
+                'corrected_brand': corrected_brand,
+                'image_path': f'{filename_base}_original.jpg',
+                'preprocessed_path': f'{filename_base}_preprocessed.jpg',
+                'image_size': tag_image.shape,
+                'metadata': metadata or {},
+                'ocr_confidence': metadata.get('confidence', 0.0) if metadata else 0.0
+            }
+            
+            with open(f'{filename_base}_data.json', 'w') as f:
+                json.dump(training_data, f, indent=2)
+            
+            logger.info(f"✅ Saved brand tag training data for: {corrected_brand}")
+            
+            # BONUS: Save to central training database
+            self._append_to_brand_database(training_data)
+            
+            return filename_base
+            
+        except Exception as e:
+            logger.error(f"Failed to save brand tag image: {e}")
+            return None
+    
+    def _append_to_brand_database(self, training_data):
+        """Append to a master CSV for easy training later"""
+        try:
+            csv_path = 'training_data/brand_tag_database.csv'
+            
+            # Create CSV if doesn't exist
+            if not os.path.exists(csv_path):
+                os.makedirs('training_data', exist_ok=True)
+                with open(csv_path, 'w') as f:
+                    f.write('timestamp,brand,ocr_raw,image_path,confidence,image_size\n')
+            
+            # Append new entry
+            with open(csv_path, 'a') as f:
+                f.write(f"{training_data['timestamp']},{training_data['corrected_brand']},{training_data['ocr_raw']},{training_data['image_path']},{training_data['ocr_confidence']},{training_data['image_size']}\n")
+                
+        except Exception as e:
+            logger.error(f"Failed to append to brand database: {e}")
+    
+    def get_training_stats(self):
+        """Get statistics on training data collected"""
+        try:
+            csv_path = 'training_data/brand_tag_database.csv'
+            if not os.path.exists(csv_path):
+                return {'total_images': 0, 'unique_brands': 0, 'brands': []}
+            
+            # Read CSV and get stats
+            brands = []
+            with open(csv_path, 'r') as f:
+                lines = f.readlines()[1:]  # Skip header
+                for line in lines:
+                    if line.strip():
+                        parts = line.strip().split(',')
+                        if len(parts) >= 2:
+                            brands.append(parts[1])  # Brand is second column
+            
+            unique_brands = list(set(brands))
+            return {
+                'total_images': len(brands),
+                'unique_brands': len(unique_brands),
+                'brands': unique_brands
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get training stats: {e}")
+            return {'total_images': 0, 'unique_brands': 0, 'brands': []}
+
+def correct_all_fields_with_learning(analysis_result: Dict, corrector: UniversalOCRCorrector) -> Dict:
+    """
+    Automatically correct all fields using learned patterns
+    """
+    
+    fields_to_correct = {
+        'brand': 'brand',
+        'size': 'size',
+        'material': 'material',
+        'garment_type': 'garment_type',
+        'style': 'style',
+        'color': 'color'
+    }
+    
+    for field_name, field_key in fields_to_correct.items():
+        if field_key in analysis_result:
+            original = analysis_result[field_key]
+            corrected, details = corrector.correct_text(original, field_name)
+            
+            if corrected != original:
+                analysis_result[field_key] = corrected
+                analysis_result[f'{field_key}_corrected'] = True
+                analysis_result[f'{field_key}_correction_details'] = details
+    
+    return analysis_result
+
+def save_brand_correction_for_training(tag_image, ocr_result, corrected_brand, metadata=None):
+    """Save brand tag image for training when correction is made"""
+    if 'tag_image_archive' in st.session_state:
+        archive = st.session_state.tag_image_archive
+        return archive.save_brand_tag_for_training(tag_image, ocr_result, corrected_brand, metadata)
+    return None
+
+def show_universal_corrector_ui(corrector: UniversalOCRCorrector):
+    """Display UI for learning and correcting any field"""
+    import streamlit as st
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔧 Universal OCR Corrector")
+    
+    # Tabs
+    tab1, tab2, tab3 = st.sidebar.tabs(["🎓 Learn", "🔍 Test", "📊 Stats"])
+    
+    with tab1:
+        st.write("**Learn any OCR mistake**")
+        
+        field_type = st.selectbox(
+            "Field Type",
+            ["brand", "size", "material", "color", "garment_type", "style", "other"],
+            key="field_learn"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            ocr_text = st.text_input("OCR Read", placeholder="What OCR saw", key="ocr_learn")
+        with col2:
+            corrected = st.text_input("Correct Text", placeholder="What it should be", key="correct_learn")
+        
+        confidence = st.slider("Confidence", 0.0, 1.0, 0.9, key="conf_learn")
+        
+        if st.button("✅ Learn This Correction", key="btn_learn"):
+            if ocr_text and corrected:
+                # Learn the correction
+                corrector.learn_correction(ocr_text, corrected, field_type, confidence)
+                
+                # If this is a brand correction and we have a tag image, save for training
+                if field_type == 'brand' and 'tag_image_archive' in st.session_state:
+                    archive = st.session_state.tag_image_archive
+                    if hasattr(st.session_state, 'pipeline_data') and hasattr(st.session_state.pipeline_data, 'tag_image'):
+                        tag_image = st.session_state.pipeline_data.tag_image
+                        if tag_image is not None:
+                            # Save brand tag for training
+                            metadata = {
+                                'confidence': confidence,
+                                'field_type': field_type,
+                                'correction_method': 'manual'
+                            }
+                            result = archive.save_brand_tag_for_training(
+                                tag_image, ocr_text, corrected, metadata
+                            )
+                            if result:
+                                st.success(f"✅ Learned & saved training data! '{ocr_text}' → '{corrected}'")
+                            else:
+                                st.success(f"✅ Learned! '{ocr_text}' → '{corrected}' (training save failed)")
+                        else:
+                            st.success(f"✅ Learned! '{ocr_text}' → '{corrected}' (no tag image to save)")
+                    else:
+                        st.success(f"✅ Learned! '{ocr_text}' → '{corrected}' (no tag image to save)")
+                else:
+                    st.success(f"✅ Learned! '{ocr_text}' → '{corrected}'")
+            else:
+                st.error("Please fill in both fields")
+    
+    with tab2:
+        st.write("**Test corrections**")
+        
+        test_field = st.selectbox(
+            "Field Type",
+            ["brand", "size", "material", "color", "garment_type", "style", "other"],
+            key="field_test"
+        )
+        
+        test_text = st.text_input("Test text", placeholder="Type something to correct", key="test_text")
+        
+        if test_text:
+            corrected, details = corrector.correct_text(test_text, test_field)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Input:** {test_text}")
+            with col2:
+                if corrected != test_text:
+                    st.write(f"**→ Corrected:** {corrected}")
+                    st.write(f"*Match: {details.get('match_type')} ({details.get('confidence', 0):.0%})*")
+                else:
+                    st.write("**→** No correction found")
+            
+            # Show suggestions
+            suggestions = corrector.get_suggestions(test_text, test_field)
+            if suggestions:
+                st.write("**Suggestions:**")
+                for suggestion, conf in suggestions[:3]:
+                    st.write(f"  • {suggestion} ({conf:.0%})")
+    
+    with tab3:
+        st.write("**Correction Statistics**")
+        
+        field_type = st.selectbox(
+            "Field Type",
+            ["brand", "size", "material", "color", "garment_type", "style", "other", "all"],
+            key="field_stats"
+        )
+        
+        if field_type == "all":
+            # Show summary for all fields
+            total_corrections = sum(corrector.get_field_stats(ft)['total_corrections'] for ft in ['brand', 'size', 'material', 'color', 'garment_type', 'style', 'other'])
+            st.metric("Total Corrections", total_corrections)
+            
+            # Show training data stats if available
+            if 'tag_image_archive' in st.session_state:
+                archive = st.session_state.tag_image_archive
+                training_stats = archive.get_training_stats()
+                if training_stats['total_images'] > 0:
+                    st.markdown("---")
+                    st.markdown("### 📚 Training Data")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Brand Images", training_stats['total_images'])
+                    with col2:
+                        st.metric("Unique Brands", training_stats['unique_brands'])
+                    
+                    if training_stats['brands']:
+                        st.write("**Brands in training data:**")
+                        for brand in training_stats['brands'][:10]:  # Show first 10
+                            st.write(f"  • {brand}")
+                        if len(training_stats['brands']) > 10:
+                            st.write(f"  ... and {len(training_stats['brands']) - 10} more")
+            
+            for ft in ['brand', 'size', 'material', 'color', 'garment_type', 'style', 'other']:
+                stats = corrector.get_field_stats(ft)
+                if stats['total_corrections'] > 0:
+                    st.write(f"**{ft.title()}**: {stats['total_corrections']} corrections")
+        else:
+            stats = corrector.get_field_stats(field_type)
+            st.json(stats)
+
+def show_tag_archive_ui(tag_archive: TagImageArchive):
+    """Display tag image archive UI in Streamlit sidebar"""
+    import streamlit as st
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📷 Tag Image Archive")
+    
+    # Show archive stats
+    stats = tag_archive.get_stats()
+    training_stats = tag_archive.get_training_stats()
+    
+    st.sidebar.metric("Images Saved", stats['total_images'])
+    st.sidebar.metric("Unique Brands", stats['unique_brands'])
+    st.sidebar.metric("Archive Size", f"{stats['archive_size_mb']} MB")
+    
+    # Show training data stats
+    if training_stats['total_images'] > 0:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 📚 Training Data")
+        st.sidebar.metric("Brand Images", training_stats['total_images'])
+        st.sidebar.metric("Training Brands", training_stats['unique_brands'])
+    
+    # Archive actions
+    with st.sidebar.expander("📊 Archive Actions", expanded=False):
+        if st.button("📈 View Stats"):
+            st.json(stats)
+        
+        if st.button("📦 Export for Training"):
+            output_dir = tag_archive.export_for_training()
+            st.success(f"✅ Exported to {output_dir}")
+        
+        if st.button("🗂️ View Manifest"):
+            if tag_archive.manifest:
+                st.json(tag_archive.manifest[-5:])  # Show last 5 entries
+            else:
+                st.info("No images in archive yet")
+
+# ============================================
 # CAMERA CONFIGURATION - CRITICAL FOR MEASUREMENTS
 # ============================================
 CAMERA_CONFIG = {
@@ -115,23 +913,7 @@ CAMERA_CONFIG = {
     'force_indices': True,         # Set to False to allow auto-detection
     'swap_cameras': False          # Set to True if cameras are physically swapped
 }
-def rate_limited(max_per_minute=5000):
-    """Rate limiting decorator for API calls"""
-    min_interval = 60.0 / max_per_minute
-    last_called = [0.0]
-    
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            elapsed = time.time() - last_called[0]
-            left_to_wait = min_interval - elapsed
-            if left_to_wait > 0:
-                time.sleep(left_to_wait)
-            ret = func(*args, **kwargs)
-            last_called[0] = time.time()
-            return ret
-        return wrapper
-    return decorator
+# Rate limiting decorator moved to line 1313 (with logging)
 
 # eBay cache helper functions
 def _cache_key_with_specifics(brand: str, garment_type: str, size: str = None, 
@@ -186,7 +968,7 @@ class eBayCompsFinder:
             logger.warning("⚠️ eBay App ID not found. Set EBAY_APP_ID environment variable")
             logger.warning("   Get one free at: https://developer.ebay.com/my/keys")
     
-    @rate_limited(max_per_minute=5000)  # eBay allows 5000 calls/day for free tier
+    @rate_limited(max_per_minute=20)  # eBay allows 5000 calls/day (≈3.5/min, use 20 for safety)
     def search_sold_comps(self, brand: str, garment_type: str, size: str = None, 
                           gender: str = None, item_specifics: dict = None,
                           days_back: int = 90) -> dict:
@@ -753,7 +1535,7 @@ class RealtimeTrackingManager:
         
         try:
             # Check if Firebase is already initialized
-            if not firebase_admin.get_app():
+            if not firebase_admin._apps:  # Check if any apps exist
                 cred = credentials.Certificate(firebase_config_path)
                 firebase_admin.initialize_app(cred, {
                     'databaseURL': 'https://your-project.firebaseio.com'
@@ -818,7 +1600,7 @@ class RealtimeTrackingManager:
             
             # Increment total items
             current = db.reference(f'batches/{batch_id}/total_items').get()
-            new_count = (current.val() if current.val() else 0) + 1
+            new_count = (current if current else 0) + 1
             db.reference(f'batches/{batch_id}/total_items').set(new_count)
             
             return True
@@ -870,7 +1652,7 @@ class RealtimeTrackingManager:
         """Increment a batch statistics counter"""
         try:
             current = db.reference(f'batches/{batch_id}/{stat_name}').get()
-            new_val = (current.val() if current.val() else 0) + 1
+            new_val = (current if current else 0) + 1
             db.reference(f'batches/{batch_id}/{stat_name}').set(new_val)
         except Exception as e:
             print(f"Error incrementing {stat_name}: {e}")
@@ -879,7 +1661,7 @@ class RealtimeTrackingManager:
         """Add to batch total value"""
         try:
             current = db.reference(f'batches/{batch_id}/total_value').get()
-            new_val = (current.val() if current.val() else 0.0) + price
+            new_val = (current if current else 0.0) + price
             db.reference(f'batches/{batch_id}/total_value').set(round(new_val, 2))
         except Exception as e:
             print(f"Error updating total value: {e}")
@@ -892,7 +1674,7 @@ class RealtimeTrackingManager:
         try:
             ref = db.reference(f'batches/{batch_id}')
             snapshot = ref.get()
-            return snapshot.val() if snapshot.val() else None
+            return snapshot if snapshot else None
         except Exception as e:
             print(f"Error fetching batch: {e}")
             return None
@@ -905,7 +1687,7 @@ class RealtimeTrackingManager:
         try:
             ref = db.reference(f'batches/{batch_id}/garments/{garment_id}')
             snapshot = ref.get()
-            return snapshot.val() if snapshot.val() else None
+            return snapshot if snapshot else None
         except Exception as e:
             print(f"Error fetching garment: {e}")
             return None
@@ -932,7 +1714,7 @@ class NotificationManager:
         if fcm_config_path:
             try:
                 cred = credentials.Certificate(fcm_config_path)
-                if not firebase_admin.get_app():
+                if not firebase_admin._apps:  # Check if any apps exist
                     firebase_admin.initialize_app(cred)
                 self.fcm_initialized = True
                 print("✅ Firebase Cloud Messaging initialized")
@@ -2101,22 +2883,18 @@ def build_ebay_item_specifics(pipeline_data) -> dict:
     
     return item_specifics
 
-def research_brand_with_ebay(pipeline_data, ebay_finder):
+def research_brand_with_ebay(pipeline_data, ebay_finder=None):
     """
-    Research the detected brand using eBay sold comps.
-    Call this after brand detection is complete.
+    Research the detected brand using eBay sold comps with enhanced sell-through analysis.
+    Uses the new eBay research module for better pricing and demand metrics.
     
     Args:
         pipeline_data: Your PipelineData object with brand, garment_type, size, gender
-        ebay_finder: Instance of eBayCompsFinder
+        ebay_finder: Instance of eBayCompsFinder (legacy, optional)
     
     Returns:
         Updated pipeline_data with eBay metrics
     """
-    if not ebay_finder or not ebay_finder.app_id:
-        logger.warning("[EBAY] Skipping research - no App ID configured")
-        return pipeline_data
-    
     # Skip if brand unknown
     if pipeline_data.brand == "Unknown":
         logger.info("[EBAY] Skipping - brand unknown")
@@ -2124,114 +2902,270 @@ def research_brand_with_ebay(pipeline_data, ebay_finder):
     
     logger.info(f"[EBAY] Researching {pipeline_data.brand} {pipeline_data.garment_type}...")
     
-    # Build item specifics from pipeline data
-    item_specifics = build_ebay_item_specifics(pipeline_data)
-    
-    # Search eBay sold comps
-    comps_data = ebay_finder.search_sold_comps(
-        brand=pipeline_data.brand,
-        garment_type=pipeline_data.garment_type,
-        size=pipeline_data.size,
-        gender=pipeline_data.gender,
-        item_specifics=item_specifics,
-        days_back=90
-    )
-    
-    if comps_data.get('success'):
-        # Update pipeline data with real market data
-        pipeline_data.price_estimate = {
-            'low': comps_data['price_range']['low'],
-            'mid': comps_data['avg_sold_price'],
-            'high': comps_data['price_range']['high'],
-            'median': comps_data['median_sold_price']
-        }
-        
-        # Add new metrics
-        pipeline_data.sell_through_rate = comps_data['sell_through_rate']
-        pipeline_data.avg_days_to_sell = comps_data['days_to_sell_avg']
-        pipeline_data.ebay_sold_count = comps_data['total_sold']
-        pipeline_data.ebay_active_count = comps_data['total_active']
-        pipeline_data.pricing_confidence = comps_data['confidence']
-        pipeline_data.ebay_comps = comps_data  # Store full data
-        
-        # Add to data sources
-        if not hasattr(pipeline_data, 'data_sources'):
-            pipeline_data.data_sources = []
-        pipeline_data.data_sources.append('eBay Sold Comps')
-        
-        logger.info(f"[EBAY] ✅ Updated pricing: ${comps_data['avg_sold_price']:.2f} avg, "
-                   f"{comps_data['sell_through_rate']:.1f}% sell-through")
-        
-    # TRACKING: Update garment status to PRICING
-    if hasattr(pipeline_data, '_pipeline_manager') and pipeline_data._pipeline_manager:
-        pipeline_data._pipeline_manager._update_tracking_status(AnalysisStatus.PRICING, {
-            'estimated_price': comps_data['avg_sold_price'],
-            'confidence': comps_data.get('confidence', 0.8)
-        })
-        
-        # API INTEGRATION: Send pricing update to backend
-        if pipeline_data._pipeline_manager.current_batch_id and pipeline_data._pipeline_manager.current_garment_id:
-            on_pricing(
-                pipeline_data._pipeline_manager.current_batch_id, 
-                pipeline_data._pipeline_manager.current_garment_id
+    # Try new eBay research module first
+    if hasattr(pipeline_data, '_pipeline_manager') and pipeline_data._pipeline_manager and pipeline_data._pipeline_manager.ebay_api:
+        try:
+            logger.info("[EBAY] Using enhanced eBay research module...")
+            ebay_analysis = analyze_garment_with_ebay_pricing(
+                pipeline_data, 
+                pipeline_data._pipeline_manager.ebay_api
             )
+            
+            # Update pipeline data with enhanced metrics
+            pipeline_data.price_estimate = ebay_analysis['combined_estimate']
+            
+            # Add new sell-through metrics
+            pipeline_data.sell_through_rate = float(ebay_analysis['ebay_metrics']['sell_through_rate'].replace('%', ''))
+            pipeline_data.ebay_sold_count = ebay_analysis['ebay_metrics']['sold_listings']
+            pipeline_data.ebay_active_count = ebay_analysis['ebay_metrics']['active_listings']
+            pipeline_data.demand_level = ebay_analysis['ebay_metrics']['demand_level']
+            pipeline_data.avg_sold_price = ebay_analysis['ebay_metrics']['avg_sold_price']
+            pipeline_data.median_sold_price = ebay_analysis['ebay_metrics']['median_sold_price']
+            pipeline_data.pricing_recommendation = ebay_analysis['pricing_recommendations']['recommendation']
+            pipeline_data.ebay_comps = ebay_analysis  # Store full enhanced data
+            
+            # Add to data sources
+            if not hasattr(pipeline_data, 'data_sources'):
+                pipeline_data.data_sources = []
+            pipeline_data.data_sources.append('eBay Enhanced Research')
+            
+            logger.info(f"[EBAY] ✅ Enhanced pricing: ${ebay_analysis['ebay_metrics']['avg_sold_price']:.2f} avg, "
+                       f"{ebay_analysis['ebay_metrics']['sell_through_rate']} sell-through, "
+                       f"{ebay_analysis['ebay_metrics']['demand_level']} demand")
+            
+            # TRACKING: Update garment status to PRICING
+            pipeline_data._pipeline_manager._update_tracking_status(AnalysisStatus.PRICING, {
+                'estimated_price': ebay_analysis['ebay_metrics']['avg_sold_price'],
+                'confidence': 0.9
+            })
+            
+            # API INTEGRATION: Send pricing update to backend
+            if pipeline_data._pipeline_manager.current_batch_id and pipeline_data._pipeline_manager.current_garment_id:
+                on_pricing(
+                    pipeline_data._pipeline_manager.current_batch_id, 
+                    pipeline_data._pipeline_manager.current_garment_id
+                )
+            
+            return pipeline_data
+            
+        except Exception as e:
+            logger.warning(f"[EBAY] Enhanced research failed: {e}, falling back to legacy method")
+    
+    # Fallback to legacy eBay research if new module fails
+    if ebay_finder and ebay_finder.app_id:
+        logger.info("[EBAY] Using legacy eBay research...")
+        
+        # Build item specifics from pipeline data
+        item_specifics = build_ebay_item_specifics(pipeline_data)
+        
+        # Search eBay sold comps
+        comps_data = ebay_finder.search_sold_comps(
+            brand=pipeline_data.brand,
+            garment_type=pipeline_data.garment_type,
+            size=pipeline_data.size,
+            gender=pipeline_data.gender,
+            item_specifics=item_specifics,
+            days_back=90
+        )
+        
+        if comps_data.get('success'):
+            # Update pipeline data with real market data
+            pipeline_data.price_estimate = {
+                'low': comps_data['price_range']['low'],
+                'mid': comps_data['avg_sold_price'],
+                'high': comps_data['price_range']['high'],
+                'median': comps_data['median_sold_price']
+            }
+            
+            # Add new metrics
+            pipeline_data.sell_through_rate = comps_data['sell_through_rate']
+            pipeline_data.avg_days_to_sell = comps_data['days_to_sell_avg']
+            pipeline_data.ebay_sold_count = comps_data['total_sold']
+            pipeline_data.ebay_active_count = comps_data['total_active']
+            pipeline_data.pricing_confidence = comps_data['confidence']
+            pipeline_data.ebay_comps = comps_data  # Store full data
+            
+            # Add to data sources
+            if not hasattr(pipeline_data, 'data_sources'):
+                pipeline_data.data_sources = []
+            pipeline_data.data_sources.append('eBay Sold Comps')
+            
+            logger.info(f"[EBAY] ✅ Legacy pricing: ${comps_data['avg_sold_price']:.2f} avg, "
+                       f"{comps_data['sell_through_rate']:.1f}% sell-through")
+            
+            # TRACKING: Update garment status to PRICING
+            if hasattr(pipeline_data, '_pipeline_manager') and pipeline_data._pipeline_manager:
+                pipeline_data._pipeline_manager._update_tracking_status(AnalysisStatus.PRICING, {
+                    'estimated_price': comps_data['avg_sold_price'],
+                    'confidence': comps_data.get('confidence', 0.8)
+                })
+                
+                # API INTEGRATION: Send pricing update to backend
+                if pipeline_data._pipeline_manager.current_batch_id and pipeline_data._pipeline_manager.current_garment_id:
+                    on_pricing(
+                        pipeline_data._pipeline_manager.current_batch_id, 
+                        pipeline_data._pipeline_manager.current_garment_id
+                    )
+        else:
+            logger.warning(f"[EBAY] Legacy research failed: {comps_data.get('error', 'Unknown error')}")
     else:
-        logger.warning(f"[EBAY] Research failed: {comps_data.get('error', 'Unknown error')}")
-        # Keep original pricing estimate
+        logger.warning("[EBAY] No eBay research available - skipping pricing analysis")
     
     return pipeline_data
 
 def display_ebay_comps(pipeline_data):
-    """Display eBay comps in Streamlit UI"""
+    """Display eBay comps in Streamlit UI - Enhanced with sell-through analysis"""
     if hasattr(pipeline_data, 'ebay_comps') and pipeline_data.ebay_comps:
         st.subheader("📊 eBay Market Research")
         
         comps = pipeline_data.ebay_comps
         
-        col1, col2, col3, col4 = st.columns(4)
+        # Check if this is enhanced data or legacy data
+        if 'ebay_metrics' in comps:
+            # Enhanced eBay research data
+            display_enhanced_ebay_data(pipeline_data, comps)
+        else:
+            # Legacy eBay data
+            display_legacy_ebay_data(comps)
+
+def display_enhanced_ebay_data(pipeline_data, comps):
+    """Display enhanced eBay research data with sell-through analysis"""
+    ebay_metrics = comps['ebay_metrics']
+    recommendations = comps['pricing_recommendations']
+    
+    # Main metrics row
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Avg Sold Price",
+            f"${ebay_metrics['avg_sold_price']:.2f}",
+            delta=f"${ebay_metrics['median_sold_price']:.2f} median"
+        )
+    
+    with col2:
+        # Color-code sell-through rate and translate to demand level
+        sell_through_str = ebay_metrics['sell_through_rate']
+        sell_through = float(sell_through_str.replace('%', ''))
         
-        with col1:
+        if sell_through >= 70:
+            demand_level = "🔥 HIGH DEMAND"
+            delta_color = "normal"
+            delta_text = f"{sell_through:.1f}% sell-through"
+        elif sell_through >= 40:
+            demand_level = "📈 MODERATE DEMAND"
+            delta_color = "normal" 
+            delta_text = f"{sell_through:.1f}% sell-through"
+        else:
+            demand_level = "📉 LOW DEMAND"
+            delta_color = "inverse"
+            delta_text = f"{sell_through:.1f}% sell-through"
+            
+        st.metric(
+            "Demand Level",
+            demand_level,
+            delta=delta_text,
+            delta_color=delta_color
+        )
+    
+    with col3:
+        st.metric(
+            "Active Listings",
+            ebay_metrics['active_listings'],
+            delta=f"{ebay_metrics['sold_listings']} sold"
+        )
+    
+    with col4:
+        # Show market confidence based on data quality
+        total_listings = ebay_metrics['active_listings'] + ebay_metrics['sold_listings']
+        if total_listings >= 20:
+            confidence = "HIGH"
+            delta_color = "normal"
+            delta_text = f"{total_listings} total listings"
+        elif total_listings >= 10:
+            confidence = "MEDIUM"
+            delta_color = "normal"
+            delta_text = f"{total_listings} total listings"
+        else:
+            confidence = "LOW"
+            delta_color = "inverse"
+            delta_text = f"{total_listings} total listings"
+            
+        st.metric(
+            "Market Confidence",
+            confidence,
+            delta=delta_text,
+            delta_color=delta_color
+        )
+    
+    # Pricing recommendation
+    st.info(f"💰 **Pricing Recommendation**: {recommendations['recommendation']}")
+    
+    # Price range and recommendations
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Price Analysis:**")
+        st.write(f"• **Conservative**: ${recommendations['conservative_price']:.2f}")
+        st.write(f"• **Market Rate**: ${recommendations['market_rate']:.2f}")
+        st.write(f"• **Premium**: ${recommendations['premium_price']:.2f}")
+    
+    with col2:
+        st.write("**Market Data:**")
+        st.write(f"• **Price Range**: ${recommendations['min_price']:.2f} - ${recommendations['max_price']:.2f}")
+        st.write(f"• **Confidence**: {recommendations['confidence'].upper()}")
+        st.write(f"• **Assessment**: {recommendations['demand_assessment']}")
+    
+    # Enhanced data source info
+    if hasattr(pipeline_data, 'data_sources') and 'eBay Enhanced Research' in pipeline_data.data_sources:
+        st.caption("✅ Data from enhanced eBay research module (no size filtering for better results)")
+
+def display_legacy_ebay_data(comps):
+    """Display legacy eBay data"""
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Avg Sold Price",
+            f"${comps['avg_sold_price']:.2f}",
+            delta=f"${comps['median_sold_price']:.2f} median"
+        )
+    
+    with col2:
+        st.metric(
+            "Sell-Through Rate",
+            f"{comps['sell_through_rate']:.1f}%",
+            delta=f"{comps['total_sold']} sold"
+        )
+    
+    with col3:
+        if comps.get('days_to_sell_avg'):
             st.metric(
-                "Avg Sold Price",
-                f"${comps['avg_sold_price']:.2f}",
-                delta=f"${comps['median_sold_price']:.2f} median"
+                "Avg Days to Sell",
+                f"{comps['days_to_sell_avg']:.0f} days"
             )
-        
-        with col2:
-            st.metric(
-                "Sell-Through Rate",
-                f"{comps['sell_through_rate']:.1f}%",
-                delta=f"{comps['total_sold']} sold"
-            )
-        
-        with col3:
-            if comps['days_to_sell_avg']:
-                st.metric(
-                    "Avg Days to Sell",
-                    f"{comps['days_to_sell_avg']:.0f} days"
-                )
-            else:
-                st.metric("Avg Days to Sell", "N/A")
-        
-        with col4:
-            st.metric(
-                "Active Listings",
-                comps['total_active'],
-                delta=f"{comps['confidence']} confidence"
-            )
-        
-        # Price range
-        st.write(f"**Price Range:** ${comps['price_range']['low']:.2f} - ${comps['price_range']['high']:.2f}")
-        
-        # Show recent sold items
-        if comps.get('sold_items'):
-            with st.expander("View Recent Sold Items"):
-                for item in comps['sold_items'][:10]:
-                    st.write(f"**${item['price']:.2f}** - {item['title']}")
-                    if item['days_to_sell']:
-                        st.caption(f"Sold in {item['days_to_sell']} days - {item['condition']}")
-                    st.write(f"[View on eBay]({item['url']})")
-                    st.divider()
+        else:
+            st.metric("Avg Days to Sell", "N/A")
+    
+    with col4:
+        st.metric(
+            "Active Listings",
+            comps['total_active'],
+            delta=f"{comps['confidence']} confidence"
+        )
+    
+    # Price range
+    st.write(f"**Price Range:** ${comps['price_range']['low']:.2f} - ${comps['price_range']['high']:.2f}")
+    
+    # Show recent sold items
+    if comps.get('sold_items'):
+        with st.expander("View Recent Sold Items"):
+            for item in comps['sold_items'][:10]:
+                st.write(f"**${item['price']:.2f}** - {item['title']}")
+                if item['days_to_sell']:
+                    st.caption(f"Sold in {item['days_to_sell']} days - {item['condition']}")
+                st.write(f"[View on eBay]({item['url']})")
+                st.divider()
 
 # ==========================
 # WORKING ELGATO CONTROLLER WITH FAST DISCOVERY
@@ -5668,6 +6602,9 @@ class OpenAIVisionTextExtractor:
             'saint john': 'St. John',
             'st. john': 'St. John'
         }
+        
+        # Note: Brand translations now handled by UniversalOCRCorrector
+        logger.info("✅ OCR corrections loaded (universal corrector handles brand translations)")
         logger.info("OpenAI Text Extractor initialized with brand validation")
     
     def validate_and_correct_brand(self, brand_text):
@@ -5712,6 +6649,8 @@ class OpenAIVisionTextExtractor:
         
         # Return original if no correction found
         return brand_text
+    
+    # Note: translate_brand method replaced by UniversalOCRCorrector
     
     def validate_brand_with_ai(self, ocr_text):
         """
@@ -13425,6 +14364,22 @@ class EnhancedPipelineManager:
             self.notification_manager = None
             self.eta_calculator = None
         
+        # Initialize eBay research API
+        try:
+            self.ebay_api = EbayResearchAPI(cache_dir='ebay_cache')
+            print("  - eBay research API initialized")
+        except Exception as e:
+            print(f"  - eBay research initialization failed: {e}")
+            self.ebay_api = None
+        
+        # Initialize learning system
+        try:
+            self.learning_system = LearningSystem()
+            print("  - Learning system initialized")
+        except Exception as e:
+            print(f"  - Learning system initialization failed: {e}")
+            self.learning_system = None
+        
         # Tracking state
         self.current_batch_id = None
         self.current_garment_id = None
@@ -13523,9 +14478,41 @@ class EnhancedPipelineManager:
             result = self.analyze_tag_simple(roi_image)
             
             if result.get('success'):
-                # Store basic results
-                self.pipeline_data.brand = result.get('brand')
+                # Store basic results with universal OCR correction
+                raw_brand = result.get('brand')
+                if raw_brand and 'universal_corrector' in st.session_state:
+                    # Apply universal OCR correction
+                    corrector = st.session_state.universal_corrector
+                    corrected_brand, details = corrector.correct_text(raw_brand, 'brand')
+                    self.pipeline_data.brand = corrected_brand
+                    if corrected_brand != raw_brand:
+                        logger.info(f"✅ Brand corrected: '{raw_brand}' → '{corrected_brand}' ({details.get('match_type', 'unknown')})")
+                        
+                        # Save brand tag for training if correction was made
+                        if hasattr(self, 'pipeline_data') and hasattr(self.pipeline_data, 'tag_image') and self.pipeline_data.tag_image is not None:
+                            metadata = {
+                                'confidence': details.get('confidence', 0.8),
+                                'field_type': 'brand',
+                                'correction_method': details.get('match_type', 'unknown'),
+                                'lighting': 'auto',
+                                'camera': 'arducam_12mp'
+                            }
+                            training_result = save_brand_correction_for_training(
+                                self.pipeline_data.tag_image, raw_brand, corrected_brand, metadata
+                            )
+                            if training_result:
+                                logger.info(f"✅ Brand tag saved for training: {corrected_brand}")
+                else:
+                    self.pipeline_data.brand = raw_brand
+                
                 raw_size = result.get('size')
+                # Also correct size if universal corrector is available
+                if raw_size and 'universal_corrector' in st.session_state:
+                    corrector = st.session_state.universal_corrector
+                    corrected_size, details = corrector.correct_text(raw_size, 'size')
+                    if corrected_size != raw_size:
+                        logger.info(f"✅ Size corrected: '{raw_size}' → '{corrected_size}'")
+                        raw_size = corrected_size
                 
             # TRACKING: Update garment status to TAG_SCANNING
             self._update_tracking_status(AnalysisStatus.TAG_SCANNING, {
@@ -13657,6 +14644,16 @@ class EnhancedPipelineManager:
                     except Exception as e:
                         logger.warning(f"[EBAY] Research failed: {e}")
                         # Continue without eBay data
+                
+                # Save tag image to archive for future training
+                if 'tag_image_archive' in st.session_state:
+                    try:
+                        archive = st.session_state.tag_image_archive
+                        filepath = archive.save_tag_image(roi_image, self.pipeline_data, result)
+                        if filepath:
+                            logger.info(f"✅ Tag image saved to archive: {filepath}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save tag image: {e}")
                 
                 return {'success': True, 'message': f"Brand: {self.pipeline_data.brand}, Size: {self.pipeline_data.size}"}
             else:
@@ -15374,6 +16371,25 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             st.write(f"**Condition:** {self.pipeline_data.condition}")
             if self.pipeline_data.price_estimate:
                 st.write(f"**Price:** ${self.pipeline_data.price_estimate.get('mid', 0)}")
+        
+        # Add correction form for learning system
+        if 'learning_system' in st.session_state:
+            st.markdown("---")
+            with st.expander("✏️ Help Improve AI - Make Corrections", expanded=False):
+                # Create tag analysis result for the correction form
+                tag_result = {
+                    'brand': self.pipeline_data.brand,
+                    'size': self.pipeline_data.size,
+                    'confidence': 0.8  # Default confidence
+                }
+                
+                # Create garment analysis result for the correction form
+                garment_result = {
+                    'garment_type': self.pipeline_data.garment_type,
+                    'confidence': 0.8  # Default confidence
+                }
+                
+                create_correction_form_ui(self.pipeline_data, tag_result, garment_result)
         
         if st.button("🔄 Start New", type="primary", width='stretch'):
             # TRACKING: Mark garment as completed/accepted
@@ -18924,6 +19940,18 @@ def main():
     # Add tracking dashboard to sidebar
     render_tracking_dashboard_sidebar()
     
+    # Add learning system UI to sidebar
+    if 'learning_system' in st.session_state:
+        show_learning_system_ui(st.session_state.learning_system)
+    
+    # Add tag image archive UI to sidebar
+    if 'tag_image_archive' in st.session_state:
+        show_tag_archive_ui(st.session_state.tag_image_archive)
+    
+    # Add universal OCR corrector UI to sidebar
+    if 'universal_corrector' in st.session_state:
+        show_universal_corrector_ui(st.session_state.universal_corrector)
+    
     # Handle pipeline reset request
     if st.session_state.get('pipeline_reset_requested', False):
         # Clear the reset flag
@@ -18987,6 +20015,21 @@ def main():
             learning_orchestrator=st.session_state.learning_orchestrator
         )
         logger.info("✅ Pipeline Manager initialized with learning orchestrator")
+    
+    # Initialize learning system in session state
+    if 'learning_system' not in st.session_state:
+        st.session_state.learning_system = LearningSystem()
+        logger.info("✅ Learning System initialized in session state")
+    
+    # Initialize tag image archive
+    if 'tag_image_archive' not in st.session_state:
+        st.session_state.tag_image_archive = TagImageArchive()
+        logger.info("✅ Tag Image Archive initialized in session state")
+    
+    # Initialize universal OCR corrector
+    if 'universal_corrector' not in st.session_state:
+        st.session_state.universal_corrector = UniversalOCRCorrector()
+        logger.info("✅ Universal OCR Corrector initialized in session state")
     
     if 'live_preview_enabled' not in st.session_state:
         st.session_state.live_preview_enabled = True
