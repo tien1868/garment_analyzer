@@ -15894,6 +15894,41 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         except Exception as e:
             st.sidebar.error(f"Performance monitoring error: {e}")
         
+        # Security Status
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔒 Security")
+        try:
+            from production.security import get_security_manager
+            security_manager = get_security_manager()
+            security_summary = security_manager.get_security_summary()
+            
+            # Security level
+            security_level = security_summary.get('security_level', 'UNKNOWN')
+            if security_level == 'LOW':
+                color = "🟢"
+            elif security_level == 'MEDIUM':
+                color = "🟡"
+            elif security_level == 'HIGH':
+                color = "🟠"
+            else:
+                color = "🔴"
+            
+            st.sidebar.write(f"{color} Security Level: {security_level}")
+            
+            # Security stats
+            st.sidebar.caption(f"Events (1h): {security_summary.get('recent_events', 0)}")
+            st.sidebar.caption(f"Blocked IPs: {security_summary.get('blocked_ips', 0)}")
+            
+            # Security recommendations
+            recommendations = security_manager.get_security_recommendations()
+            if recommendations:
+                st.sidebar.write("⚠️ Recommendations:")
+                for rec in recommendations[:2]:  # Show first 2
+                    st.sidebar.caption(f"• {rec}")
+                    
+        except Exception as e:
+            st.sidebar.error(f"Security monitoring error: {e}")
+        
         # Multi-capture settings
         st.sidebar.markdown("---")
         st.sidebar.subheader("📸 Multi-Capture Settings")
@@ -20149,6 +20184,78 @@ def main():
     except Exception as e:
         logger.warning(f"⚠️ Performance optimization initialization error: {e}")
         logger.info("ℹ️ Continuing without advanced performance optimization")
+    
+    # Initialize production hardening
+    try:
+        from production.startup_checks import run_startup_checks
+        from production.graceful_shutdown import register_shutdown_handler, get_shutdown_manager
+        from production.security import get_security_manager
+        
+        # Run startup checks
+        startup_passed, startup_results = run_startup_checks()
+        if not startup_passed:
+            logger.error("🚨 Startup checks failed - some features may not work properly")
+            for result in startup_results:
+                if result.status.value == "fail":
+                    logger.error(f"❌ {result.name}: {result.message}")
+        else:
+            logger.info("✅ All startup checks passed")
+        
+        # Initialize security manager
+        security_manager = get_security_manager()
+        logger.info("✅ Security system initialized")
+        
+        # Register shutdown handlers
+        shutdown_manager = get_shutdown_manager()
+        
+        # Register camera cleanup
+        def cleanup_cameras():
+            try:
+                import cv2
+                for i in range(10):
+                    cap = cv2.VideoCapture(i)
+                    if cap.isOpened():
+                        cap.release()
+                logger.info("📷 Cameras cleaned up")
+            except Exception as e:
+                logger.warning(f"Camera cleanup failed: {e}")
+        
+        register_shutdown_handler("camera_cleanup", cleanup_cameras, priority=10, critical=True)
+        
+        # Register memory cleanup
+        def cleanup_memory():
+            try:
+                import gc
+                collected = gc.collect()
+                logger.info(f"🧠 Memory cleanup: {collected} objects collected")
+            except Exception as e:
+                logger.warning(f"Memory cleanup failed: {e}")
+        
+        register_shutdown_handler("memory_cleanup", cleanup_memory, priority=5)
+        
+        # Register file cleanup
+        def cleanup_files():
+            try:
+                import tempfile
+                import glob
+                temp_dir = tempfile.gettempdir()
+                temp_files = glob.glob(os.path.join(temp_dir, "garment_analyzer_*"))
+                for temp_file in temp_files:
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
+                logger.info(f"🗑️ Cleaned up {len(temp_files)} temporary files")
+            except Exception as e:
+                logger.warning(f"File cleanup failed: {e}")
+        
+        register_shutdown_handler("file_cleanup", cleanup_files, priority=1)
+        
+        logger.info("✅ Production hardening system initialized")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Production hardening initialization error: {e}")
+        logger.info("ℹ️ Continuing without advanced production hardening")
     
     # Tablet-optimized page config
     st.set_page_config(
