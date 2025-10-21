@@ -1643,18 +1643,17 @@ class GarmentAnalysisUpdate:
         if self.details is None:
             self.details = {}
 
-@dataclass
 # AnalysisState moved to src.models.data_models
-    
-    def increment_retry(self):
-        """Increment retry count"""
-        self.current_retry_count += 1
-    
-    def reset_retries(self):
-        """Reset retry count"""
-        self.current_retry_count = 0
+# class AnalysisState:
+#     def increment_retry(self):
+#         """Increment retry count"""
+#         self.current_retry_count += 1
+#     
+#     def reset_retries(self):
+#         """Reset retry count"""
+#         self.current_retry_count = 0
 
-@dataclass
+# @dataclass
 # UIState moved to src.models.data_models
 
 # CameraCache moved to src.models.data_models
@@ -3675,7 +3674,8 @@ def build_ebay_listing_improved(pipeline_data):
 # ==========================
 # CAMERA MANAGER 
 # ==========================
-class OpenAIVisionCameraManager:
+# OpenAIVisionCameraManager moved to src.cameras.manager
+# class OpenAIVisionCameraManager:
     """Camera manager with 12MP Arducam support and Logitech C930e for garment analysis"""
     
     def __init__(self):
