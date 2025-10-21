@@ -4,6 +4,74 @@ With Fixed Elgato Light Control, Better OCR, and Consolidated Steps
 INDENTATION FIXED VERSION
 """
 
+# Import configuration
+from src.config.settings import AppConfig, PricingConfig
+
+# Import data models
+from src.models.data_models import (
+    AnalysisStatus,
+    UIState,
+    CameraCache,
+    AnalysisState,
+    RetryConfig,
+    PipelineData
+)
+
+# Import utilities
+from src.utils.cache import (
+    rate_limited,
+    generate_cache_key,
+    generate_cache_key_with_specifics,
+    get_cached_result,
+    cache_result
+)
+from src.utils.retry import SimpleRetryManager, RetryConfig
+
+# Import hardware
+from src.hardware.lighting import ElgatoLightController
+from src.hardware.optimizer import ImprovedSmartLightOptimizer
+
+# Import vision utilities
+from src.vision.preprocessing import (
+    validate_image,
+    normalize_image_to_uint8,
+    upscale_image_if_needed
+)
+from src.vision.focus import calculate_focus_score, select_sharpest_frame
+
+# Import AI
+from src.ai.serp_api import SERPAPIBrandDetector
+
+# Import Analysis
+from src.analysis.validators import (
+    validate_classification_strict,
+    validate_cardigan_pullover_classification,
+    validate_and_correct_garment_type,
+    analyze_garment_with_strict_validation,
+    classify_and_validate,
+    validate_roi_coordinates,
+    validate_brand_name,
+    validate_size_format,
+    validate_garment_type,
+    validate_price_range
+)
+from src.analysis.helpers import (
+    extract_features_from_analysis,
+    calculate_confidence_score,
+    determine_garment_category,
+    get_brand_tier,
+    estimate_price_range,
+    extract_size_variations,
+    generate_search_queries,
+    calculate_sell_through_rate,
+    determine_demand_level,
+    format_price_for_display,
+    calculate_price_confidence
+)
+
+# Import Camera Manager
+from src.cameras.manager import OpenAIVisionCameraManager
+
 # Constants to replace magic numbers
 MIN_COLOR_THRESHOLD = 1000  # Minimum unique colors for true RGB detection
 MIN_TAG_WIDTH_PX = 100      # Minimum acceptable tag width in pixels
@@ -13,8 +81,8 @@ DEFAULT_TIMEOUT = 30        # Default timeout for API calls
 MAX_FRAME_SKIP = 5          # Maximum frames to skip for buffer clearing
 
 # Cache settings
-FRAME_CACHE_DURATION_SEC = 0.5  # Cache frames for 500ms
-FRAME_SKIP_COUNT = 2            # Skip frames for performance
+FRAME_CACHE_DURATION_SEC = AppConfig.CACHE_DURATION  # Cache frames for 500ms
+FRAME_SKIP_COUNT = AppConfig.FRAME_SKIP_COUNT            # Skip frames for performance
 
 # Camera configuration
 CAMERA_CONFIG = {
@@ -117,24 +185,7 @@ import re
 from typing import List, Tuple, Dict, Optional
 
 # Rate limiting decorator (moved to top to avoid NameError)
-def rate_limited(max_per_minute=20):  # Fixed: 5000/day = ~20/min
-    """Rate limiting decorator for API calls"""
-    min_interval = 60.0 / max_per_minute
-    last_called = [0.0]
-    
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            elapsed = time.time() - last_called[0]
-            left_to_wait = min_interval - elapsed
-            if left_to_wait > 0:
-                logger.info(f"[RATE-LIMIT] Waiting {left_to_wait:.2f}s before API call")
-                time.sleep(left_to_wait)
-            ret = func(*args, **kwargs)
-            last_called[0] = time.time()
-            return ret
-        return wrapper
-    return decorator
+# rate_limited moved to src.utils.cache
 
 # Load environment variables and secrets management
 try:
@@ -1162,7 +1213,8 @@ def detect_knitwear_visually(image: np.ndarray) -> dict:
         }
 
 
-def validate_classification_strict(garment_type, features_dict):
+# validate_classification_strict moved to src.analysis.validators
+# def validate_classification_strict(garment_type, features_dict):
     """
     Strict validation rules for garment classification
     Returns: (is_valid, corrected_type, issues)
@@ -1283,7 +1335,8 @@ def build_ebay_item_specifics(pipeline_data) -> dict:
     return item_specifics
 
 
-def validate_cardigan_pullover_classification(garment_data):
+# validate_cardigan_pullover_classification moved to src.analysis.validators
+# def validate_cardigan_pullover_classification(garment_data):
     """Validate cardigan vs pullover classification"""
     
     garment_type = garment_data.get('type', '').lower()
@@ -1572,17 +1625,7 @@ def save_brand_tag_with_correction(tag_image, ocr_result, corrected_brand,
 # ANALYSIS STATUS TRACKING
 # ==========================
 
-class AnalysisStatus(Enum):
-    """Status tracking for garment analysis pipeline"""
-    PENDING = "pending"
-    TAG_SCANNING = "tag_scanning"
-    GARMENT_IMAGING = "garment_imaging"
-    ANALYZING = "analyzing"
-    PRICING = "pricing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
+# AnalysisStatus moved to src.models.data_models
 
 @dataclass
 class GarmentAnalysisUpdate:
@@ -1601,17 +1644,7 @@ class GarmentAnalysisUpdate:
             self.details = {}
 
 @dataclass
-class AnalysisState:
-    """Clean encapsulation of analysis state"""
-    tag_analysis_status: AnalysisStatus = AnalysisStatus.PENDING
-    garment_analysis_status: AnalysisStatus = AnalysisStatus.PENDING
-    current_retry_count: int = 0
-    max_retries: int = 3
-    last_error: Optional[str] = None
-    
-    def can_retry(self) -> bool:
-        """Check if retry is allowed"""
-        return self.current_retry_count < self.max_retries
+# AnalysisState moved to src.models.data_models
     
     def increment_retry(self):
         """Increment retry count"""
@@ -1622,124 +1655,17 @@ class AnalysisState:
         self.current_retry_count = 0
 
 @dataclass
-class UIState:
-    """UI state management for the pipeline"""
-    current_step: int = 1
-    is_analyzing: bool = False
-    show_debug: bool = False
-    last_update: str = None
+# UIState moved to src.models.data_models
 
-@dataclass  
-class CameraCache:
-    """Camera frame caching for performance with bounded memory"""
-    
-    def __init__(self):
-        from memory.bounded_cache import get_bounded_cache, CacheConfig
-        # Small cache for camera frames (max 10 frames, 100MB)
-        config = CacheConfig(max_size=10, max_memory_mb=100, ttl_seconds=1)
-        self.cache = get_bounded_cache("camera_frames", config)
-        self.cache_duration: float = 0.1  # 100ms cache
-    
-    def get_cached_frame(self) -> Optional[np.ndarray]:
-        """Get cached frame if still valid"""
-        import time
-        current_time = time.time()
-        cache_key = f"frame_{int(current_time * 10)}"  # 100ms buckets
-        
-        result = self.cache.get(cache_key)
-        if result is not None:
-            return result
-        return None
-    
-    def cache_frame(self, frame: np.ndarray):
-        """Cache a new frame"""
-        import time
-        current_time = time.time()
-        cache_key = f"frame_{int(current_time * 10)}"  # 100ms buckets
-        
-        # Estimate frame size
-        frame_size = frame.nbytes if hasattr(frame, 'nbytes') else frame.size * frame.itemsize
-        
-        self.cache.put(cache_key, frame.copy(), frame_size)
+# CameraCache moved to src.models.data_models
 
 # ==========================
 # SIMPLIFIED RETRY MECHANISM
 # ==========================
 
-@dataclass
-class RetryConfig:
-    """Configuration for retry mechanisms"""
-    max_attempts: int = 3
-    timeout_seconds: int = 30
-    backoff_factor: float = 1.5
+# RetryConfig moved to src.models.data_models
 
-class SimpleRetryManager:
-    """Unified retry mechanism for all analysis operations"""
-    
-    def __init__(self, config: RetryConfig = None):
-        self.config = config or RetryConfig()
-        self.analysis_state = AnalysisState()
-    
-    def execute_with_retry(self, operation_name: str, operation_func, *args, **kwargs):
-        """
-        Execute an operation with unified retry logic.
-        
-        Args:
-            operation_name: Name of the operation for logging
-            operation_func: Function to execute
-            *args, **kwargs: Arguments to pass to the function
-            
-        Returns:
-            Result of the operation or error information
-        """
-        self.analysis_state.reset_retries()
-        
-        for attempt in range(self.config.max_attempts):
-            try:
-                logger.info(f"[RETRY] {operation_name} - Attempt {attempt + 1}/{self.config.max_attempts}")
-                
-                # Execute the operation
-                result = operation_func(*args, **kwargs)
-                
-                # Check if operation was successful
-                if self._is_successful(result):
-                    logger.info(f"[RETRY] {operation_name} - SUCCESS on attempt {attempt + 1}")
-                    self.analysis_state.tag_analysis_status = AnalysisStatus.COMPLETED
-                    return result
-                else:
-                    logger.warning(f"[RETRY] {operation_name} - Failed on attempt {attempt + 1}: {self._get_error_message(result)}")
-                    
-            except Exception as e:
-                logger.error(f"[RETRY] {operation_name} - Exception on attempt {attempt + 1}: {e}")
-                self.analysis_state.last_error = str(e)
-            
-            # If not the last attempt, wait before retrying
-            if attempt < self.config.max_attempts - 1:
-                wait_time = self.config.backoff_factor ** attempt
-                logger.info(f"[RETRY] {operation_name} - Waiting {wait_time:.1f}s before retry...")
-                time.sleep(wait_time)
-        
-        # All attempts failed
-        logger.error(f"[RETRY] {operation_name} - FAILED after {self.config.max_attempts} attempts")
-        self.analysis_state.tag_analysis_status = AnalysisStatus.FAILED
-        return {
-            'success': False,
-            'error': f"Operation failed after {self.config.max_attempts} attempts",
-            'last_error': self.analysis_state.last_error,
-            'method': f'Retry Manager ({operation_name})'
-        }
-    
-    def _is_successful(self, result) -> bool:
-        """Check if the result indicates success"""
-        if isinstance(result, dict):
-            return result.get('success', False)
-        return result is not None
-    
-    def _get_error_message(self, result) -> str:
-        """Extract error message from result"""
-        if isinstance(result, dict):
-            return result.get('error', 'Unknown error')
-        return str(result) if result else 'No result returned'
+# SimpleRetryManager moved to src.utils.retry
 
 # Load environment variables
 def load_env_file():
@@ -1871,10 +1797,11 @@ class PipelineStepManager:
 # ==========================
 # PIPELINE DATA STRUCTURES
 # ==========================
-@dataclass
-class PipelineData:
-    """Store all data collected through the pipeline"""
-    tag_image: Optional[np.ndarray] = None
+# PipelineData moved to src.models.data_models
+# @dataclass
+# class PipelineData:
+    # """Store all data collected through the pipeline"""
+    # tag_image: Optional[np.ndarray] = None
     garment_image: Optional[np.ndarray] = None
     brand: str = "Unknown"
     size: str = "Unknown"
@@ -2074,7 +2001,7 @@ class PipelineData:
         return weighted_sum / total_weight if total_weight > 0 else 0.0
     ebay_active_count: int = 0
     pricing_confidence: str = "Unknown"
-    ebay_comps: Dict = field(default_factory=dict)
+    # ebay_comps: Dict = field(default_factory=dict)
 
 # BackgroundAnalysisManager removed - was unused dead code
 
@@ -2136,7 +2063,8 @@ Respond with ONLY valid JSON (no markdown, no code blocks):
 REMEMBER: If you don't see a front opening, say NO. This is the #1 reason for misclassification."""
 
 
-def validate_and_correct_garment_type(analysis_result: dict) -> dict:
+# validate_and_correct_garment_type moved to src.analysis.validators
+# def validate_and_correct_garment_type(analysis_result: dict) -> dict:
     """
     Post-process AI analysis to catch and correct common misclassifications
     CRITICAL validation happens HERE, not in the AI
@@ -2634,7 +2562,8 @@ def display_legacy_ebay_data(comps):
 # ==========================
 # SERP API INTEGRATION FOR BRAND DETECTION
 # ==========================
-class SERPAPIBrandDetector:
+# SERPAPIBrandDetector moved to src.ai.serp_api
+# class SERPAPIBrandDetector:
     """SERP API integration for brand detection when OCR fails"""
     
     def __init__(self, api_key=None):
@@ -2932,7 +2861,8 @@ class SERPAPIBrandDetector:
         
         return found_brands
 
-class ElgatoLightController:
+# ElgatoLightController moved to src.hardware.lighting
+# class ElgatoLightController:
     """Control Elgato lights via their local API with fast discovery"""
     
     def __init__(self, quick_mode=True):
@@ -3141,7 +3071,8 @@ class ElgatoLightController:
 # ==========================
 # REAL AUTO OPTIMIZER (not stub)
 # ==========================
-class ImprovedSmartLightOptimizer:
+# ImprovedSmartLightOptimizer moved to src.hardware.optimizer
+# class ImprovedSmartLightOptimizer:
     """More aggressive light optimizer to prevent overexposure"""
     
     def __init__(self, light_controller):
@@ -6401,8 +6332,8 @@ Return ONLY this JSON format:
         """Process vintage and designer indicators from tag analysis"""
         
         # Check if brand is in designer database
-        is_designer = brand in DESIGNER_BRANDS if brand else False
-        designer_tier = DESIGNER_BRANDS[brand]['tier'] if is_designer else 'none'
+        is_designer = brand in PricingConfig.DESIGNER_BRANDS if brand else False
+        designer_tier = PricingConfig.DESIGNER_BRANDS[brand]['tier'] if is_designer else 'none'
         
         # Calculate vintage status (20+ years = vintage)
         current_year = 2025
