@@ -150,6 +150,20 @@ try:
     secret_manager = SecretManager('api.env')
     print("✅ SecretManager initialized")
     
+    # Initialize circuit breakers for external services
+    from service_health.circuit_breakers import get_circuit_breaker, CircuitBreakerConfig
+    openai_config = CircuitBreakerConfig(failure_threshold=3, recovery_timeout=30)
+    gemini_config = CircuitBreakerConfig(failure_threshold=3, recovery_timeout=30)
+    serp_config = CircuitBreakerConfig(failure_threshold=5, recovery_timeout=60)
+    ebay_config = CircuitBreakerConfig(failure_threshold=5, recovery_timeout=60)
+    
+    # Initialize circuit breakers
+    openai_breaker = get_circuit_breaker("openai", openai_config)
+    gemini_breaker = get_circuit_breaker("gemini", gemini_config)
+    serp_breaker = get_circuit_breaker("serp", serp_config)
+    ebay_breaker = get_circuit_breaker("ebay", ebay_config)
+    print("✅ Circuit breakers initialized")
+    
     # Validate secrets on startup
     try:
         secret_manager._validate_secrets()
@@ -1617,24 +1631,36 @@ class UIState:
 
 @dataclass  
 class CameraCache:
-    """Camera frame caching for performance"""
-    last_frame: Optional[np.ndarray] = None
-    last_timestamp: float = 0
-    cache_duration: float = 0.1  # 100ms cache
+    """Camera frame caching for performance with bounded memory"""
+    
+    def __init__(self):
+        from memory.bounded_cache import get_bounded_cache, CacheConfig
+        # Small cache for camera frames (max 10 frames, 100MB)
+        config = CacheConfig(max_size=10, max_memory_mb=100, ttl_seconds=1)
+        self.cache = get_bounded_cache("camera_frames", config)
+        self.cache_duration: float = 0.1  # 100ms cache
     
     def get_cached_frame(self) -> Optional[np.ndarray]:
         """Get cached frame if still valid"""
         import time
-        if (self.last_frame is not None and 
-            time.time() - self.last_timestamp < self.cache_duration):
-            return self.last_frame
+        current_time = time.time()
+        cache_key = f"frame_{int(current_time * 10)}"  # 100ms buckets
+        
+        result = self.cache.get(cache_key)
+        if result is not None:
+            return result
         return None
     
     def cache_frame(self, frame: np.ndarray):
         """Cache a new frame"""
         import time
-        self.last_frame = frame.copy()
-        self.last_timestamp = time.time()
+        current_time = time.time()
+        cache_key = f"frame_{int(current_time * 10)}"  # 100ms buckets
+        
+        # Estimate frame size
+        frame_size = frame.nbytes if hasattr(frame, 'nbytes') else frame.size * frame.itemsize
+        
+        self.cache.put(cache_key, frame.copy(), frame_size)
 
 # ==========================
 # SIMPLIFIED RETRY MECHANISM
@@ -6466,9 +6492,12 @@ Return ONLY this JSON format:
             return self._analyze_tag_internal(image_np)
         
         try:
-            return rate_limiter.queue_request('openai', _analyze_tag_with_rate_limit)
+            # Use circuit breaker for OpenAI API calls
+            from service_health.circuit_breakers import get_circuit_breaker
+            openai_breaker = get_circuit_breaker("openai")
+            return openai_breaker.call(rate_limiter.queue_request, 'openai', _analyze_tag_with_rate_limit)
         except Exception as e:
-            logger.error(f"[TAG-ANALYSIS] Rate limited or failed: {e}")
+            logger.error(f"[TAG-ANALYSIS] Rate limited or circuit breaker failed: {e}")
             # Fallback to direct analysis without rate limiting
             return self._analyze_tag_internal(image_np)
     
@@ -8302,9 +8331,13 @@ class TagReadResult:
     focus_score: float = 0.0
     
 class TagAnalysisCache:
-    """Intelligent caching system for tag analysis results"""
+    """Intelligent caching system for tag analysis results with bounded memory"""
     
     def __init__(self, cache_dir='cache/tag_analysis'):
+        from memory.bounded_cache import get_bounded_cache, CacheConfig
+        # Cache for tag analysis results (max 1000 items, 500MB, 24h TTL)
+        config = CacheConfig(max_size=1000, max_memory_mb=500, ttl_seconds=86400)
+        self.cache = get_bounded_cache("tag_analysis", config)
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Tag analysis cache initialized: {cache_dir}")
@@ -8320,20 +8353,13 @@ class TagAnalysisCache:
         """Get cached result for image"""
         try:
             image_hash = self._get_image_hash(image)
-            cache_file = os.path.join(self.cache_dir, f"{image_hash}.json")
+            cache_key = f"tag_analysis_{image_hash}"
             
-            if os.path.exists(cache_file):
-                # Check if cache is still valid (24 hours)
-                file_age = time.time() - os.path.getmtime(cache_file)
-                if file_age < 86400:  # 24 hours
-                    with open(cache_file, 'r') as f:
-                        result = json.load(f)
-                    logger.info(f"[CACHE HIT] Using cached tag analysis (age: {file_age/3600:.1f}h)")
-                    result['cached'] = True
-                    return result
-                else:
-                    logger.info(f"[CACHE EXPIRED] Cache too old ({file_age/3600:.1f}h)")
-                    os.remove(cache_file)
+            result = self.cache.get(cache_key)
+            if result is not None:
+                logger.info(f"[CACHE HIT] Using cached tag analysis")
+                result['cached'] = True
+                return result
             
             return None
             
@@ -8345,14 +8371,15 @@ class TagAnalysisCache:
         """Cache analysis result"""
         try:
             image_hash = self._get_image_hash(image)
-            cache_file = os.path.join(self.cache_dir, f"{image_hash}.json")
+            cache_key = f"tag_analysis_{image_hash}"
             
             # Add metadata
             result['cached_at'] = time.time()
             result['image_hash'] = image_hash
             
-            with open(cache_file, 'w') as f:
-                json.dump(result, f, indent=2, default=str)
+            # Store in bounded cache
+            result_size = len(str(result).encode('utf-8'))
+            self.cache.put(cache_key, result, result_size)
             
             logger.info(f"[CACHE STORED] Tag analysis cached: {image_hash}")
             
@@ -15761,6 +15788,112 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         st.sidebar.progress(min(max(progress, 0.0), 1.0))
         st.sidebar.caption(f"Progress: {int(progress * 100)}%")
         
+        # Circuit Breaker Status
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("⚡ Service Health")
+        try:
+            from service_health.circuit_breakers import get_all_circuit_status
+            circuit_status = get_all_circuit_status()
+            
+            for service, info in circuit_status.items():
+                state = info['state']
+                color = "🟢" if state == "closed" else "🟡" if state == "half_open" else "🔴"
+                st.sidebar.write(f"{color} {service.upper()}: {state}")
+                if state != "closed":
+                    st.sidebar.caption(f"Failures: {info['failure_count']}")
+        except Exception as e:
+            st.sidebar.error(f"Circuit breaker error: {e}")
+        
+        # Memory Status
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("💾 Memory Usage")
+        try:
+            from memory.bounded_cache import get_cache_stats
+            cache_stats = get_cache_stats()
+            
+            for cache_name, stats in cache_stats.items():
+                memory_mb = stats['memory_mb']
+                max_memory_mb = stats['max_memory_mb']
+                hit_rate = stats['hit_rate']
+                
+                # Color based on memory usage
+                if memory_mb / max_memory_mb > 0.8:
+                    color = "🔴"
+                elif memory_mb / max_memory_mb > 0.6:
+                    color = "🟡"
+                else:
+                    color = "🟢"
+                
+                st.sidebar.write(f"{color} {cache_name}: {memory_mb:.1f}/{max_memory_mb}MB")
+                st.sidebar.caption(f"Hit rate: {hit_rate:.1%}")
+        except Exception as e:
+            st.sidebar.error(f"Memory monitor error: {e}")
+        
+        # System Health Status
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🏥 System Health")
+        try:
+            from monitoring.health import get_health_status
+            health_status = get_health_status()
+            
+            overall_status = health_status['status']
+            if overall_status == 'healthy':
+                color = "🟢"
+            elif overall_status == 'degraded':
+                color = "🟡"
+            else:
+                color = "🔴"
+            
+            st.sidebar.write(f"{color} Overall: {overall_status.upper()}")
+            
+            # Show individual checks
+            checks = health_status['checks']
+            for check_name, check_result in checks.items():
+                if isinstance(check_result, dict):
+                    # Handle camera checks
+                    for camera_name, camera_result in check_result.items():
+                        status_color = "🟢" if camera_result.status.value == 'healthy' else "🟡" if camera_result.status.value == 'degraded' else "🔴"
+                        st.sidebar.caption(f"{status_color} {camera_name}: {camera_result.message}")
+                else:
+                    status_color = "🟢" if check_result.status.value == 'healthy' else "🟡" if check_result.status.value == 'degraded' else "🔴"
+                    st.sidebar.caption(f"{status_color} {check_name}: {check_result.message}")
+                    
+        except Exception as e:
+            st.sidebar.error(f"Health check error: {e}")
+        
+        # Performance Status
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🚀 Performance")
+        try:
+            from performance.optimizer import get_performance_optimizer
+            optimizer = get_performance_optimizer()
+            performance_summary = optimizer.profiler.get_performance_summary()
+            
+            if "top_bottlenecks" in performance_summary:
+                bottlenecks = performance_summary["top_bottlenecks"]
+                if bottlenecks:
+                    st.sidebar.write("🔍 Top Bottlenecks:")
+                    for i, (operation, stats) in enumerate(bottlenecks[:3], 1):
+                        duration = stats.get('avg_duration_ms', 0)
+                        if duration > 1000:
+                            color = "🔴"
+                        elif duration > 500:
+                            color = "🟡"
+                        else:
+                            color = "🟢"
+                        st.sidebar.caption(f"{color} {operation}: {duration:.0f}ms")
+            
+            # Performance optimization button
+            if st.sidebar.button("Run Optimization"):
+                try:
+                    optimization_results = optimizer.run_comprehensive_optimization()
+                    st.sidebar.success("✅ Optimization completed")
+                except Exception as e:
+                    st.sidebar.error(f"Optimization failed: {e}")
+                    
+        except Exception as e:
+            st.sidebar.error(f"Performance monitoring error: {e}")
+        
         # Multi-capture settings
         st.sidebar.markdown("---")
         st.sidebar.subheader("📸 Multi-Capture Settings")
@@ -19950,6 +20083,72 @@ def main():
     except Exception as e:
         logger.warning(f"⚠️ Database initialization error: {e}")
         logger.info("ℹ️ Continuing without database features - core functionality still available")
+    
+    # Initialize memory management
+    try:
+        from memory.bounded_cache import cleanup_all_caches
+        logger.info("✅ Memory management initialized")
+        
+        # Schedule periodic cleanup
+        import atexit
+        atexit.register(lambda: cleanup_all_caches())
+    except Exception as e:
+        logger.warning(f"⚠️ Memory management initialization error: {e}")
+        logger.info("ℹ️ Continuing without advanced memory management")
+    
+    # Initialize monitoring and metrics
+    try:
+        from monitoring.metrics import get_metrics_collector, update_system_metrics
+        from monitoring.health import get_health_checker
+        metrics_collector = get_metrics_collector()
+        health_checker = get_health_checker()
+        logger.info("✅ Monitoring system initialized")
+        
+        # Schedule periodic system metrics updates
+        import threading
+        def update_metrics_periodically():
+            while True:
+                try:
+                    update_system_metrics()
+                    time.sleep(30)  # Update every 30 seconds
+                except Exception as e:
+                    logger.warning(f"Metrics update error: {e}")
+                    time.sleep(60)  # Wait longer on error
+        
+        metrics_thread = threading.Thread(target=update_metrics_periodically, daemon=True)
+        metrics_thread.start()
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Monitoring initialization error: {e}")
+        logger.info("ℹ️ Continuing without advanced monitoring")
+    
+    # Initialize performance optimization
+    try:
+        from performance.optimizer import get_performance_optimizer, start_async_processing
+        from performance.async_processor import start_async_processing as start_async_proc
+        
+        performance_optimizer = get_performance_optimizer()
+        start_async_proc()  # Start async processing
+        logger.info("✅ Performance optimization system initialized")
+        
+        # Schedule periodic performance optimization
+        def run_performance_optimization():
+            while True:
+                try:
+                    # Run optimization every hour
+                    time.sleep(3600)
+                    optimization_results = performance_optimizer.run_comprehensive_optimization()
+                    logger.info("📊 Performance optimization completed")
+                except Exception as e:
+                    logger.warning(f"Performance optimization error: {e}")
+                    time.sleep(1800)  # Wait 30 minutes on error
+        
+        optimization_thread = threading.Thread(target=run_performance_optimization, daemon=True)
+        optimization_thread.start()
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Performance optimization initialization error: {e}")
+        logger.info("ℹ️ Continuing without advanced performance optimization")
     
     # Tablet-optimized page config
     st.set_page_config(
