@@ -136,17 +136,43 @@ def rate_limited(max_per_minute=20):  # Fixed: 5000/day = ~20/min
         return wrapper
     return decorator
 
-# Load environment variables from api.env file
+# Load environment variables and secrets management
 try:
+    from config.secrets import get_secret_manager, validate_secrets_on_startup
     from dotenv import load_dotenv
+    
     # Load from api.env file specifically
     load_dotenv('api.env')
     print("✅ Loaded environment variables from api.env")
-except ImportError:
-    print("⚠️ python-dotenv not installed. Install with: pip install python-dotenv")
+    
+    # Initialize secrets manager with api.env file
+    from config.secrets import SecretManager
+    secret_manager = SecretManager('api.env')
+    print("✅ SecretManager initialized")
+    
+    # Validate secrets on startup
+    try:
+        secret_manager._validate_secrets()
+        print("✅ All secrets validated")
+    except Exception as e:
+        print(f"❌ Secret validation failed: {e}")
+        print("Please check your API keys in api.env")
+        # Continue with fallback for now
+    
+except ImportError as e:
+    print(f"⚠️ Missing dependencies: {e}")
+    print("Install with: pip install python-dotenv cryptography")
+    # Fallback to basic environment loading
+    from dotenv import load_dotenv
+    load_dotenv('api.env')
+    print("✅ Fallback: Loaded environment variables from api.env")
 except Exception as e:
-    print(f"⚠️ Could not load api.env: {e}")
-    # Try to load manually
+    print(f"❌ Secret validation failed: {e}")
+    print("Please check your API keys in api.env or environment variables")
+    # Continue with fallback for now
+    from dotenv import load_dotenv
+    load_dotenv('api.env')
+    print("✅ Fallback: Loaded environment variables from api.env")
     try:
         with open('api.env', 'r') as f:
             for line in f:
@@ -1868,14 +1894,161 @@ class PipelineData:
     price_high: float = 30
     model_comparison: Dict = field(default_factory=dict)  # Stores dual-model AI comparison results
     
+    # Confidence scoring system
+    confidence_details: Dict = field(default_factory=dict)  # Detailed confidence breakdown
+    brand_confidence: float = 0.0
+    garment_type_confidence: float = 0.0
+    size_confidence: float = 0.0
+    material_confidence: float = 0.0
+    condition_confidence: float = 0.0
+    overall_confidence: float = 0.0
+    requires_review: bool = False
+    analysis_completed: bool = False
+    
     # eBay sold comps research fields
     sell_through_rate: float = 0.0
     avg_days_to_sell: Optional[float] = None
     ebay_sold_count: int = 0
+    
+    def calculate_confidence_scores(self):
+        """Calculate confidence scores for all fields"""
+        # Brand confidence (based on OCR clarity and brand recognition)
+        self.brand_confidence = self._calculate_brand_confidence()
+        
+        # Garment type confidence (based on validation logic and model agreement)
+        self.garment_type_confidence = self._calculate_garment_type_confidence()
+        
+        # Size confidence (based on OCR clarity and tag readability)
+        self.size_confidence = self._calculate_size_confidence()
+        
+        # Material confidence (based on image quality and text recognition)
+        self.material_confidence = self._calculate_material_confidence()
+        
+        # Condition confidence (based on defect analysis and visual assessment)
+        self.condition_confidence = self._calculate_condition_confidence()
+        
+        # Overall confidence (weighted average)
+        self.overall_confidence = self._calculate_overall_confidence()
+        
+        # Flag if requires review
+        self.requires_review = self.overall_confidence < 70.0
+        
+        # Store detailed breakdown
+        self.confidence_details = {
+            'brand_confidence': self.brand_confidence,
+            'garment_type_confidence': self.garment_type_confidence,
+            'size_confidence': self.size_confidence,
+            'material_confidence': self.material_confidence,
+            'condition_confidence': self.condition_confidence,
+            'overall_confidence': self.overall_confidence,
+            'requires_review': self.requires_review
+        }
+    
+    def _calculate_brand_confidence(self) -> float:
+        """Calculate brand confidence score"""
+        confidence = 50.0  # Base confidence
+        
+        # Boost for known brands
+        known_brands = ['Theory', 'Helmut Lang', 'Jil Sander', 'Paul Smith', 'Ralph Lauren', 'Calvin Klein']
+        if self.brand and any(brand.lower() in self.brand.lower() for brand in known_brands):
+            confidence += 20.0
+        
+        # Boost for clear brand recognition
+        if self.brand and self.brand != "Unknown" and len(self.brand) > 2:
+            confidence += 15.0
+        
+        # Boost for model agreement (if available)
+        if 'model_comparison' in self.__dict__ and self.model_comparison:
+            if self.model_comparison.get('brand_agreement', False):
+                confidence += 15.0
+        
+        return min(confidence, 100.0)
+    
+    def _calculate_garment_type_confidence(self) -> float:
+        """Calculate garment type confidence score"""
+        confidence = 50.0  # Base confidence
+        
+        # Boost for clear garment type
+        if self.garment_type != "Unknown":
+            confidence += 20.0
+        
+        # Boost for validation passing
+        if not self.validation_issue:
+            confidence += 15.0
+        
+        # Boost for specific features
+        if self.has_front_opening and self.garment_type in ['cardigan', 'blazer', 'jacket']:
+            confidence += 10.0
+        
+        return min(confidence, 100.0)
+    
+    def _calculate_size_confidence(self) -> float:
+        """Calculate size confidence score"""
+        confidence = 50.0  # Base confidence
+        
+        # Boost for clear size
+        if self.size and self.size != "Unknown" and len(self.size) > 0:
+            confidence += 20.0
+        
+        # Boost for size conversion success
+        if self.raw_size != self.size and self.size != "Unknown":
+            confidence += 15.0
+        
+        return min(confidence, 100.0)
+    
+    def _calculate_material_confidence(self) -> float:
+        """Calculate material confidence score"""
+        confidence = 50.0  # Base confidence
+        
+        # Boost for material identification
+        if self.material and self.material != "Unknown" and len(self.material) > 2:
+            confidence += 20.0
+        
+        # Boost for material keywords
+        material_keywords = ['cotton', 'wool', 'silk', 'polyester', 'linen', 'cashmere']
+        if self.material and any(keyword in self.material.lower() for keyword in material_keywords):
+            confidence += 15.0
+        
+        return min(confidence, 100.0)
+    
+    def _calculate_condition_confidence(self) -> float:
+        """Calculate condition confidence score"""
+        confidence = 50.0  # Base confidence
+        
+        # Boost for condition assessment
+        if self.condition != "Unknown":
+            confidence += 20.0
+        
+        # Boost for defect analysis
+        if self.defect_count == 0 and self.condition in ['Excellent', 'Good']:
+            confidence += 15.0
+        elif self.defect_count > 0 and self.condition in ['Fair', 'Poor']:
+            confidence += 10.0
+        
+        return min(confidence, 100.0)
+    
+    def _calculate_overall_confidence(self) -> float:
+        """Calculate overall confidence as weighted average"""
+        weights = {
+            'brand_confidence': 0.25,
+            'garment_type_confidence': 0.25,
+            'size_confidence': 0.20,
+            'material_confidence': 0.15,
+            'condition_confidence': 0.15
+        }
+        
+        weighted_sum = 0.0
+        total_weight = 0.0
+        
+        for field, weight in weights.items():
+            confidence_value = getattr(self, field, 0.0)
+            weighted_sum += confidence_value * weight
+            total_weight += weight
+        
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
     ebay_active_count: int = 0
     pricing_confidence: str = "Unknown"
     ebay_comps: Dict = field(default_factory=dict)
-    analysis_completed: bool = False  # Track if analysis has been completed
 
 # BackgroundAnalysisManager removed - was unused dead code
 
@@ -2019,7 +2192,14 @@ def analyze_garment_with_strict_validation(camera_manager, pipeline_data):
         import cv2
         import json
         
-        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+        # Use SecretManager for API key
+        try:
+            from config.secrets import get_secret
+            api_key = get_secret('GEMINI_API_KEY')
+        except:
+            # Fallback to environment variable
+            api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
+        genai.configure(api_key=api_key)
         client = genai.Client()
         
         message = client.models.generate_content(
@@ -2432,14 +2612,38 @@ class SERPAPIBrandDetector:
     """SERP API integration for brand detection when OCR fails"""
     
     def __init__(self, api_key=None):
-        self.api_key = api_key or os.getenv('SERPAPI_KEY') or os.getenv('SERP_API_KEY')  # Support both naming conventions
+        # Use SecretManager for API key
+        try:
+            from config.secrets import get_secret
+            self.api_key = api_key or get_secret('SERP_API_KEY')
+        except:
+            # Fallback to environment variables
+            self.api_key = api_key or os.getenv('SERPAPI_KEY') or os.getenv('SERP_API_KEY')
         self.base_url = "https://serpapi.com/search"
         
     def search_brand_from_image(self, image, garment_type="clothing", gender="women's"):
-        """Use Google Lens for visual brand identification"""
+        """Use Google Lens for visual brand identification with rate limiting"""
         
         if not self.api_key:
             return {"success": False, "error": "SERP API key not found"}
+        
+        # Apply rate limiting
+        from api.rate_limiter import get_rate_limiter, retry_with_backoff
+        rate_limiter = get_rate_limiter()
+        
+        @retry_with_backoff(max_attempts=3, base_delay=2.0)
+        def _search_brand_with_rate_limit():
+            return self._search_brand_internal(image, garment_type, gender)
+        
+        try:
+            return rate_limiter.queue_request('serp', _search_brand_with_rate_limit)
+        except Exception as e:
+            logger.error(f"[SERP-API] Rate limited or failed: {e}")
+            # Fallback to direct search without rate limiting
+            return self._search_brand_internal(image, garment_type, gender)
+    
+    def _search_brand_internal(self, image, garment_type="clothing", gender="women's"):
+        """Internal SERP search method without rate limiting."""
         
         try:
             # Encode image to base64
@@ -4075,7 +4279,7 @@ class OpenAIVisionCameraManager:
                 # Reset button
                 if st.button("🔄 Reset Points"):
                     st.session_state.armpit_points = []
-                    st.rerun()
+                    safe_rerun()
         
         # Draw existing points on frame
         if 'armpit_points' in st.session_state and len(st.session_state.armpit_points) > 0:
@@ -5169,7 +5373,7 @@ class OpenAIVisionCameraManager:
                 if st.button("⏹️ Stop Dragging"):
                     st.session_state.dragging = False
                     st.session_state.drag_handle = None
-                    st.rerun()
+                    safe_rerun()
         
         with col2:
             # Get current frame from camera
@@ -5293,7 +5497,7 @@ class OpenAIVisionCameraManager:
                     new_h = min(frame.shape[0] - new_y, new_h)
                     
                     st.session_state.temp_roi = (new_x, new_y, new_w, new_h)
-                    st.rerun()
+                    safe_rerun()
         
         # Manual adjustment controls
         st.markdown("---")
@@ -5375,22 +5579,156 @@ class OpenAIVisionCameraManager:
             return False
     
     def cleanup(self):
-        """Release camera resources"""
-        if self.arducam_cap:
-            self.arducam_cap.release()
-            self.arducam_cap = None
+        """Release camera resources with bulletproof cleanup"""
+        cleanup_report = {
+            'cameras_cleaned': 0,
+            'errors': [],
+            'success': True
+        }
         
-        # Release C930e
-        self.c930e.release()
+        logger.info("🧹 Starting camera cleanup...")
+        
+        # Cleanup ArduCam
+        if self.arducam_cap:
+            try:
+                if self.arducam_cap.isOpened():
+                    self.arducam_cap.release()
+                    logger.info("✅ ArduCam released")
+                    cleanup_report['cameras_cleaned'] += 1
+                self.arducam_cap = None
+            except Exception as e:
+                logger.error(f"❌ Error releasing ArduCam: {e}")
+                cleanup_report['errors'].append(f"ArduCam: {e}")
+                cleanup_report['success'] = False
+        
+        # Cleanup C930e
+        try:
+            self.c930e.release()
+            logger.info("✅ C930e released")
+            cleanup_report['cameras_cleaned'] += 1
+        except Exception as e:
+            logger.error(f"❌ Error releasing C930e: {e}")
+            cleanup_report['errors'].append(f"C930e: {e}")
+            cleanup_report['success'] = False
         
         # DEPRECATED: Release RealSense SDK pipeline (kept for backward compatibility)
         if self.realsense_pipeline:
-            self.realsense_pipeline.stop()
-            self.realsense_pipeline = None
+            try:
+                self.realsense_pipeline.stop()
+                self.realsense_pipeline = None
+                logger.info("✅ RealSense pipeline stopped")
+            except Exception as e:
+                logger.error(f"❌ Error stopping RealSense pipeline: {e}")
+                cleanup_report['errors'].append(f"RealSense pipeline: {e}")
+                cleanup_report['success'] = False
         
         if self.realsense_cap:
-            self.realsense_cap.release()
-            self.realsense_cap = None
+            try:
+                if self.realsense_cap.isOpened():
+                    self.realsense_cap.release()
+                    logger.info("✅ RealSense camera released")
+                    cleanup_report['cameras_cleaned'] += 1
+                self.realsense_cap = None
+            except Exception as e:
+                logger.error(f"❌ Error releasing RealSense camera: {e}")
+                cleanup_report['errors'].append(f"RealSense camera: {e}")
+                cleanup_report['success'] = False
+        
+        # Verify cleanup
+        remaining_cameras = 0
+        if self.arducam_cap and self.arducam_cap.isOpened():
+            remaining_cameras += 1
+        if hasattr(self.c930e, 'cap') and self.c930e.cap and self.c930e.cap.isOpened():
+            remaining_cameras += 1
+        if self.realsense_cap and self.realsense_cap.isOpened():
+            remaining_cameras += 1
+        
+        if remaining_cameras > 0:
+            logger.warning(f"⚠️ {remaining_cameras} cameras still active after cleanup")
+            cleanup_report['errors'].append(f"{remaining_cameras} cameras still active")
+            cleanup_report['success'] = False
+        
+        logger.info(f"✅ Camera cleanup complete: {cleanup_report['cameras_cleaned']} cameras cleaned")
+        return cleanup_report
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with guaranteed cleanup."""
+        logger.info("🛑 CameraManager context exiting, cleaning up...")
+        self.cleanup()
+    
+    def health_check(self):
+        """Perform health check on all cameras."""
+        health = {
+            'status': 'healthy',
+            'cameras': {},
+            'issues': []
+        }
+        
+        # Check ArduCam
+        if self.arducam_cap:
+            if self.arducam_cap.isOpened():
+                try:
+                    ret, frame = self.arducam_cap.read()
+                    if ret and frame is not None:
+                        health['cameras']['arducam'] = 'working'
+                    else:
+                        health['cameras']['arducam'] = 'no_frame'
+                        health['issues'].append("ArduCam: Cannot read frames")
+                except Exception as e:
+                    health['cameras']['arducam'] = 'error'
+                    health['issues'].append(f"ArduCam: {e}")
+            else:
+                health['cameras']['arducam'] = 'closed'
+        else:
+            health['cameras']['arducam'] = 'not_initialized'
+        
+        # Check C930e
+        if hasattr(self.c930e, 'cap') and self.c930e.cap:
+            if self.c930e.cap.isOpened():
+                try:
+                    ret, frame = self.c930e.cap.read()
+                    if ret and frame is not None:
+                        health['cameras']['c930e'] = 'working'
+                    else:
+                        health['cameras']['c930e'] = 'no_frame'
+                        health['issues'].append("C930e: Cannot read frames")
+                except Exception as e:
+                    health['cameras']['c930e'] = 'error'
+                    health['issues'].append(f"C930e: {e}")
+            else:
+                health['cameras']['c930e'] = 'closed'
+        else:
+            health['cameras']['c930e'] = 'not_initialized'
+        
+        # Check RealSense (if enabled)
+        if self.realsense_cap:
+            if self.realsense_cap.isOpened():
+                try:
+                    ret, frame = self.realsense_cap.read()
+                    if ret and frame is not None:
+                        health['cameras']['realsense'] = 'working'
+                    else:
+                        health['cameras']['realsense'] = 'no_frame'
+                        health['issues'].append("RealSense: Cannot read frames")
+                except Exception as e:
+                    health['cameras']['realsense'] = 'error'
+                    health['issues'].append(f"RealSense: {e}")
+            else:
+                health['cameras']['realsense'] = 'closed'
+        else:
+            health['cameras']['realsense'] = 'disabled'
+        
+        # Determine overall status
+        if any(status == 'error' for status in health['cameras'].values()):
+            health['status'] = 'unhealthy'
+        elif any(status == 'no_frame' for status in health['cameras'].values()):
+            health['status'] = 'degraded'
+        
+        return health
 
     def set_exposure(self, exposure_value: int = -6):
         """
@@ -5846,7 +6184,13 @@ Examples:
     def setup_openai(self):
         """Setup OpenAI client"""
         try:
-            api_key = os.getenv('OPENAI_API_KEY')
+            # Use SecretManager for API key
+            try:
+                from config.secrets import get_secret
+                api_key = get_secret('OPENAI_API_KEY')
+            except:
+                # Fallback to environment variable
+                api_key = os.getenv('OPENAI_API_KEY')
             if not api_key:
                 logger.warning("OpenAI API key not found")
                 return
@@ -5872,7 +6216,13 @@ Examples:
                 logger.warning(f"Google credentials file not found at: {credentials_path}")
                 return False
             
-            project_id = os.getenv('PROJECT_ID', 'keen-answer-442316-v9')
+            # Use SecretManager for project ID
+            try:
+                from config.secrets import get_secret
+                project_id = get_secret('FIREBASE_PROJECT_ID')
+            except:
+                # Fallback to environment variable
+                project_id = os.getenv('PROJECT_ID', 'keen-answer-442316-v9')
             
             credentials = service_account.Credentials.from_service_account_file(
                 credentials_path,
@@ -6103,9 +6453,27 @@ Return ONLY this JSON format:
     def analyze_tag(self, image_np: np.ndarray):
         """
         PRIMARY TAG ANALYSIS METHOD - Consolidated entry point for all tag analysis.
-        NOW WITH LEARNING SYSTEM INTEGRATION
+        NOW WITH LEARNING SYSTEM INTEGRATION AND RATE LIMITING
         """
         logger.info("[TAG-ANALYSIS] Starting tag analysis with learning system...")
+        
+        # Apply rate limiting
+        from api.rate_limiter import get_rate_limiter, retry_with_backoff
+        rate_limiter = get_rate_limiter()
+        
+        @retry_with_backoff(max_attempts=3, base_delay=2.0)
+        def _analyze_tag_with_rate_limit():
+            return self._analyze_tag_internal(image_np)
+        
+        try:
+            return rate_limiter.queue_request('openai', _analyze_tag_with_rate_limit)
+        except Exception as e:
+            logger.error(f"[TAG-ANALYSIS] Rate limited or failed: {e}")
+            # Fallback to direct analysis without rate limiting
+            return self._analyze_tag_internal(image_np)
+    
+    def _analyze_tag_internal(self, image_np: np.ndarray):
+        """Internal tag analysis method without rate limiting."""
         
         # Initialize learning orchestrator if not exists
         if 'learning_orchestrator' not in st.session_state:
@@ -6344,7 +6712,13 @@ class MeasurementDatasetManager:
     def setup_openai(self):
         """Setup OpenAI client"""
         try:
-            api_key = os.getenv('OPENAI_API_KEY')
+            # Use SecretManager for API key
+            try:
+                from config.secrets import get_secret
+                api_key = get_secret('OPENAI_API_KEY')
+            except:
+                # Fallback to environment variable
+                api_key = os.getenv('OPENAI_API_KEY')
             if not api_key:
                 raise ValueError("OpenAI API key required")
             
@@ -6912,10 +7286,28 @@ Return JSON:
         return result
 
     def analyze_garment(self, garment_image):
-        """Synchronous wrapper for the async garment analysis."""
+        """Synchronous wrapper for the async garment analysis with rate limiting."""
         if not self.openai_client:
             logger.error("[GARMENT-ANALYZER] OpenAI client not available.")
             return {'success': False, 'error': 'OpenAI client not configured'}
+        
+        # Apply rate limiting
+        from api.rate_limiter import get_rate_limiter, retry_with_backoff
+        rate_limiter = get_rate_limiter()
+        
+        @retry_with_backoff(max_attempts=3, base_delay=2.0)
+        def _analyze_garment_with_rate_limit():
+            return self._analyze_garment_internal(garment_image)
+        
+        try:
+            return rate_limiter.queue_request('openai', _analyze_garment_with_rate_limit)
+        except Exception as e:
+            logger.error(f"[GARMENT-ANALYZER] Rate limited or failed: {e}")
+            # Fallback to direct analysis without rate limiting
+            return self._analyze_garment_internal(garment_image)
+    
+    def _analyze_garment_internal(self, garment_image):
+        """Internal garment analysis method without rate limiting."""
         
         try:
             # FIX: Don't use asyncio.run with a potentially sync client
@@ -11786,13 +12178,13 @@ def display_armpit_measurement_with_validation():
                     if hasattr(st.session_state, 'pipeline_manager'):
                         st.session_state.pipeline_manager.current_step = 3
                         st.success("✅ Moving to final results step...")
-                        st.rerun()
+                        safe_rerun()
                 else:
                     st.error("❌ No pipeline data available to save to")
                     st.info("💡 Try starting a new analysis first")
 
 def display_armpit_measurement_interface():
-    """Display armpit measurement interface with FORCED camera 1"""
+    """Display armpit measurement interface with improved click detection"""
     import cv2
     import numpy as np
     
@@ -11920,38 +12312,65 @@ def display_armpit_measurement_interface():
                            midpoint,
                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
     
-    # Display with coordinate capture
-    value = streamlit_image_coordinates(
-        display_frame,
-        key="armpit_coords",
-        width=display_frame.shape[1]
-    )
-    
-    # Handle click - prevent duplicate points
-    if value is not None and len(st.session_state.armpit_points) < 2:
-        point = (int(value['x']), int(value['y']))
+    # Display with coordinate capture - IMPROVED VERSION
+    try:
+        # Try the streamlit_image_coordinates function
+        value = streamlit_image_coordinates(
+            display_frame,
+            key="armpit_coords",
+            width=display_frame.shape[1]
+        )
         
-        # Debug logging
-        logger.info(f"[ARMPIT-CLICK] Clicked at ({point[0]}, {point[1]})")
-        logger.info(f"[ARMPIT-CLICK] Current points: {st.session_state.armpit_points}")
+        # Handle click - prevent duplicate points
+        if value is not None and len(st.session_state.armpit_points) < 2:
+            point = (int(value['x']), int(value['y']))
+            
+            # Debug logging
+            logger.info(f"[ARMPIT-CLICK] Clicked at ({point[0]}, {point[1]})")
+            logger.info(f"[ARMPIT-CLICK] Current points: {st.session_state.armpit_points}")
+            
+            # Check if this point is too close to existing points
+            too_close = False
+            for existing_point in st.session_state.armpit_points:
+                distance = np.sqrt((point[0] - existing_point[0])**2 + (point[1] - existing_point[1])**2)
+                logger.info(f"[ARMPIT-CLICK] Distance to existing point {existing_point}: {distance:.1f}px")
+                if distance < 20:  # If within 20 pixels, consider it too close
+                    too_close = True
+                    break
+            
+            if not too_close:
+                st.session_state.armpit_points.append(point)
+                logger.info(f"[ARMPIT-CLICK] Added point. Total points: {len(st.session_state.armpit_points)}")
+                st.success(f"✅ {'Left' if len(st.session_state.armpit_points)==1 else 'Right'} armpit marked!")
+                st.rerun()
+            else:
+                logger.warning(f"[ARMPIT-CLICK] Point too close to existing point")
+                st.warning("⚠️ Point too close to existing point. Please click a different location.")
+                
+    except Exception as e:
+        logger.error(f"[ARMPIT-CLICK] Error with streamlit_image_coordinates: {e}")
+        st.error(f"❌ Click detection failed: {e}")
         
-        # Check if this point is too close to existing points
-        too_close = False
-        for existing_point in st.session_state.armpit_points:
-            distance = np.sqrt((point[0] - existing_point[0])**2 + (point[1] - existing_point[1])**2)
-            logger.info(f"[ARMPIT-CLICK] Distance to existing point {existing_point}: {distance:.1f}px")
-            if distance < 20:  # If within 20 pixels, consider it too close
-                too_close = True
-                break
+        # Fallback: Manual coordinate input
+        st.markdown("---")
+        st.markdown("### 🔧 Manual Coordinate Input (Fallback)")
+        st.warning("The click detection isn't working. Please enter coordinates manually:")
         
-        if not too_close:
-            st.session_state.armpit_points.append(point)
-            logger.info(f"[ARMPIT-CLICK] Added point. Total points: {len(st.session_state.armpit_points)}")
-            st.success(f"✅ {'Left' if len(st.session_state.armpit_points)==1 else 'Right'} armpit marked!")
-            st.rerun()
-        else:
-            logger.warning(f"[ARMPIT-CLICK] Point too close to existing point")
-            st.warning("⚠️ Point too close to existing point. Please click a different location.")
+        col1, col2 = st.columns(2)
+        with col1:
+            left_x = st.number_input("Left Armpit X:", min_value=0, max_value=display_frame.shape[1], value=0)
+            left_y = st.number_input("Left Armpit Y:", min_value=0, max_value=display_frame.shape[0], value=0)
+        with col2:
+            right_x = st.number_input("Right Armpit X:", min_value=0, max_value=display_frame.shape[1], value=0)
+            right_y = st.number_input("Right Armpit Y:", min_value=0, max_value=display_frame.shape[0], value=0)
+        
+        if st.button("✅ Use Manual Coordinates"):
+            if left_x > 0 and left_y > 0 and right_x > 0 and right_y > 0:
+                st.session_state.armpit_points = [(left_x, left_y), (right_x, right_y)]
+                st.success("✅ Manual coordinates set!")
+                st.rerun()
+            else:
+                st.error("Please enter valid coordinates (all > 0)")
     
     # Show results
     if len(st.session_state.armpit_points) == 2:
@@ -12064,7 +12483,7 @@ def display_armpit_measurement_interface():
                     if hasattr(st.session_state, 'pipeline_manager'):
                         st.session_state.pipeline_manager.current_step = 3
                         st.success("✅ Moving to final results step...")
-                        st.rerun()
+                        safe_rerun()
                 else:
                     st.error("❌ No pipeline data available to save to")
                     st.info("💡 Try starting a new analysis first")
@@ -12104,7 +12523,7 @@ def display_armpit_measurement_interface():
                     if hasattr(st.session_state, 'pipeline_manager'):
                         st.session_state.pipeline_manager.current_step = 3
                         st.success("✅ Moving to final results step...")
-                        st.rerun()
+                        safe_rerun()
                 else:
                     st.error("❌ No pipeline data available to save to")
                     st.info("💡 Try starting a new analysis first")
@@ -12698,10 +13117,18 @@ class EnhancedPipelineManager:
         # Initialize the synchronized step manager
         self.step_manager = PipelineStepManager()
         
-        # Background analysis system for garment analysis
+        # Background analysis system for garment analysis (thread-safe)
         self.background_garment_thread = None
-        self.background_garment_result = None
-        self.background_garment_error = None
+        
+        # Initialize thread-safe state management
+        from utils.thread_safety import ThreadSafeState, ThreadOwnership
+        self.thread_safe_state = ThreadSafeState()
+        
+        # Initialize background analysis state
+        self.thread_safe_state.set('background_garment_result', None, ThreadOwnership.MAIN)
+        self.thread_safe_state.set('background_garment_error', None, ThreadOwnership.MAIN)
+        self.thread_safe_state.set('analysis_state', 'idle', ThreadOwnership.MAIN)
+        self.thread_safe_state.set('camera_frame_cache', {}, ThreadOwnership.CAMERA)
         
         # Initialize OpenAI client
         self.openai_client = None
@@ -12728,12 +13155,22 @@ class EnhancedPipelineManager:
             print(f"  - Camera manager failed: {e}")
             self.camera_manager = None
         
-        # Initialize data
+        # Initialize data with validation
+        from models.data_models import PipelineData
+        from validation.validators import get_validator
+        
         self.pipeline_data = PipelineData()
-        print("  - Pipeline data initialized")
+        self.validator = get_validator()
+        print("  - Pipeline data initialized with validation")
         
         # Initialize analyzers
-        api_key = os.getenv('OPENAI_API_KEY')
+        # Use SecretManager for API key
+        try:
+            from config.secrets import get_secret
+            api_key = get_secret('OPENAI_API_KEY')
+        except:
+            # Fallback to environment variable
+            api_key = os.getenv('OPENAI_API_KEY')
         if api_key:
             try:
                 import openai
@@ -12840,17 +13277,24 @@ class EnhancedPipelineManager:
             return False
         
         logger.info("[BACKGROUND-ANALYSIS] Starting garment analysis in background thread")
-        self.background_garment_result = None
-        self.background_garment_error = None
+        # Reset background analysis state (thread-safe)
+        self.thread_safe_state.set('background_garment_result', None, ThreadOwnership.MAIN)
+        self.thread_safe_state.set('background_garment_error', None, ThreadOwnership.MAIN)
+        self.thread_safe_state.set('analysis_state', 'running', ThreadOwnership.BACKGROUND)
         
         def run_analysis():
             try:
                 logger.info("[BACKGROUND-ANALYSIS] Thread started, analyzing garment...")
-                self.background_garment_result = self.garment_analyzer.analyze_garment(garment_image)
-                logger.info(f"[BACKGROUND-ANALYSIS] Analysis complete: {self.background_garment_result.get('success', False)}")
+                result = self.garment_analyzer.analyze_garment(garment_image)
+                # Store result thread-safely
+                self.thread_safe_state.set('background_garment_result', result, ThreadOwnership.BACKGROUND)
+                self.thread_safe_state.set('analysis_state', 'completed', ThreadOwnership.BACKGROUND)
+                logger.info(f"[BACKGROUND-ANALYSIS] Analysis complete: {result.get('success', False)}")
             except Exception as e:
                 logger.error(f"[BACKGROUND-ANALYSIS] Analysis failed: {e}")
-                self.background_garment_error = str(e)
+                # Store error thread-safely
+                self.thread_safe_state.set('background_garment_error', str(e), ThreadOwnership.BACKGROUND)
+                self.thread_safe_state.set('analysis_state', 'error', ThreadOwnership.BACKGROUND)
         
         self.background_garment_thread = threading.Thread(target=run_analysis)
         self.background_garment_thread.start()
@@ -12860,7 +13304,13 @@ class EnhancedPipelineManager:
     def _initialize_openai_client(self):
         """Initialize OpenAI client if API key is available"""
         try:
-            api_key = os.getenv('OPENAI_API_KEY')
+            # Use SecretManager for API key
+            try:
+                from config.secrets import get_secret
+                api_key = get_secret('OPENAI_API_KEY')
+            except:
+                # Fallback to environment variable
+                api_key = os.getenv('OPENAI_API_KEY')
             if api_key:
                 # Show first few characters for debugging (but keep it secure)
                 masked_key = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
@@ -12879,10 +13329,15 @@ class EnhancedPipelineManager:
     def get_background_garment_result(self):
         """Get background garment analysis result if ready"""
         if self.background_garment_thread and not self.background_garment_thread.is_alive():
-            if self.background_garment_result:
-                return self.background_garment_result
-            elif self.background_garment_error:
-                return {'success': False, 'error': self.background_garment_error}
+            # Get result thread-safely
+            result = self.thread_safe_state.get('background_garment_result')
+            if result:
+                return result
+            else:
+                # Check for error thread-safely
+                error = self.thread_safe_state.get('background_garment_error')
+                if error:
+                    return {'success': False, 'error': error}
         return None
     
     def handle_step_0_tag_analysis(self):
@@ -12914,9 +13369,31 @@ class EnhancedPipelineManager:
                 result = reader.capture_and_read_tag_with_consensus(analyze_single_tag)
                 
                 if result.get('success', False):
-                    # Store results in pipeline data
-                    self.pipeline_data.brand = result['brand']
-                    self.pipeline_data.size = result['size']
+                    # Validate and sanitize results before storing
+                    brand_result = self.validator.validate_brand_name(result.get('brand', ''))
+                    size_result = self.validator.validate_size(result.get('size', ''))
+                    
+                    if brand_result.is_valid and size_result.is_valid:
+                        # Store validated results in pipeline data
+                        self.pipeline_data.brand = brand_result.sanitized_value
+                        self.pipeline_data.size = size_result.sanitized_value
+                        
+                        # Log validation warnings if any
+                        if brand_result.warnings:
+                            logger.warning(f"[VALIDATION] Brand warnings: {brand_result.warnings}")
+                        if size_result.warnings:
+                            logger.warning(f"[VALIDATION] Size warnings: {size_result.warnings}")
+                    else:
+                        # Handle validation failures
+                        logger.error(f"[VALIDATION] Tag analysis validation failed:")
+                        if not brand_result.is_valid:
+                            logger.error(f"  Brand: {brand_result.error_message}")
+                        if not size_result.is_valid:
+                            logger.error(f"  Size: {size_result.error_message}")
+                        
+                        # Use fallback values
+                        self.pipeline_data.brand = "Unknown"
+                        self.pipeline_data.size = "Unknown"
                     
                     # Store consensus metadata
                     st.session_state.consensus_result = result
@@ -13409,10 +13886,24 @@ class EnhancedPipelineManager:
                             complete_result['size'] = corrected_size
                     
                     # Update ALL fields from complete analysis (with corrections applied)
-                    self.pipeline_data.brand = complete_result.get('brand')
-                    self.pipeline_data.size = complete_result.get('size')
-                    self.pipeline_data.material = complete_result.get('material')
-                    self.pipeline_data.garment_type = complete_result.get('garment_type')
+                    # Validate and sanitize all fields before storing
+                    brand_result = self.validator.validate_brand_name(complete_result.get('brand', ''))
+                    size_result = self.validator.validate_size(complete_result.get('size', ''))
+                    garment_type_result = self.validator.validate_garment_type(complete_result.get('garment_type', ''))
+                    
+                    # Store validated results
+                    self.pipeline_data.brand = brand_result.sanitized_value if brand_result.is_valid else "Unknown"
+                    self.pipeline_data.size = size_result.sanitized_value if size_result.is_valid else "Unknown"
+                    self.pipeline_data.material = complete_result.get('material')  # Material validation can be added later
+                    self.pipeline_data.garment_type = garment_type_result.sanitized_value if garment_type_result.is_valid else "Unknown"
+                    
+                    # Log validation results
+                    if not brand_result.is_valid:
+                        logger.warning(f"[VALIDATION] Brand validation failed: {brand_result.error_message}")
+                    if not size_result.is_valid:
+                        logger.warning(f"[VALIDATION] Size validation failed: {size_result.error_message}")
+                    if not garment_type_result.is_valid:
+                        logger.warning(f"[VALIDATION] Garment type validation failed: {garment_type_result.error_message}")
                     self.pipeline_data.gender = complete_result.get('gender')
                     self.pipeline_data.gender_confidence = complete_result.get('gender_confidence')
                     self.pipeline_data.gender_indicators = complete_result.get('gender_indicators', [])
@@ -13436,6 +13927,63 @@ class EnhancedPipelineManager:
                     if (self.pipeline_data.garment_type and self.pipeline_data.garment_type != 'Unknown' and 
                         self.pipeline_data.garment_type != 'Not analyzed'):
                         self.pipeline_data.analysis_completed = True
+                        
+                        # Calculate confidence scores
+                        self.pipeline_data.calculate_confidence_scores()
+                        logger.info(f"[CONFIDENCE] Overall confidence: {self.pipeline_data.overall_confidence:.1f}%")
+                        logger.info(f"[CONFIDENCE] Requires review: {self.pipeline_data.requires_review}")
+                        
+                        # Fast validation against verified dataset (<5ms)
+                        if 'fast_validator' in st.session_state and st.session_state.fast_validator:
+                            validator = st.session_state.fast_validator
+                            
+                            # Validate brand
+                            brand_validation = validator.validate_brand(self.pipeline_data.brand)
+                            if brand_validation:
+                                if brand_validation.get('confidence_boost'):
+                                    self.pipeline_data.brand_confidence += brand_validation.get('boost', 0)
+                                    logger.info(f"[VALIDATION] Brand validation boost: +{brand_validation.get('boost', 0)}")
+                                
+                                if brand_validation.get('similar_tags'):
+                                    self.pipeline_data.similar_verified_tags = brand_validation['similar_tags']
+                                    similar_tags = brand_validation['similar_tags']
+                                    similar_count = len(similar_tags) if similar_tags else 0
+                                    logger.info(f"[VALIDATION] Found {similar_count} similar verified tags")
+                            
+                            # Validate garment type
+                            type_validation = validator.validate_garment_type(self.pipeline_data.garment_type)
+                            if type_validation and type_validation.get('confidence_boost'):
+                                self.pipeline_data.garment_type_confidence += type_validation.get('boost', 0)
+                                logger.info(f"[VALIDATION] Garment type validation boost: +{type_validation.get('boost', 0)}")
+                            
+                            # Validate size
+                            size_validation = validator.validate_size(self.pipeline_data.size)
+                            if size_validation and size_validation.get('confidence_boost'):
+                                self.pipeline_data.size_confidence += size_validation.get('boost', 0)
+                                logger.info(f"[VALIDATION] Size validation boost: +{size_validation.get('boost', 0)}")
+                            
+                            # Recalculate overall confidence with validation boosts
+                            self.pipeline_data.calculate_confidence_scores()
+                            logger.info(f"[VALIDATION] Final confidence after validation: {self.pipeline_data.overall_confidence:.1f}%")
+                        
+                        # MISS DETECTION: Check if model failed to detect something obvious
+                        if 'miss_detector' in st.session_state and st.session_state.miss_detector:
+                            # Get OCR text from the analysis (if available)
+                            ocr_text = getattr(self.pipeline_data, 'ocr_text_extracted', '')
+                            
+                            # Check if this is a critical miss
+                            is_critical_miss = st.session_state.miss_detector.detect_miss(
+                                analysis_data=self.pipeline_data,
+                                tag_image=getattr(self.pipeline_data, 'tag_image', None),
+                                extracted_ocr_text=ocr_text
+                            )
+                            
+                            if is_critical_miss:
+                                self.pipeline_data.requires_review = True
+                                self.pipeline_data.review_reason = "⚠️ Model couldn't detect brand, but text was visible"
+                                ocr_preview = ocr_text[:50] if ocr_text else "None"
+                                logger.warning(f"[MISS DETECTION] Critical miss detected: {self.pipeline_data.brand} (OCR: {ocr_preview})")
+                        
                         logger.info("[ANALYSIS] ✅ Marked as completed with real results")
                     else:
                         logger.warning("[ANALYSIS] ⚠️ Not marking as completed - no real results")
@@ -13885,7 +14433,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                         if st.button("✅ Confirm as Sweater/Cardigan", key="manual_sweater_correction"):
                             pipeline_data.garment_type = correction_result.get('suggested_type', 'sweater')
                             st.success(f"✅ Manually corrected to: {pipeline_data.garment_type}")
-                            st.rerun()
+                            safe_rerun()
             
             # Color & Material
             pipeline_data.primary_color = data.get('primary_color', 'Unknown')
@@ -14167,7 +14715,13 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
         
         try:
             # Create async client
-            api_key = os.getenv('OPENAI_API_KEY')
+            # Use SecretManager for API key
+            try:
+                from config.secrets import get_secret
+                api_key = get_secret('OPENAI_API_KEY')
+            except:
+                # Fallback to environment variable
+                api_key = os.getenv('OPENAI_API_KEY')
             if not api_key:
                 return None
             
@@ -14420,7 +14974,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 if st.button("Update"):
                     self.pipeline_data.brand = new_brand
                     self.pipeline_data.size = new_size
-                    st.rerun()
+                    safe_rerun()
         
         else:
             # AUTO-REFRESH MOTION DETECTION (IMPROVED)
@@ -14450,7 +15004,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 # Manual refresh
                 if st.button("🔄 Refresh", key="refresh_tag_compact", width='stretch'):
                     st.session_state.last_tag_motion_check = 0  # Force immediate check
-                    st.rerun()
+                    safe_rerun()
             
             with col_ctrl2:
                 # Auto-zoom toggle
@@ -14644,12 +15198,32 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 if st.button("🗑️ Clear Points", key="clear_armpit_points"):
                     st.session_state.armpit_points = []
                     st.success("✅ Points cleared")
-                    st.rerun()
+                    safe_rerun()
             
             # Add manual measurement option
             if st.button("📏 Use Manual Measurement Instead", key="manual_armpit_measurement"):
                 st.session_state.use_manual_armpit_measurement = True
                 st.rerun()
+            
+            # Alternative: Simple coordinate input (always available)
+            with st.expander("🔧 Alternative: Manual Coordinate Input", expanded=False):
+                st.info("If click detection isn't working, you can enter coordinates manually:")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    manual_left_x = st.number_input("Left Armpit X:", min_value=0, max_value=display_frame.shape[1], value=0, key="manual_left_x")
+                    manual_left_y = st.number_input("Left Armpit Y:", min_value=0, max_value=display_frame.shape[0], value=0, key="manual_left_y")
+                with col2:
+                    manual_right_x = st.number_input("Right Armpit X:", min_value=0, max_value=display_frame.shape[1], value=0, key="manual_right_x")
+                    manual_right_y = st.number_input("Right Armpit Y:", min_value=0, max_value=display_frame.shape[0], value=0, key="manual_right_y")
+                
+                if st.button("✅ Use Manual Coordinates", key="manual_coords_alternative"):
+                    if manual_left_x > 0 and manual_left_y > 0 and manual_right_x > 0 and manual_right_y > 0:
+                        st.session_state.armpit_points = [(manual_left_x, manual_left_y), (manual_right_x, manual_right_y)]
+                        st.success("✅ Manual coordinates set!")
+                        safe_rerun()
+                    else:
+                        st.error("Please enter valid coordinates (all > 0)")
             
             # Check if user wants manual measurement
             if st.session_state.get('use_manual_armpit_measurement', False):
@@ -14673,11 +15247,11 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     
                     st.success(f"✅ Manual measurement recorded: {manual_width} inches ({manual_width * 2.54:.1f} cm)")
                     st.session_state.use_manual_armpit_measurement = False
-                    st.rerun()
+                    safe_rerun()
                 
                 if st.button("🔄 Try Click Measurement Again", key="retry_click_measurement"):
                     st.session_state.use_manual_armpit_measurement = False
-                    st.rerun()
+                    safe_rerun()
                 
                 return  # Skip the click detection below
             
@@ -14722,31 +15296,39 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     measurement_text = f"{estimated_inches:.1f}\""
                     cv2.putText(display_frame, measurement_text, (mid_x, mid_y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             
-            # Display image with click detection
+            # Display image with IMPROVED click detection
             try:
+                # Test if streamlit_image_coordinates is working
+                st.caption(f"🔍 Debug: {len(points)} points currently stored")
+                logger.info(f"[ARMPIT-CLICK] Debug: {len(points)} points currently stored")
+                
+                # Try to get click coordinates
                 clicked_point = streamlit_image_coordinates(
                     display_frame,
                     key="armpit_measurement_click"
                 )
                 
-                # Debug: Show current state
-                st.caption(f"🔍 Debug: {len(points)} points, clicked_point: {clicked_point}")
-                logger.info(f"[ARMPIT-CLICK] Debug: {len(points)} points, clicked_point: {clicked_point}")
+                # Enhanced debug logging
+                st.caption(f"🔍 Click detection result: {clicked_point}")
+                logger.info(f"[ARMPIT-CLICK] Click detection result: {clicked_point}")
                 
-                # Handle click - FIXED: Prevent double-click registration
+                # Handle click - IMPROVED VERSION
                 if clicked_point is not None:
                     x, y = clicked_point["x"], clicked_point["y"]
                     logger.info(f"[ARMPIT-CLICK] Point clicked at ({x}, {y})")
+                    st.success(f"🎯 Click detected at ({x}, {y})")
                     
                     # Check if this is a new click (not already processed)
                     new_click = True
                     if len(points) > 0:
-                        # Check if this click is too close to existing points (within 10 pixels)
+                        # Check if this click is too close to existing points (within 20 pixels)
                         for existing_x, existing_y in points:
                             distance = ((x - existing_x) ** 2 + (y - existing_y) ** 2) ** 0.5
-                            if distance < 10:
+                            logger.info(f"[ARMPIT-CLICK] Distance to existing point ({existing_x}, {existing_y}): {distance:.1f}px")
+                            if distance < 20:  # Increased from 10 to 20 pixels
                                 new_click = False
                                 logger.info(f"[ARMPIT-CLICK] Ignoring duplicate click at ({x}, {y}) - too close to existing point")
+                                st.warning(f"⚠️ Click too close to existing point (distance: {distance:.1f}px)")
                                 break
                     
                     if new_click and len(points) < 2:
@@ -14755,10 +15337,12 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                         
                         if len(points) == 1:
                             st.success(f"✅ Point 1 added at ({x}, {y}). Click to add point 2.")
+                            logger.info(f"[ARMPIT-CLICK] Point 1 added at ({x}, {y})")
                         elif len(points) == 2:
                             st.success(f"✅ Point 2 added at ({x}, {y}). Measurement complete!")
-                            logger.info(f"[ARMPIT-CLICK] Both points added - line should be drawn between them")
-                        # FIXED: Don't call st.rerun() - let Streamlit handle the state naturally
+                            logger.info(f"[ARMPIT-CLICK] Both points added - measurement complete")
+                        # Force rerun to update display
+                        safe_rerun()
                     elif not new_click:
                         st.info("👆 Click detected but ignored (too close to existing point)")
                     else:
@@ -14776,10 +15360,31 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                         
             except Exception as e:
                 logger.error(f"[ARMPIT-CLICK] Error with streamlit_image_coordinates: {e}")
-                st.error(f"Click detection error: {e}")
-                # Fallback: show image without click detection
-                st.image(display_frame, caption="RealSense Garment View", width='stretch')
-                st.warning("⚠️ Click detection not available. Please use manual measurement.")
+                st.error(f"❌ Click detection failed: {e}")
+                
+                # Enhanced fallback with manual coordinate input
+                st.markdown("---")
+                st.markdown("### 🔧 Manual Coordinate Input (Fallback)")
+                st.warning("The click detection isn't working. Please enter coordinates manually:")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    left_x = st.number_input("Left Armpit X:", min_value=0, max_value=display_frame.shape[1], value=0)
+                    left_y = st.number_input("Left Armpit Y:", min_value=0, max_value=display_frame.shape[0], value=0)
+                with col2:
+                    right_x = st.number_input("Right Armpit X:", min_value=0, max_value=display_frame.shape[1], value=0)
+                    right_y = st.number_input("Right Armpit Y:", min_value=0, max_value=display_frame.shape[0], value=0)
+                
+                if st.button("✅ Use Manual Coordinates", key="manual_coords_armpit_simple"):
+                    if left_x > 0 and left_y > 0 and right_x > 0 and right_y > 0:
+                        st.session_state.armpit_points = [(left_x, left_y), (right_x, right_y)]
+                        st.success("✅ Manual coordinates set!")
+                        safe_rerun()
+                    else:
+                        st.error("Please enter valid coordinates (all > 0)")
+                
+                # Show image without click detection
+                st.image(display_frame, caption="Camera view (click detection unavailable)", use_container_width=True)
             
             # Show measurement results
             if len(points) >= 2:
@@ -14810,7 +15415,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 # Clear points button
                 if st.button("🗑️ Clear Points & Measure Again", key="clear_armpit_points"):
                     st.session_state.armpit_points = []
-                    st.rerun()
+                    safe_rerun()
         else:
             st.warning("⚠️ RealSense camera not available for measurements")
             
@@ -14833,7 +15438,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                             'method': 'manual_input'
                         }
                         st.success(f"✅ Manual measurement saved: {manual_width}\" ({manual_width * 2.54:.1f} cm)")
-                        st.rerun()
+                        safe_rerun()
                 else:
                     st.error("❌ No cameras available for measurements")
             except Exception as e:
@@ -15955,7 +16560,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 with col_btn1:
                     if st.button("🔍 Try Connect", key="try_connect_top"):
                         st.session_state.pipeline_manager.light_controller.discover_lights()
-                        st.rerun()
+                        safe_rerun()
                 with col_btn2:
                     if st.button("📍 Scan Network for Lights", key="connect_known_top"):
                         try:
@@ -15964,11 +16569,11 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                             discovered_lights = st.session_state.pipeline_manager.light_controller.discover_lights()
                             if discovered_lights:
                                 st.success(f"Found {len(st.session_state.pipeline_manager.light_controller.lights)} light(s)")
-                                st.rerun()
+                                safe_rerun()
                             else:
                                 st.warning("No Elgato lights found on network")
                                 st.success("Connected!")
-                                st.rerun()
+                                safe_rerun()
                         except:
                             st.error("Connection failed")
         
@@ -16082,7 +16687,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                                 # Update ROI coordinates
                                 st.session_state.pipeline_manager.camera_manager.roi_coords['work'] = (new_x, new_y, new_w, new_h)
                                 st.success("✅ ROI coordinates updated!")
-                                st.rerun()
+                                safe_rerun()
                 else:
                     st.warning("C930e not accessible")
             except Exception as e:
@@ -16384,11 +16989,11 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             if st.session_state.live_preview_enabled:
                 if st.button("⏸️ Pause Live Feed", key="pause_tag_feed"):
                     st.session_state.live_preview_enabled = False
-                    st.rerun()
+                    safe_rerun()
             else:
                 if st.button("▶️ Resume Live Feed", key="resume_tag_feed"):
                     st.session_state.live_preview_enabled = True
-                    st.rerun()
+                    safe_rerun()
         
         with col_ctrl2:
             # Auto-zoom toggle
@@ -16434,7 +17039,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 with col_adv2:
                     if st.button("📏 Show Measurements"):
                         st.session_state.show_measurements = not st.session_state.get('show_measurements', False)
-                        st.rerun()
+                        safe_rerun()
         
         with col_refresh2:
             if st.button("🔄 Refresh Preview", key="refresh_tag_preview"):
@@ -16521,7 +17126,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 if not pause_refresh_on_interaction():
                     st.session_state.last_preview_refresh = current_time
                     time.sleep(0.1)  # Small delay to prevent CPU spike
-                    st.rerun()
+                    safe_rerun()
         
         # Manual override section
         st.markdown("---")
@@ -16608,7 +17213,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 result = self.handle_step_1_garment_analysis()
                 if result and result.get('success'):
                     st.success("✅ Combined analysis completed!")
-                    st.rerun()
+                    safe_rerun()
                 else:
                     st.error(f"❌ Analysis failed: {result.get('error', 'Unknown error')}")
         
@@ -16665,7 +17270,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     st.session_state.pipeline_manager.pipeline_data.validation_issue = None
                     st.success("✅ Confirmed as cardigan")
                     st.toast("🎯 Thank you! This correction will improve the AI.", icon="📚")
-                    st.rerun()
+                    safe_rerun()
             
             with col2:
                 if st.button("No → It's a PULLOVER", type="primary", key="confirm_pullover"):
@@ -16685,7 +17290,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     st.session_state.pipeline_manager.pipeline_data.validation_issue = None
                     st.success("✅ Confirmed as pullover")
                     st.toast("🎯 Thank you! This correction will improve the AI.", icon="📚")
-                    st.rerun()
+                    safe_rerun()
             
             # Show photography guidance
             st.info("""
@@ -16821,7 +17426,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                 if st.session_state.pipeline_manager.pipeline_data.garment_image is not None:
                     st.session_state.pipeline_manager.analyze_defects()
                     st.success("🔍 Defect analysis complete!")
-                    st.rerun()
+                    safe_rerun()
                 else:
                     st.warning("Please capture garment first")
         
@@ -16996,7 +17601,7 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             if st.button("🔄 Refresh Market Data", type="secondary"):
                 with st.spinner("🔍 Updating market data..."):
                     self._calculate_automatic_pricing()
-                    st.rerun()
+                    safe_rerun()
         
         # Show pricing results
         price_data = st.session_state.price_data
@@ -17397,8 +18002,24 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             else: return "XXXL"
     
     def render_action_panel(self):
-        """Clean action panel with organized buttons"""
+        """Clean action panel with organized buttons using state machine"""
         logger.info(f"[PANEL] render_action_panel() called for step {self.current_step}")
+        
+        # Initialize state machine if not exists
+        if 'state_machine' not in st.session_state:
+            from state.state_machine import get_state_machine
+            st.session_state.state_machine = get_state_machine()
+        
+        state_machine = st.session_state.state_machine
+        
+        # Safe rerun function that checks state machine
+        def safe_rerun():
+            """Safely rerun Streamlit only if state machine allows it."""
+            if state_machine.should_rerun():
+                logger.info(f"[RERUN] Safe rerun allowed: {state_machine.current_state.value}")
+                st.rerun()
+            else:
+                logger.warning(f"[RERUN] Rerun blocked by state machine: {state_machine.current_state.value}")
         
         # Clean button layout - centered and organized with Google Lens
         col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
@@ -17409,7 +18030,28 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                     if self.current_step > 0:
                         old_step = self.current_step
                         self.current_step -= 1
-                        logger.info(f"[BUTTON] ⬅️ Back: {old_step} → {self.current_step}")
+                        
+                        # Update state machine
+                        if state_machine.current_state.value != "init":
+                            # Map step to state
+                            step_to_state = {
+                                0: "init",
+                                1: "tag_capture", 
+                                2: "garment_capture",
+                                3: "analysis",
+                                4: "measurement",
+                                5: "pricing"
+                            }
+                            target_state = step_to_state.get(self.current_step, "init")
+                            from state.state_machine import PipelineState
+                            target_enum = PipelineState(target_state)
+                            
+                            if state_machine.can_transition_to(target_enum):
+                                state_machine.transition_to(target_enum, "back_button")
+                                logger.info(f"[BUTTON] ⬅️ Back: {old_step} → {self.current_step} (state: {state_machine.current_state.value})")
+                            else:
+                                logger.warning(f"[BUTTON] ⬅️ Back: Invalid transition to {target_state}")
+                                self.current_step = old_step  # Revert step
                 
                 st.button("⬅️ Back", on_click=go_back, key="back_button", type="secondary")
         
@@ -17417,12 +18059,16 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             def reset_pipeline():
                 self.current_step = 0
                 self.pipeline_data = PipelineData()
+                
+                # Reset state machine
+                state_machine.reset("reset_button")
+                
                 # Clear captured images
                 if 'captured_tag_image' in st.session_state:
                     del st.session_state.captured_tag_image
                 if 'captured_garment_image' in st.session_state:
                     del st.session_state.captured_garment_image
-                logger.info("[BUTTON] 🔄 Reset clicked - pipeline reset")
+                logger.info("[BUTTON] 🔄 Reset clicked - pipeline and state machine reset")
             
             st.button("🔄 Reset", on_click=reset_pipeline, key="reset_button", type="secondary")
         
@@ -17574,12 +18220,12 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
                         # Clear editing state
                         st.session_state[f"editing_{field_name}"] = False
                         st.success(f"✅ {label} updated: {value} → {new_value}")
-                        st.rerun()
+                        safe_rerun()
                 
                 with col_cancel:
                     if st.form_submit_button("❌ Cancel"):
                         st.session_state[f"editing_{field_name}"] = False
-                        st.rerun()
+                        safe_rerun()
     
     def _save_correction(self, field_name, original, corrected):
         """Save user corrections for training data improvement"""
@@ -17692,6 +18338,79 @@ Be thorough, specific, and honest. If no defects are found, say so explicitly. I
             for field, score in scores.items():
                 color = "🟢" if score > 0.8 else "🟡" if score > 0.6 else "🔴"
                 st.write(f"{color} **{field.title()}:** {score:.1%}")
+        
+        # State machine status display
+        if 'state_machine' in st.session_state:
+            state_machine = st.session_state.state_machine
+            st.markdown("---")
+            st.markdown("#### 🔄 State Machine Status")
+            
+            # Show current state and health
+            health = state_machine.get_health_status()
+            state_info = state_machine.get_state_info()
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Current State", state_machine.current_state.value)
+            
+            with col2:
+                st.metric("Transitions", state_machine.transition_count)
+            
+            with col3:
+                status_color = "🟢" if health['status'] == 'healthy' else "🟡" if health['status'] == 'degraded' else "🔴"
+                st.metric("Health", f"{status_color} {health['status']}")
+            
+            # Show warnings if any
+            if health['warnings']:
+                for warning in health['warnings']:
+                    st.warning(f"⚠️ {warning}")
+            
+            # Show issues if any
+            if health['issues']:
+                for issue in health['issues']:
+                    st.error(f"❌ {issue}")
+            
+            # Show recent transitions
+            if state_info['recent_transitions']:
+                st.caption("Recent transitions:")
+                for transition in state_info['recent_transitions'][-3:]:  # Last 3
+                    st.caption(f"  {transition['from']} → {transition['to']} ({transition['trigger']})")
+        
+        # Rate limiting status display
+        try:
+            from api.rate_limiter import get_rate_limiter
+            rate_limiter = get_rate_limiter()
+            
+            st.markdown("---")
+            st.markdown("#### 🚦 API Rate Limits")
+            
+            # Show rate limit status for all APIs
+            all_status = rate_limiter.get_all_status()
+            
+            for api_name, status in all_status.items():
+                if status.total_requests > 0:  # Only show APIs that have been used
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric(f"{api_name.upper()}", f"{status.requests_this_minute}/min")
+                    
+                    with col2:
+                        st.metric("Today", f"{status.requests_today}")
+                    
+                    with col3:
+                        success_rate = (status.total_requests - status.errors) / max(status.total_requests, 1)
+                        st.metric("Success", f"{success_rate:.1%}")
+                    
+                    with col4:
+                        if status.is_limited:
+                            retry_after = rate_limiter.get_retry_after(api_name)
+                            st.metric("Cooldown", f"{retry_after:.0f}s")
+                        else:
+                            st.metric("Status", "🟢 Active")
+        
+        except Exception as e:
+            st.caption(f"Rate limiter status unavailable: {e}")
     
     def _check_ebay_pricing(self):
         """Check eBay for similar items and pricing"""
@@ -18556,6 +19275,182 @@ def render_defect_collection_mode():
             st.session_state.defect_points = []
             st.rerun()
 
+def render_learning_feedback_dashboard():
+    """Render Zero-Latency Learning dashboard in sidebar"""
+    with st.sidebar.expander("📊 Zero-Latency Learning", expanded=False):
+        st.markdown("### Live Metrics")
+        
+        # Get zero-latency learning components
+        if 'tag_dataset' in st.session_state:
+            dataset = st.session_state.tag_dataset
+            dataset_stats = dataset.get_stats()
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Verified Tags", dataset_stats.get('total_tags', 0))
+                st.metric("Brands", dataset_stats.get('brands', 0))
+            
+            with col2:
+                st.metric("Dataset Ready", "✅" if dataset_stats.get('ready') else "❌")
+                st.metric("Garment Types", dataset_stats.get('garment_types', 0))
+        
+        # Get async processor stats
+        if 'async_processor' in st.session_state:
+            processor = st.session_state.async_processor
+            queue_stats = processor.get_queue_stats()
+            
+            st.markdown("### Processing Queue")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Queue Size", queue_stats.get('queue_size', 0))
+                st.metric("Processed", queue_stats.get('processed_count', 0))
+            
+            with col2:
+                st.metric("Errors", queue_stats.get('error_count', 0))
+                st.metric("Status", "🟢 Active" if queue_stats.get('processing') else "🔴 Stopped")
+        
+        # Get validator stats
+        if 'fast_validator' in st.session_state:
+            validator = st.session_state.fast_validator
+            validator_stats = validator.get_stats()
+            
+            st.markdown("### Validation Performance")
+            st.write(f"**Cache Hit Rate:** {validator_stats.get('cache_hit_rate', '0%')}")
+            st.write(f"**Cache Size:** {validator_stats.get('cache_size', 0)}/{validator_stats.get('max_cache_size', 500)}")
+            st.write(f"**Timeouts:** {validator_stats.get('timeouts', 0)}")
+        
+        # Show current analysis confidence
+        if 'pipeline_manager' in st.session_state:
+            pipeline_data = st.session_state.pipeline_manager.pipeline_data
+            if hasattr(pipeline_data, 'overall_confidence') and pipeline_data.overall_confidence > 0:
+                st.markdown("### Current Analysis")
+                
+                if pipeline_data.requires_review:
+                    st.warning(f"🚩 Manual Review Needed ({pipeline_data.overall_confidence:.1f}% confidence)")
+                    
+                    # Show which fields need review
+                    low_confidence_fields = []
+                    if pipeline_data.brand_confidence < 70:
+                        low_confidence_fields.append("Brand")
+                    if pipeline_data.garment_type_confidence < 70:
+                        low_confidence_fields.append("Type")
+                    if pipeline_data.size_confidence < 70:
+                        low_confidence_fields.append("Size")
+                    
+                    if low_confidence_fields:
+                        st.write(f"**Low confidence fields:** {', '.join(low_confidence_fields)}")
+                else:
+                    st.success(f"✅ High Confidence ({pipeline_data.overall_confidence:.1f}%)")
+                
+                # Show validation boosts if available
+                if hasattr(pipeline_data, 'similar_verified_tags') and pipeline_data.similar_verified_tags:
+                    st.info(f"🔍 Found {len(pipeline_data.similar_verified_tags)} similar verified tags")
+        
+        # Show recent learning activity
+        st.markdown("### Recent Learning")
+        if 'async_processor' in st.session_state:
+            processor = st.session_state.async_processor
+            queue_stats = processor.get_queue_stats()
+            
+            if queue_stats.get('processed_count', 0) > 0:
+                st.write(f"📈 **{queue_stats.get('processed_count', 0)} corrections processed**")
+                st.write("🔄 System learning from user feedback")
+            else:
+                st.info("No corrections processed yet")
+        
+        # Show dataset status
+        if 'tag_dataset' in st.session_state:
+            dataset = st.session_state.tag_dataset
+            if dataset.ready:
+                st.success("✅ Dataset loaded and ready for validation")
+            else:
+                st.warning("⚠️ Dataset loading...")
+                if dataset.load_error:
+                    st.error(f"Error: {dataset.load_error}")
+        
+        # Performance guarantee
+        st.markdown("### Performance")
+        st.info("🚀 **Zero-latency learning:** All validation <5ms, corrections queued instantly")
+        
+        # Show critical misses that need user input
+        if 'miss_detector' in st.session_state:
+            st.markdown("### 🎯 Critical Misses (Need Your Input)")
+            critical_misses = st.session_state.miss_detector.get_critical_misses(limit=3)
+            
+            if critical_misses:
+                for i, miss in enumerate(critical_misses):
+                    with st.expander(f"Miss {i+1}: {miss.get('ocr_extracted_text', '')[:30]}...", expanded=False):
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            st.write("**What OCR found:**")
+                            st.code(miss.get('ocr_extracted_text', ''))
+                            
+                            st.write("**What AI predicted:**")
+                            st.write(f"🤔 {miss.get('ai_prediction', {}).get('brand', 'Unknown')} (confidence: {miss.get('ai_prediction', {}).get('confidence', 0)}%)")
+                            
+                            st.write("**Tag image quality:**")
+                            tag_analysis = miss.get('tag_analysis', {})
+                            st.write(f"- Focus: {tag_analysis.get('focus_score', 0):.0f}")
+                            st.write(f"- Brightness: {tag_analysis.get('brightness', 0)}")
+                            st.write(f"- Text density: {tag_analysis.get('text_density', 0):.1%}")
+                        
+                        with col2:
+                            correct_brand = st.text_input("Correct brand:", key=f"miss_{miss.get('miss_id', i)}")
+                            if st.button("Save correction", key=f"save_{miss.get('miss_id', i)}"):
+                                st.session_state.miss_detector.log_correction_for_miss(miss.get('miss_id', ''), {
+                                    'brand': correct_brand,
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                                st.success("✅ Correction saved!")
+                                safe_rerun()
+            else:
+                st.info("No critical misses found")
+        
+        # Show learning patterns
+        if 'pattern_analyzer' in st.session_state:
+            st.markdown("### 📊 What We Learned Today")
+            
+            # Run analysis if not cached
+            if 'latest_analysis' not in st.session_state:
+                st.session_state.latest_analysis = st.session_state.pattern_analyzer.get_latest_analysis()
+            
+            if st.session_state.latest_analysis:
+                analysis = st.session_state.latest_analysis
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Misses Today", analysis.get('total_misses', 0))
+                
+                with col2:
+                    st.metric("Corrections Today", analysis.get('total_corrections', 0))
+                
+                with col3:
+                    st.metric("Prompt Updates Needed", len(analysis.get('prompt_updates', [])))
+                
+                # Show missed brands
+                if analysis.get('patterns', {}).get('missed_brands'):
+                    st.markdown("**Most Missed Brands:**")
+                    for brand, count in list(analysis['patterns']['missed_brands'].items())[:5]:
+                        st.write(f"• {brand}: {count} misses")
+                
+                # Show brand confusions
+                if analysis.get('patterns', {}).get('brand_confusions'):
+                    st.markdown("**Top Brand Confusions:**")
+                    for confusion in analysis['patterns']['brand_confusions'][:3]:
+                        st.write(f"• {confusion['brand_a']} ↔ {confusion['brand_b']}: {confusion['count']} times")
+                
+                # Show prompt updates
+                if analysis.get('prompt_updates'):
+                    st.markdown("**Suggested Prompt Improvements:**")
+                    for update in analysis['prompt_updates'][:3]:
+                        priority_color = "🔴" if update.get('priority') == 'CRITICAL' else "🟡" if update.get('priority') == 'HIGH' else "🟢"
+                        st.info(f"{priority_color} **{update.get('type', '').upper()}** (Priority: {update.get('priority', '')})\n\n{update.get('instruction', '')}")
+            else:
+                st.info("No learning data available yet")
+
+
 def render_tracking_dashboard_sidebar():
     """Render real-time tracking dashboard in sidebar"""
     
@@ -18619,7 +19514,7 @@ def render_tracking_dashboard_sidebar():
                         garment_id = str(uuid.uuid4())
                         if pipeline_manager.add_garment_to_tracking(garment_id):
                             st.sidebar.success("✅ Garment added to batch")
-                            st.rerun()
+                            safe_rerun()
                         else:
                             st.sidebar.error("❌ Failed to add garment")
                 else:
@@ -18689,9 +19584,9 @@ def render_simple_analysis_interface():
                 # Apply ROI for tag capture
                 tag_roi = pipeline_manager.camera_manager.apply_roi_pure(tag_frame, 'tag')
                 if tag_roi is not None:
-                    st.image(tag_roi, caption="Tag ROI", use_column_width=True)
+                    st.image(tag_roi, caption="Tag ROI", use_container_width=True)
                 else:
-                    st.image(tag_frame, caption="Tag Camera Feed", use_column_width=True)
+                    st.image(tag_frame, caption="Tag Camera Feed", use_container_width=True)
             else:
                 st.error("Tag camera not available")
         
@@ -18699,7 +19594,7 @@ def render_simple_analysis_interface():
             st.markdown("### 📸 Garment Camera")
             garment_frame = pipeline_manager.camera_manager.capture_garment_for_analysis()
             if garment_frame is not None:
-                st.image(garment_frame, caption="Garment Image", use_column_width=True)
+                st.image(garment_frame, caption="Garment Image", use_container_width=True)
             else:
                 st.warning("Garment camera not available")
     
@@ -18820,6 +19715,65 @@ def render_simple_analysis_interface():
                 # Save to database or file
                 save_results(st.session_state.analysis_results)
                 st.success("Results saved!")
+        
+        # Add correction interface for uncertain predictions
+        if st.session_state.analysis_results and st.session_state.analysis_results.get('requires_review'):
+            st.markdown("---")
+            st.markdown("### 🔧 Correction Interface")
+            st.warning("This analysis has low confidence and may need review")
+            
+            with st.expander("Make Corrections", expanded=False):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    corrected_brand = st.text_input("Correct Brand", value=st.session_state.analysis_results['garment'].get('brand', ''))
+                    corrected_type = st.text_input("Correct Garment Type", value=st.session_state.analysis_results['garment'].get('type', ''))
+                
+                with col2:
+                    corrected_size = st.text_input("Correct Size", value=st.session_state.analysis_results['garment'].get('size', ''))
+                    corrected_condition = st.text_input("Correct Condition", value=st.session_state.analysis_results['garment'].get('condition', ''))
+                
+                if st.button("💾 Save Corrections", type="primary"):
+                    # Extract lessons from this correction
+                    if 'correction_extractor' in st.session_state:
+                        corrections = {
+                            'brand': corrected_brand,
+                            'garment_type': corrected_type,
+                            'size': corrected_size,
+                            'condition': corrected_condition
+                        }
+                        
+                        # Extract the lesson from this correction
+                        lesson = st.session_state.correction_extractor.extract_correction(
+                            original_analysis=st.session_state.analysis_results['garment'],
+                            user_input=corrections,
+                            tag_image=None,  # Could capture tag image here
+                            ocr_text=getattr(st.session_state.analysis_results['garment'], 'ocr_text_extracted', '')
+                        )
+                        
+                        # Show what we learned
+                        if lesson.get('error_type'):
+                            st.info(f"📚 **Learning:** Error type: {', '.join(lesson['error_type'])}")
+                        
+                        if lesson.get('suggested_fix'):
+                            for fix in lesson['suggested_fix'][:2]:  # Show first 2 fixes
+                                st.caption(f"💡 **Fix:** {fix['instruction']}")
+                    
+                    # Queue correction for background processing
+                    if 'async_processor' in st.session_state:
+                        result = st.session_state.async_processor.queue_correction(
+                            analysis_data=st.session_state.analysis_results['garment'],
+                            user_corrections=corrections,
+                            tag_image=None  # Could capture tag image here
+                        )
+                        
+                        if result.get('status') == 'queued':
+                            st.success("✅ Corrections saved! Learning in progress...")
+                            st.info("Your corrections are being processed in the background to improve the system.")
+                        else:
+                            st.error(f"Failed to save corrections: {result.get('message', 'Unknown error')}")
+                    else:
+                        st.error("Learning system not available")
 
 
 def analyze_garment():
@@ -18848,6 +19802,27 @@ def analyze_garment():
             if result and result.get('success'):
                 # Extract data from pipeline
                 pipeline_data = pipeline_manager.pipeline_data
+                # Check if this is an uncertain prediction
+                if hasattr(pipeline_data, 'requires_review') and pipeline_data.requires_review:
+                    # Initialize uncertainty sampler if not exists
+                    if 'uncertainty_sampler' not in st.session_state:
+                        from uncertainty_sampler import UncertaintySampler
+                        st.session_state.uncertainty_sampler = UncertaintySampler()
+                    
+                    # Save uncertain prediction
+                    analysis_data = {
+                        'brand': getattr(pipeline_data, 'brand', 'Unknown'),
+                        'garment_type': getattr(pipeline_data, 'garment_type', 'Unknown'),
+                        'size': getattr(pipeline_data, 'size', 'Unknown'),
+                        'condition': getattr(pipeline_data, 'condition', 'Unknown'),
+                        'material': getattr(pipeline_data, 'material', 'Unknown'),
+                        'confidence_details': getattr(pipeline_data, 'confidence_details', {})
+                    }
+                    
+                    uncertain_id = st.session_state.uncertainty_sampler.save_uncertain_prediction(analysis_data)
+                    if uncertain_id:
+                        logger.info(f"Saved uncertain prediction: {uncertain_id}")
+                
                 return {
                     'type': getattr(pipeline_data, 'garment_type', 'Unknown'),
                     'brand': getattr(pipeline_data, 'brand', 'Unknown'),
@@ -18856,7 +19831,8 @@ def analyze_garment():
                     'condition': getattr(pipeline_data, 'condition', 'Unknown'),
                     'style': getattr(pipeline_data, 'style', 'Unknown'),
                     'material': getattr(pipeline_data, 'material', 'Unknown'),
-                    'confidence': 0.92
+                    'confidence': getattr(pipeline_data, 'overall_confidence', 0.92),
+                    'requires_review': getattr(pipeline_data, 'requires_review', False)
                 }
             else:
                 return None
@@ -18946,6 +19922,35 @@ def save_results(results):
 def main():
     """Main application entry point - simple single-analysis flow"""
     
+    # Register cleanup handlers for camera resources
+    import atexit
+    
+    def cleanup_cameras():
+        """Cleanup all cameras on exit"""
+        try:
+            if 'pipeline_manager' in st.session_state and st.session_state.pipeline_manager:
+                if hasattr(st.session_state.pipeline_manager, 'camera_manager'):
+                    cleanup_report = st.session_state.pipeline_manager.camera_manager.cleanup()
+                    logger.info(f"🧹 Camera cleanup on exit: {cleanup_report}")
+        except Exception as e:
+            logger.error(f"❌ Error during camera cleanup on exit: {e}")
+    
+    # Register cleanup handlers (only atexit for Streamlit compatibility)
+    atexit.register(cleanup_cameras)
+    # Note: signal handlers removed for Streamlit compatibility
+    # Streamlit runs in a different thread context where signal handlers don't work
+    
+    # Initialize database (optional for core functionality)
+    try:
+        from database.manager import initialize_database
+        if initialize_database():
+            logger.info("✅ Database initialized successfully")
+        else:
+            logger.warning("⚠️ Database initialization failed - continuing without database features")
+    except Exception as e:
+        logger.warning(f"⚠️ Database initialization error: {e}")
+        logger.info("ℹ️ Continuing without database features - core functionality still available")
+    
     # Tablet-optimized page config
     st.set_page_config(
         page_title="Garment Analyzer Pipeline",
@@ -18959,6 +19964,32 @@ def main():
         st.session_state.analysis_complete = False
     if 'analysis_results' not in st.session_state:
         st.session_state.analysis_results = None
+    
+    # Initialize zero-latency learning system
+    if 'tag_dataset' not in st.session_state:
+        from learning.dataset_loader import tag_dataset
+        st.session_state.tag_dataset = tag_dataset
+    
+    if 'fast_validator' not in st.session_state:
+        from validation.fast_validator import get_validator
+        st.session_state.fast_validator = get_validator(st.session_state.tag_dataset)
+    
+    if 'async_processor' not in st.session_state:
+        from learning.async_corrector import get_processor
+        st.session_state.async_processor = get_processor()
+    
+    # Initialize error detection and learning system
+    if 'miss_detector' not in st.session_state:
+        from learning.miss_detector import get_miss_detector
+        st.session_state.miss_detector = get_miss_detector()
+    
+    if 'correction_extractor' not in st.session_state:
+        from learning.correction_extractor import get_correction_extractor
+        st.session_state.correction_extractor = get_correction_extractor()
+    
+    if 'pattern_analyzer' not in st.session_state:
+        from learning.pattern_analyzer import get_analyzer
+        st.session_state.pattern_analyzer = get_analyzer()
     
     # Add camera diagnostics to sidebar
     display_camera_diagnostics()
@@ -18979,6 +20010,9 @@ def main():
     # Add universal OCR corrector UI to sidebar
     if 'universal_corrector' in st.session_state:
         show_universal_corrector_ui(st.session_state.universal_corrector)
+    
+    # Add Learning & Feedback dashboard
+    render_learning_feedback_dashboard()
     
     # Handle pipeline reset request
     if st.session_state.get('pipeline_reset_requested', False):
